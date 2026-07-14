@@ -1,0 +1,16 @@
+version: 1
+host_id: server-a
+services_root: /srv/stacks
+repository: rclone:onedrive:Backups/restic/server-a
+password_file: /etc/homelab-backup/restic-password
+rclone_config: /etc/homelab-backup/rclone/rclone.conf
+staging_root: /var/lib/homelab-backup/staging
+restore_root: /var/lib/homelab-backup/restores
+state_root: /var/lib/homelab-backup/state
+cache_root: /var/cache/homelab-backup/restic
+lock_file: /run/lock/homelab-backup.lock
+volume_helper_image: homelab/volume-rsync:1
+rclone:
+  bwlimit: ""
+check:
+  read_data_subset: 5%

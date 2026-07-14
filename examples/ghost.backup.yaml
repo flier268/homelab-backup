@@ -1,0 +1,44 @@
+version: 1
+service: ghost
+enabled: true
+
+schedule:
+  # 每 6 小時一次
+  cron: "0 */6 * * *"
+  retry_after: 30m
+  max_lateness: 3h
+
+retention:
+  keep_last: 8
+  keep_daily: 14
+  keep_weekly: 8
+  keep_monthly: 12
+  keep_yearly: 3
+
+compose:
+  files: [compose.yaml]
+
+consistency:
+  mode: hooks
+  timeout: 180
+  services: []
+  before:
+    - >-
+      mkdir -p ./backup-dumps &&
+      docker compose exec -T db sh -c
+      'exec mysqldump -uroot -p"$MYSQL_ROOT_PASSWORD" "$MYSQL_DATABASE"'
+      > ./backup-dumps/ghost.sql
+  after: []
+
+sources:
+  paths:
+    - id: compose
+      path: compose.yaml
+    - id: env
+      path: .env
+      required: false
+    - id: content
+      path: ./content
+    - id: database-dump
+      path: ./backup-dumps
+  volumes: []

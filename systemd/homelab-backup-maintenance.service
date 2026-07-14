@@ -1,0 +1,12 @@
+[Unit]
+Description=Homelab backup retention, prune, and repository check
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/backupctl maintenance
+ExecStart=/usr/local/sbin/backupctl check
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

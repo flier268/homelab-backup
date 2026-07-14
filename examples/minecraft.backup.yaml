@@ -1,0 +1,39 @@
+version: 1
+service: minecraft
+enabled: true
+
+schedule:
+  # 標準 5 欄 cron：分鐘 小時 日 月 星期
+  # 每天 02:00、08:00、14:00、20:00
+  cron: "0 2,8,14,20 * * *"
+  retry_after: 30m
+  max_lateness: 2h
+
+retention:
+  keep_last: 8
+  keep_daily: 14
+  keep_weekly: 8
+  keep_monthly: 12
+  keep_yearly: 3
+
+compose:
+  files: [compose.yaml]
+
+consistency:
+  mode: stop
+  timeout: 120
+  services: [minecraft]
+  before: []
+  after: []
+
+sources:
+  paths:
+    - id: compose
+      path: compose.yaml
+    - id: env
+      path: .env
+      required: false
+    - id: data
+      path: ./data
+      exclude: ["logs/**", "crash-reports/**"]
+  volumes: []

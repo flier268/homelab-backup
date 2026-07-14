@@ -1,0 +1,735 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Homelab Docker 備份：從零部署手冊</title>
+<style>
+:root{--bg:#f5f7fa;--panel:#fff;--text:#1f2937;--muted:#667085;--line:#d8dee8;--dark:#111827;--blue:#2563eb;--green:#087f5b;--amber:#b45309}
+*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,"Noto Sans TC","Segoe UI",sans-serif;line-height:1.72}
+.layout{display:grid;grid-template-columns:280px minmax(0,1fr);min-height:100vh}
+nav{position:sticky;top:0;height:100vh;overflow:auto;background:var(--dark);padding:26px 22px;color:#e5e7eb}
+nav h1{font-size:18px;color:white;margin:0 0 18px;line-height:1.4}nav a{display:block;color:#cbd5e1;text-decoration:none;padding:5px 0;font-size:14px}nav a:hover{color:white}
+main{max-width:1050px;width:100%;padding:42px 48px 100px}.hero,section{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:30px 34px;margin-bottom:22px}
+.hero h1{font-size:34px;line-height:1.25;margin:0 0 12px}.hero p{font-size:17px;color:var(--muted);margin:0}
+h2{font-size:25px;margin:0 0 18px;padding-bottom:10px;border-bottom:1px solid var(--line)}h3{margin-top:28px}
+pre{background:var(--dark);color:#e5e7eb;padding:17px 19px;border-radius:9px;overflow:auto;line-height:1.55}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#eef2f7;padding:2px 5px;border-radius:4px}pre code{background:transparent;padding:0}
+table{width:100%;border-collapse:collapse;margin:16px 0}th,td{border:1px solid var(--line);padding:10px 11px;text-align:left;vertical-align:top}th{background:#f2f4f7}
+.box{border-left:5px solid var(--blue);background:#eff6ff;padding:14px 17px;border-radius:8px;margin:17px 0}.ok{border-color:var(--green);background:#ecfdf5}.warn{border-color:var(--amber);background:#fffbeb}
+.flow{white-space:pre-wrap;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:#f8fafc;border:1px dashed #94a3b8;padding:17px;border-radius:9px}
+.small{color:var(--muted);font-size:14px}.step{display:inline-block;background:var(--blue);color:white;border-radius:999px;padding:2px 9px;font-weight:700;font-size:13px;margin-right:7px}
+@media(max-width:900px){.layout{display:block}nav{position:static;height:auto}main{padding:20px 12px 60px}.hero,section{padding:22px 18px}.hero h1{font-size:28px}}
+</style>
+</head>
+<body>
+<div class="layout">
+<nav>
+<h1>Homelab Docker 備份<br>從零部署手冊</h1>
+<a href="#goal">1. 目標與架構</a>
+<a href="#requirements">2. 前置條件</a>
+<a href="#docker">3. 安裝 Docker Compose</a>
+<a href="#directories">4. 建立 /srv/stacks</a>
+<a href="#git">5. 可選：用 Git 保存 stacks</a>
+<a href="#install">6. 取得並安裝專案</a>
+<a href="#onedrive">7. 設定 OneDrive</a>
+<a href="#global-config">8. 全域設定</a>
+<a href="#config-backup">9. 備份復原必要設定</a>
+<a href="#manifest">10. backup.yaml</a>
+<a href="#consistency">11. 一致性模式</a>
+<a href="#sources">12. Bind 與 Volume</a>
+<a href="#cron">13. Cron 排程</a>
+<a href="#retention">14. 保留策略</a>
+<a href="#examples">15. 服務範例</a>
+<a href="#validate">16. 驗證與初始化</a>
+<a href="#first-backup">17. 首次備份</a>
+<a href="#restore-test">18. 還原與全選操作</a>
+<a href="#enable">19. 啟用自動排程</a>
+<a href="#monitor">20. 監控與維護</a>
+<a href="#secrets">21. 災難復原必要材料</a>
+<a href="#disaster">22. 主機全毀重建</a>
+</nav>
+
+<main>
+<div class="hero">
+<h1>Docker Compose + Restic + OneDrive<br>每個服務自行宣告備份</h1>
+<p>從一台尚未部署本方案的 Linux 主機開始，完成工具安裝、OneDrive 授權、服務 manifest、首次備份、還原測試與 systemd 自動排程。</p>
+</div>
+
+<section id="goal">
+<h2>1. 目標與架構</h2>
+<div class="box ok"><strong>服務仍由 Docker Compose 管理。</strong> 每個服務在自己的目錄放一份 <code>backup.yaml</code>，自行宣告排程、保留策略、備份來源與一致性方式。</div>
+<div class="flow">/srv/stacks/minecraft/backup.yaml ─┐
+/srv/stacks/palworld/backup.yaml  ├─ backupctl 每 5 分鐘掃描
+/srv/stacks/ghost/backup.yaml     ┘
+            ↓
+停止服務或執行 hook
+            ↓
+本機 staging
+            ↓
+Restic 加密、去重、快照
+            ↓
+rclone → OneDrive repository</div>
+<table>
+<tr><th>元件</th><th>用途</th></tr>
+<tr><td>Docker Compose</td><td>執行 Minecraft、Palworld、Ghost 等服務。</td></tr>
+<tr><td><code>backup.yaml</code></td><td>每個服務自己的排程、保留策略與來源清單。</td></tr>
+<tr><td><code>backupctl</code></td><td>掃描 manifest、建立 staging、控制 Compose、執行 Restic。</td></tr>
+<tr><td>Restic</td><td>加密、去重、snapshot、forget、prune、check、restore。</td></tr>
+<tr><td>rclone</td><td>讓 Restic 使用 OneDrive 作為 repository backend。</td></tr>
+<tr><td>systemd timer</td><td>每 5 分鐘執行一次到期檢查；另有週期性維護。</td></tr>
+</table>
+</section>
+
+<section id="requirements">
+<h2>2. 前置條件</h2>
+<ul>
+<li>Debian、Ubuntu 或 Linux Mint 類型系統。</li>
+<li>目前登入帳號具備 <code>sudo</code> 權限。</li>
+<li>兩台主機需要各自執行本手冊。</li>
+<li>Microsoft OneDrive 帳號可正常登入。</li>
+<li>服務可以短暫停止，或能透過 hook 產生一致性快照。</li>
+</ul>
+<p>下列命令用來確認系統：</p>
+<pre><code>cat /etc/os-release
+uname -a
+id
+sudo -v</code></pre>
+</section>
+
+<section id="docker">
+<h2>3. 安裝或確認 Docker Compose</h2>
+<p>先檢查：</p>
+<pre><code>docker --version
+docker compose version</code></pre>
+<p>若兩者都能正常輸出，可以直接前往下一章。</p>
+<h3>Ubuntu／Linux Mint 安裝 Docker 官方套件</h3>
+<pre><code>sudo apt update
+sudo apt install -y ca-certificates curl
+
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+  -o /etc/apt/keyrings/docker.asc
+sudo chmod a+r /etc/apt/keyrings/docker.asc
+
+. /etc/os-release
+
+echo \
+  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] \
+https://download.docker.com/linux/ubuntu \
+${UBUNTU_CODENAME:-$VERSION_CODENAME} stable" \
+| sudo tee /etc/apt/sources.list.d/docker.list &gt; /dev/null
+
+sudo apt update
+sudo apt install -y \
+  docker-ce docker-ce-cli containerd.io \
+  docker-buildx-plugin docker-compose-plugin
+
+sudo systemctl enable --now docker</code></pre>
+<h3>讓目前帳號可操作 Docker</h3>
+<pre><code>sudo usermod -aG docker "$USER"</code></pre>
+<p>登出後重新登入，再測試：</p>
+<pre><code>docker run --rm hello-world
+docker compose version</code></pre>
+<div class="box warn">加入 <code>docker</code> 群組等同授予高權限。這台電腦只有你使用時較容易接受，但仍不應把不受信任的人加入此群組。</div>
+</section>
+
+<section id="directories">
+<h2>4. 建立 Compose 服務目錄</h2>
+<p>Compose 專案統一放在：</p>
+<pre><code>/srv/stacks/&lt;service&gt;</code></pre>
+<p>建立並交給目前使用者：</p>
+<pre><code>sudo mkdir -p /srv/stacks
+sudo chown -R "$USER":"$USER" /srv/stacks
+sudo chmod 755 /srv /srv/stacks</code></pre>
+<p>建議結構：</p>
+<pre><code>/srv/stacks/
+├── minecraft/
+│   ├── compose.yaml
+│   ├── .env
+│   ├── backup.yaml
+│   └── data/
+├── palworld/
+│   ├── compose.yaml
+│   ├── .env
+│   ├── backup.yaml
+│   └── data/
+└── ghost/
+    ├── compose.yaml
+    ├── .env
+    ├── backup.yaml
+    └── content/</code></pre>
+<p>一般權限：</p>
+<pre><code>chmod 644 compose.yaml backup.yaml
+chmod 600 .env</code></pre>
+<p>資料目錄先讓 container 建立或使用預設權限；只有遇到 permission denied 時，才依 image 的 UID/GID 個別調整。</p>
+</section>
+
+<section id="git">
+<h2>5. 可選：用 Git 保存 <code>/srv/stacks</code></h2>
+<p>可以把各服務的 <code>compose.yaml</code>、Dockerfile、Caddyfile、scripts 與其他非機密部署檔保存到 private Git，作為版本管理與額外副本。</p>
+<p>這是加分項，不是本專案災難復原的必要條件，也不在本專案主要流程內。即使沒有另外備份 <code>/srv/stacks</code>，仍可從 Restic snapshot 取回服務資料、Compose 檔與自動保存的 <code>backup.yaml</code>。</p>
+<div class="box warn">不要把公開 Git 當成 secrets 儲存位置。真正的 <code>.env</code>、Restic 密碼與 rclone token 不應公開。</div>
+</section>
+
+<section id="install">
+<h2>6. 從 GitHub 取得並安裝專案</h2>
+<p>若尚未安裝 Git：</p>
+<pre><code>sudo apt update
+sudo apt install -y git</code></pre>
+<pre><code>cd ~/Apps
+git clone https://github.com/flier268/homelab-backup.git
+cd homelab-backup
+sudo ./install.sh</code></pre>
+<p>安裝器會：</p>
+<ul>
+<li>安裝 Python、PyYAML、rsync、Restic、rclone、OpenSSL。</li>
+<li>安裝 <code>/usr/local/sbin/backupctl</code>。</li>
+<li>建立全域設定、密碼、staging、restore、state 與 cache 路徑。</li>
+<li>建立 named-volume rsync helper image。</li>
+<li>安裝 systemd service 與 timer，但不立即啟用。</li>
+</ul>
+<p>確認：</p>
+<pre><code>command -v backupctl
+backupctl --help
+restic version
+rclone version
+rsync --version</code></pre>
+</section>
+
+<section id="onedrive">
+<h2>7. 設定 OneDrive</h2>
+<p>使用 root 的獨立 rclone 設定：</p>
+<pre><code>sudo rclone config \
+  --config /etc/homelab-backup/rclone/rclone.conf</code></pre>
+<p>建立 remote 時：</p>
+<ol>
+<li>選擇 <code>n</code> 建立新 remote。</li>
+<li>名稱固定使用 <code>onedrive</code>。</li>
+<li>Storage 選 Microsoft OneDrive。</li>
+<li>依提示完成 Microsoft OAuth。</li>
+<li>選擇正確的 OneDrive drive。</li>
+</ol>
+<p>完成後：</p>
+<pre><code>sudo chmod 600 /etc/homelab-backup/rclone/rclone.conf
+
+sudo rclone lsd onedrive: \
+  --config /etc/homelab-backup/rclone/rclone.conf</code></pre>
+<p>本方案不使用 <code>rclone mount</code>。Restic 直接使用：</p>
+<pre><code>rclone:onedrive:Backups/restic/server-a</code></pre>
+</section>
+
+<section id="global-config">
+<h2>8. 設定本機 repository</h2>
+<p>編輯：</p>
+<pre><code>sudo editor /etc/homelab-backup/config.yaml</code></pre>
+<h3>第一台主機</h3>
+<pre><code>version: 1
+host_id: server-a
+services_root: /srv/stacks
+
+repository: rclone:onedrive:Backups/restic/server-a
+password_file: /etc/homelab-backup/restic-password
+rclone_config: /etc/homelab-backup/rclone/rclone.conf
+
+staging_root: /var/lib/homelab-backup/staging
+restore_root: /var/lib/homelab-backup/restores
+state_root: /var/lib/homelab-backup/state
+cache_root: /var/cache/homelab-backup/restic
+
+lock_file: /run/lock/homelab-backup.lock
+volume_helper_image: homelab/volume-rsync:1
+
+rclone:
+  bwlimit: ""
+
+check:
+  read_data_subset: 5%</code></pre>
+<h3>第二台主機</h3>
+<p>只需改成：</p>
+<pre><code>host_id: server-b
+repository: rclone:onedrive:Backups/restic/server-b</code></pre>
+<div class="box">兩台主機可以共用同一個 OneDrive 帳號，但應使用不同 Restic repository。這樣 lock、prune、check 與故障範圍不會互相干擾。</div>
+</section>
+
+<section id="config-backup">
+<h2>9. 備份災難復原必要設定</h2>
+<p>完成 OneDrive 與全域設定後，在專案目錄執行：</p>
+<pre><code>cd ~/Apps/homelab-backup
+sudo ./backup-configs.sh</code></pre>
+<p>此腳本只允許 root 執行，因為輸出內容包含 Restic 密碼與 rclone 帳戶憑證。</p>
+<p>腳本會把以下三個必要檔案複製到專案的 <code>configs/</code>：</p>
+<pre><code>configs/restic-password
+configs/rclone.conf
+configs/config.yaml</code></pre>
+<p>接著只能選一種保存方式：</p>
+<ol>
+<li><strong>Git：</strong>腳本先顯示 configured remotes；確認所有目的地都是嚴格控管的 private repository 後，必須輸入完整的 <code>PRIVATE</code>，腳本才會提交設定並詢問是否 <code>git push</code>。</li>
+<li><strong>ZIP：</strong>建立 <code>homelab-backup-configs-YYYYMMDD-HHMMSS.zip</code>。</li>
+</ol>
+<div class="box warn"><code>restic-password</code> 與 <code>rclone.conf</code> 都是 secrets。Git 選項只能用於嚴格控管存取權的 private repository。ZIP 本身沒有加密，應放入加密密碼管理器或離線加密媒體。</div>
+<h3>從 <code>configs/</code> 放回設定</h3>
+<pre><code>cd ~/Apps/homelab-backup
+./restore-configs.sh</code></pre>
+<p>還原腳本會將檔案安裝到：</p>
+<pre><code>/etc/homelab-backup/restic-password
+/etc/homelab-backup/rclone/rclone.conf
+/etc/homelab-backup/config.yaml</code></pre>
+<p>如果 <code>configs/</code> 缺少任何一個必要檔案，腳本會列出缺失項目、要求使用者先補齊，然後終止，不會執行部分還原。</p>
+</section>
+
+<section id="manifest">
+<h2>10. 每個服務的 <code>backup.yaml</code></h2>
+<p>每個服務在自己的 Compose 目錄放一份 manifest：</p>
+<div class="box ok"><code>backup.yaml</code> 由備份程式自動保存到每份 snapshot 的 <code>_meta/backup.yaml</code>，不需要再把它寫進 <code>sources.paths</code>。</div>
+<div class="box">目錄名稱必須與 <code>service</code> 完全相同；manifest、compose、sources 與各 source entry 的未知欄位會被拒絕，避免拼字錯誤造成靜默漏備份。</div>
+<pre><code>/srv/stacks/minecraft/backup.yaml</code></pre>
+<p>完整結構：</p>
+<pre><code>version: 1
+service: minecraft
+enabled: true
+
+schedule:
+  cron: "0 2,8,14,20 * * *"
+  retry_after: 30m
+  max_lateness: 2h
+
+retention:
+  keep_last: 8
+  keep_daily: 14
+  keep_weekly: 8
+  keep_monthly: 12
+  keep_yearly: 3
+
+compose:
+  files:
+    - compose.yaml
+
+consistency:
+  mode: stop
+  timeout: 120
+  services:
+    - minecraft
+  before: []
+  after: []
+
+sources:
+  paths:
+    - id: compose
+      path: compose.yaml
+
+    - id: env
+      path: .env
+      required: false
+
+    - id: data
+      path: ./data
+      exclude:
+        - logs/**
+        - crash-reports/**
+
+  volumes: []</code></pre>
+</section>
+
+<section id="consistency">
+<h2>11. 一致性模式</h2>
+<table>
+<tr><th>模式</th><th>行為</th><th>用途</th></tr>
+<tr><td><code>stop</code></td><td>預同步 → 停止指定 Compose services → 最終同步與 volume 備份 → 重啟原本運行的 services。</td><td>Minecraft、Palworld、持續寫入檔案、raw database volume。</td></tr>
+<tr><td><code>hooks</code></td><td>執行 before hook → 同步 → 執行 after hook；不自動停服。</td><td>SQL dump、RCON save、應用內建 snapshot。</td></tr>
+<tr><td><code>none</code></td><td>直接同步，不停止、不執行一致性 hook。</td><td>靜態檔、唯讀資料、可重建內容。</td></tr>
+</table>
+<h3><code>stop</code> 範例</h3>
+<pre><code>consistency:
+  mode: stop
+  timeout: 180
+  services:
+    - ghost
+    - db</code></pre>
+<h3><code>hooks</code> 範例</h3>
+<pre><code>consistency:
+  mode: hooks
+  before:
+    - ./scripts/dump-database.sh
+  after: []</code></pre>
+<div class="box warn">不確定時先使用 <code>stop</code>。它較保守，也比較容易實際驗證還原結果。</div>
+</section>
+
+<section id="sources">
+<h2>12. Bind mount 與 named volume</h2>
+<h3>Bind mount</h3>
+<p>Compose：</p>
+<pre><code>services:
+  minecraft:
+    volumes:
+      - ./data:/data</code></pre>
+<p>Manifest：</p>
+<pre><code>sources:
+  paths:
+    - id: data
+      path: ./data
+      exclude:
+        - logs/**
+        - crash-reports/**</code></pre>
+<h3>Compose named volume</h3>
+<p>Compose：</p>
+<pre><code>services:
+  db:
+    volumes:
+      - db-data:/var/lib/mysql
+
+volumes:
+  db-data:</code></pre>
+<p>Manifest：</p>
+<pre><code>sources:
+  volumes:
+    - id: database
+      compose_volume: db-data</code></pre>
+<p><code>compose_volume</code> 填 Compose 頂層邏輯 key，不是實際 Docker volume 名稱。工具會透過 <code>docker compose config --format json</code> 解析。</p>
+<h3>外部 volume</h3>
+<pre><code>sources:
+  volumes:
+    - id: shared-data
+      name: company_shared_data</code></pre>
+<h3>Anonymous volume</h3>
+<p>以下形式沒有穩定名稱，不適合宣告式備份：</p>
+<pre><code>volumes:
+  - /data</code></pre>
+<p>應改成 named volume：</p>
+<pre><code>services:
+  app:
+    volumes:
+      - app-data:/data
+
+volumes:
+  app-data:</code></pre>
+</section>
+
+<section id="cron">
+<h2>13. Cron 排程</h2>
+<p>格式固定為標準 5 欄：</p>
+<pre><code>分鐘 小時 日期 月份 星期</code></pre>
+<table>
+<tr><th>表達式</th><th>意義</th></tr>
+<tr><td><code>0 2 * * *</code></td><td>每天 02:00</td></tr>
+<tr><td><code>0 2,8,14,20 * * *</code></td><td>每天 02:00、08:00、14:00、20:00</td></tr>
+<tr><td><code>*/15 * * * *</code></td><td>每 15 分鐘</td></tr>
+<tr><td><code>0 */6 * * *</code></td><td>每 6 小時整點</td></tr>
+<tr><td><code>30 3 * * mon-fri</code></td><td>週一到週五 03:30</td></tr>
+<tr><td><code>0 4 1 * *</code></td><td>每月 1 日 04:00</td></tr>
+</table>
+<p>排程器每 5 分鐘掃描，因此實際開始時間可能比 cron 時點晚數分鐘。</p>
+<h3>備份超過 5 分鐘</h3>
+<ul>
+<li>systemd oneshot 不會同時再啟動第二份相同 service。</li>
+<li>全域 <code>flock</code> 阻止手動備份、排程、還原與維護重疊。</li>
+<li>多個服務同時到期時依序執行，不平行寫入 repository。</li>
+<li>執行期間經過的 cron 時點不建立工作佇列。</li>
+</ul>
+<div class="box">例如 02:00 開始，備份到 08:20，而 cron 也包含 08:00：08:00 不會另開第二份；完成後下一個有效時點是 14:00。</div>
+<h3>失敗重試</h3>
+<pre><code>schedule:
+  cron: "0 */6 * * *"
+  retry_after: 30m
+  max_lateness: 2h</code></pre>
+<p>失敗後至少等待 30 分鐘再重試；若該 cron 時點已遲到超過 2 小時，放棄該次，等待下一時點。</p>
+</section>
+
+<section id="retention">
+<h2>14. 每個服務的保留策略</h2>
+<pre><code>retention:
+  keep_last: 8
+  keep_daily: 14
+  keep_weekly: 8
+  keep_monthly: 12
+  keep_yearly: 3</code></pre>
+<table>
+<tr><th>欄位</th><th>意義</th></tr>
+<tr><td><code>keep_last</code></td><td>保留最新 N 份。</td></tr>
+<tr><td><code>keep_hourly</code></td><td>最近 N 個有 snapshot 的小時，各留一份。</td></tr>
+<tr><td><code>keep_daily</code></td><td>最近 N 個有 snapshot 的日期，各留一份。</td></tr>
+<tr><td><code>keep_weekly</code></td><td>最近 N 個有 snapshot 的週，各留一份。</td></tr>
+<tr><td><code>keep_monthly</code></td><td>最近 N 個有 snapshot 的月份，各留一份。</td></tr>
+<tr><td><code>keep_yearly</code></td><td>最近 N 個有 snapshot 的年份，各留一份。</td></tr>
+</table>
+<div class="box warn">多個 <code>keep-*</code> 條件是聯集，不是總數相加，也不是絕對最大數量。只要符合任一規則就保留。若要嚴格只留最新 30 份，只設定 <code>keep_last: 30</code>。</div>
+</section>
+
+<section id="examples">
+<h2>15. 服務範例</h2>
+<h3>Minecraft</h3>
+<pre><code>version: 1
+service: minecraft
+enabled: true
+
+schedule:
+  cron: "0 2,8,14,20 * * *"
+  retry_after: 30m
+  max_lateness: 2h
+
+retention:
+  keep_last: 8
+  keep_daily: 14
+  keep_weekly: 8
+  keep_monthly: 12
+
+compose:
+  files: [compose.yaml]
+
+consistency:
+  mode: stop
+  timeout: 120
+  services: [minecraft]
+  before: []
+  after: []
+
+sources:
+  paths:
+    - id: compose
+      path: compose.yaml
+    - id: env
+      path: .env
+      required: false
+    - id: data
+      path: ./data
+      exclude:
+        - logs/**
+        - crash-reports/**
+  volumes: []</code></pre>
+<h3>Ghost + MySQL named volume</h3>
+<pre><code>version: 1
+service: ghost
+enabled: true
+
+schedule:
+  cron: "0 3,15 * * *"
+  retry_after: 30m
+  max_lateness: 3h
+
+retention:
+  keep_last: 4
+  keep_daily: 14
+  keep_weekly: 8
+  keep_monthly: 12
+
+compose:
+  files: [compose.yaml]
+
+consistency:
+  mode: stop
+  timeout: 180
+  services:
+    - ghost
+    - db
+
+sources:
+  paths:
+    - id: compose
+      path: compose.yaml
+    - id: env
+      path: .env
+      required: false
+    - id: content
+      path: ./content
+
+  volumes:
+    - id: mysql-data
+      compose_volume: db-data</code></pre>
+<div class="box warn">資料庫較成熟的做法是使用 <code>hooks</code> 產生 SQL logical dump，再備份 dump。直接備份 raw MySQL volume 時，還原環境應維持相同資料庫產品與 major version。</div>
+</section>
+
+<section id="validate">
+<h2>16. 驗證並初始化 repository</h2>
+<h3>列出 manifests</h3>
+<pre><code>sudo backupctl list</code></pre>
+<h3>完整驗證</h3>
+<pre><code>sudo backupctl validate</code></pre>
+<p>驗證內容包括：</p>
+<ul>
+<li>全域 YAML 與每個 <code>backup.yaml</code>。</li>
+<li>Compose 檔案與 <code>docker compose config</code>。</li>
+<li>required paths。</li>
+<li>Compose logical volume 與實際 Docker volume。</li>
+<li>Cron、retention 與 consistency 欄位。</li>
+<li>helper image、Restic、rclone、rsync。</li>
+</ul>
+<h3>第一次建立 repository</h3>
+<pre><code>sudo backupctl init</code></pre>
+<div class="box warn"><code>init</code> 只在 repository 尚不存在時執行。主機重建、重新連接既有 repository 時不要再次執行。</div>
+</section>
+
+<section id="first-backup">
+<h2>17. 執行首次備份</h2>
+<p>先測單一服務：</p>
+<pre><code>sudo backupctl backup minecraft</code></pre>
+<p>查看 snapshot：</p>
+<pre><code>sudo backupctl snapshots minecraft</code></pre>
+<p>再測其他服務：</p>
+<pre><code>sudo backupctl backup ghost
+sudo backupctl backup palworld</code></pre>
+<p>一次備份所有 enabled 服務：</p>
+<pre><code>sudo backupctl backup</code></pre>
+<p>查看排程狀態：</p>
+<pre><code>sudo backupctl status</code></pre>
+</section>
+
+<section id="restore-test">
+<h2>18. 還原、選取與一次還原全部服務</h2>
+<p>不指定服務名稱時，會從 Restic repository 找出所有具有 <code>service:&lt;name&gt;</code> tag 的服務，開啟互動式選單。所有項目預設勾選：</p>
+<pre><code>sudo backupctl restore</code></pre>
+<p>操作鍵：</p>
+<table>
+<tr><th>按鍵</th><th>功能</th></tr>
+<tr><td>↑／↓</td><td>移動游標</td></tr>
+<tr><td>Space</td><td>切換目前服務</td></tr>
+<tr><td>A</td><td>全選或全部取消</td></tr>
+<tr><td>Enter</td><td>確認</td></tr>
+<tr><td>Q／Esc</td><td>取消</td></tr>
+</table>
+<h3>略過服務選單並還原全部服務</h3>
+<pre><code>sudo backupctl restore --all</code></pre>
+<p>仍會進行最後確認。stdin 不是 TTY（例如自動化或 pipe）時必須明確加入 <code>--yes</code>，否則命令會拒絕執行。</p>
+<h3>還原、套用並啟動全部服務</h3>
+<pre><code>sudo backupctl restore --all --apply --start --yes</code></pre>
+<p>也可只指定部分服務：</p>
+<pre><code>sudo backupctl restore minecraft ghost --apply</code></pre>
+<h3><code>backup.yaml</code> 的還原規則</h3>
+<ul>
+<li>本機不存在 <code>/srv/stacks/&lt;service&gt;/backup.yaml</code>：直接從 snapshot 的 <code>_meta/backup.yaml</code> 還原，並依該 manifest 套用資料。</li>
+<li>本機已存在：互動詢問是否以 snapshot 中的 <code>backup.yaml</code> 覆蓋。</li>
+<li>可用 <code>--restore-manifest</code> 強制採用 snapshot manifest。</li>
+<li>可用 <code>--keep-manifest</code> 強制保留本機 manifest。</li>
+</ul>
+<p>單純下載 snapshot 時，資料放在：</p>
+<pre><code>/var/lib/homelab-backup/restores/&lt;service&gt;/&lt;timestamp&gt;</code></pre>
+<div class="box warn">第一次上線前至少實際執行一次 <code>restore --apply</code> 測試。成功上傳不等於能成功還原。</div>
+<div class="box">套用前會先驗證所有 required path、volume 與 Compose 檔案均存在於還原資料中，並停止該 Compose project 目前所有運行中的 services；任何必要來源缺失都會中止，不會以空目錄覆寫正式 volume。設定的 exclude 也會在還原時保留。</div>
+</section>
+
+<section id="enable">
+<h2>19. 啟用自動排程</h2>
+<p>只有在以下項目完成後才啟用：</p>
+<ul>
+<li><code>validate</code> 通過。</li>
+<li>每個服務至少成功備份一次。</li>
+<li>至少一個服務完成實際還原測試。</li>
+<li>Restic 密碼已另外保存。</li>
+</ul>
+<pre><code>sudo systemctl enable --now homelab-backup.timer
+sudo systemctl enable --now homelab-backup-maintenance.timer</code></pre>
+<p>確認：</p>
+<pre><code>systemctl list-timers 'homelab-backup*'
+systemctl status homelab-backup.timer
+systemctl status homelab-backup-maintenance.timer</code></pre>
+<p>每 5 分鐘 timer 執行：</p>
+<pre><code>backupctl run-due</code></pre>
+<p>它只備份當下到期的服務。</p>
+</section>
+
+<section id="monitor">
+<h2>20. 監控與 repository 維護</h2>
+<h3>查看服務執行紀錄</h3>
+<pre><code>journalctl -u homelab-backup.service \
+  -n 200 --no-pager
+
+journalctl -u homelab-backup.service -f</code></pre>
+<h3>檢查目前狀態</h3>
+<pre><code>sudo backupctl status
+sudo backupctl snapshots</code></pre>
+<h3>預覽 retention</h3>
+<pre><code>sudo backupctl maintenance --dry-run</code></pre>
+<h3>正式 forget + prune</h3>
+<pre><code>sudo backupctl maintenance</code></pre>
+<h3>Repository check</h3>
+<pre><code>sudo backupctl check</code></pre>
+<h3>非正常中斷後移除 stale lock</h3>
+<pre><code>sudo backupctl unlock</code></pre>
+<p>此命令只移除 Restic repository 判定為 stale 的 locks，不處理會隨 process 自動釋放的本機 <code>flock</code>。只有確認沒有其他 Restic process 執行時才能使用。</p>
+</section>
+
+<section id="secrets">
+<h2>21. 災難復原必要材料</h2>
+<p>本專案以最少外部材料完成復原。真正必要的是：</p>
+<table>
+<tr><th>材料</th><th>用途</th></tr>
+<tr><td>本專案程式碼</td><td>從 <code>https://github.com/flier268/homelab-backup.git</code> 重新 clone。</td></tr>
+<tr><td><code>configs/restic-password</code></td><td>解密 Restic repository。</td></tr>
+<tr><td><code>configs/rclone.conf</code></td><td>存取 OneDrive；也可以重新授權取代。</td></tr>
+<tr><td><code>configs/config.yaml</code></td><td>提供 host ID、repository 路徑與本機工作路徑。</td></tr>
+<tr><td>OneDrive Restic repository</td><td>保存服務資料、歷史 snapshots、Compose 等來源檔，以及自動保存的 <code>backup.yaml</code>。</td></tr>
+</table>
+<p>使用 <code>./backup-configs.sh</code> 產生並保存前三個設定檔。使用 <code>./restore-configs.sh</code> 放回對應系統路徑。</p>
+<div class="box ok">不需要另外備份 <code>/srv/stacks</code> 才能完成復原。用 private Git 保存 stacks 只會讓版本管理與人工查看更方便。</div>
+<div class="box warn">如果遺失 Restic 密碼，即使 OneDrive repository 還在，也無法解密資料。</div>
+</section>
+
+<section id="disaster">
+<h2>22. 主機全毀後的最短重建流程</h2>
+<h3>1. 重新取得專案</h3>
+<pre><code>cd ~/Apps
+git clone https://github.com/flier268/homelab-backup.git
+cd homelab-backup</code></pre>
+<h3>2. 準備 <code>configs/</code></h3>
+<p>若設定已存入 private Git，clone 後應直接存在。若使用 ZIP，將 ZIP 解壓到專案目錄，最後必須是：</p>
+<pre><code>configs/restic-password
+configs/rclone.conf
+configs/config.yaml</code></pre>
+<h3>3. 安裝工具</h3>
+<pre><code>sudo ./install.sh</code></pre>
+<h3>4. 放回必要設定</h3>
+<pre><code>./restore-configs.sh</code></pre>
+<p>此腳本實際執行等效於：</p>
+<pre><code>sudo install -d -o root -g root -m 0700 \
+  /etc/homelab-backup/rclone
+
+sudo install -o root -g root -m 0600 \
+  configs/restic-password \
+  /etc/homelab-backup/restic-password
+
+sudo install -o root -g root -m 0600 \
+  configs/rclone.conf \
+  /etc/homelab-backup/rclone/rclone.conf
+
+sudo install -o root -g root -m 0600 \
+  configs/config.yaml \
+  /etc/homelab-backup/config.yaml</code></pre>
+<h3>5. 測試 OneDrive 與 repository</h3>
+<pre><code>sudo rclone lsd onedrive: \
+  --config /etc/homelab-backup/rclone/rclone.conf
+
+sudo backupctl snapshots</code></pre>
+<p><strong>不要執行 <code>backupctl init</code></strong>，因為這是連回原有 repository。</p>
+<h3>6. 還原全部服務</h3>
+<p>互動選取，預設全選：</p>
+<pre><code>sudo backupctl restore --apply --start</code></pre>
+<p>完全非互動：</p>
+<pre><code>sudo backupctl restore --all \
+  --restore-manifest --apply --start --yes</code></pre>
+<p>本機沒有 <code>backup.yaml</code> 時，程式會先從 snapshot 還原它；之後依其中的 path 與 volume 定義還原各服務，不需要 bootstrap 命令。</p>
+<h3>7. 檢查服務</h3>
+<pre><code>docker ps
+cd /srv/stacks/ghost
+docker compose ps
+docker compose logs --tail=200</code></pre>
+<h3>8. 最後才啟用排程</h3>
+<pre><code>sudo systemctl enable --now homelab-backup.timer
+sudo systemctl enable --now homelab-backup-maintenance.timer</code></pre>
+</section>
+
+<section>
+<h2>部署完成條件</h2>
+<ul>
+<li>兩台主機各自使用獨立 repository。</li>
+<li>所有 manifests 通過驗證。</li>
+<li>所有重要服務有成功 snapshot。</li>
+<li>至少完成一次實際 restore + apply。</li>
+<li><code>configs/</code> 三個必要檔案已有安全的外部副本。</li>
+<li>Restic 密碼、repository 設定與 OneDrive 授權資料可在主機外取得。</li>
+<li>systemd timers 正常執行且 journal 無錯誤。</li>
+<li>舊備份方案在新方案還原驗證完成前不要刪除。</li>
+</ul>
+<p class="small">本文件按首次部署流程編排。</p>
+</section>
+</main>
+</div>
+</body>
+</html>

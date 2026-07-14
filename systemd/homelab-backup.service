@@ -1,0 +1,12 @@
+[Unit]
+Description=Evaluate and run due homelab backups
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/backupctl run-due
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

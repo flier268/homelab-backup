@@ -1,0 +1,1450 @@
+#!/usr/bin/env python3
+import argparse
+import curses
+import datetime as dt
+import fcntl
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+import yaml
+
+CFG = Path('/etc/homelab-backup/config.yaml')
+VERSION = '2.5.0'
+DURATION_RE = re.compile(r'^(\d+)(m|h|d|w)$')
+RETENTION_FLAGS = (
+    ('keep_last', '--keep-last'),
+    ('keep_hourly', '--keep-hourly'),
+    ('keep_daily', '--keep-daily'),
+    ('keep_weekly', '--keep-weekly'),
+    ('keep_monthly', '--keep-monthly'),
+    ('keep_yearly', '--keep-yearly'),
+)
+SERVICE_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]*')
+
+
+def die(msg):
+    print(f'ERROR: {msg}', file=sys.stderr)
+    raise SystemExit(1)
+
+
+class CommandError(RuntimeError):
+    def __init__(self, cmd, returncode, cwd=None, stdout='', stderr=''):
+        self.cmd = [str(x) for x in cmd]
+        self.returncode = returncode
+        self.cwd = str(cwd) if cwd else None
+        self.stdout = stdout or ''
+        self.stderr = stderr or ''
+        self.reported = False
+        super().__init__(f'command failed with exit code {returncode}')
+
+
+def _print_command_failure(err, *, context=None):
+    err.reported = True
+    if context:
+        print(f'ERROR: {context}', file=sys.stderr)
+    print(f'ERROR: command exited with status {err.returncode}', file=sys.stderr)
+    if err.cwd:
+        print(f'  working directory: {err.cwd}', file=sys.stderr)
+    print('  command: ' + ' '.join(shlex.quote(x) for x in err.cmd), file=sys.stderr)
+    if err.stderr.strip():
+        print('  stderr:', file=sys.stderr)
+        for line in err.stderr.rstrip().splitlines():
+            print(f'    {line}', file=sys.stderr)
+    if err.stdout.strip():
+        print('  stdout:', file=sys.stderr)
+        for line in err.stdout.rstrip().splitlines():
+            print(f'    {line}', file=sys.stderr)
+
+
+def run(cmd, *, cwd=None, env=None, check=True, capture=False):
+    printable = ' '.join(shlex.quote(str(x)) for x in cmd)
+    print('+', printable)
+    must_capture = capture or check
+    result = subprocess.run(
+        cmd, cwd=cwd, env=env, check=False, text=True,
+        capture_output=must_capture,
+    )
+    if check and result.returncode != 0:
+        raise CommandError(cmd, result.returncode, cwd=cwd, stdout=result.stdout, stderr=result.stderr)
+    if must_capture and not capture:
+        if result.stdout:
+            print(result.stdout, end='')
+        if result.stderr:
+            print(result.stderr, end='', file=sys.stderr)
+    return result
+
+
+def load_yaml(path):
+    with open(path, encoding='utf-8') as f:
+        return yaml.safe_load(f) or {}
+
+
+def atomic_write_json(path, data):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + '.tmp')
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+    os.replace(tmp, path)
+
+
+def resolved_path(path):
+    return Path(path).expanduser().resolve(strict=False)
+
+
+def paths_overlap(left, right):
+    left = resolved_path(left)
+    right = resolved_path(right)
+    return left == right or left in right.parents or right in left.parents
+
+
+def cfg():
+    if not CFG.exists():
+        die(f'missing {CFG}')
+    c = load_yaml(CFG)
+    if not isinstance(c, dict):
+        die(f'{CFG} must contain a YAML mapping')
+    required = [
+        'host_id', 'services_root', 'repository', 'password_file',
+        'rclone_config', 'staging_root', 'restore_root', 'cache_root',
+        'volume_helper_image', 'state_root', 'lock_file',
+    ]
+    for key in required:
+        if not c.get(key):
+            die(f'config missing {key}')
+    if paths_overlap(c['staging_root'], c['services_root']):
+        die('staging_root must not overlap services_root')
+    return c
+
+
+def manifests(c, include_disabled=False):
+    out = []
+    for path in sorted(Path(c['services_root']).glob('*/backup.yaml')):
+        m = load_yaml(path)
+        if not isinstance(m, dict):
+            raise ValueError(f'{path}: manifest must be a YAML mapping')
+        m['_path'] = str(path)
+        m['_dir'] = str(path.parent)
+        if include_disabled or m.get('enabled', True):
+            out.append(m)
+    return out
+
+
+def manifest(c, name):
+    for m in manifests(c):
+        if m.get('service') == name:
+            return m
+    die(f'unknown or disabled service: {name}')
+
+
+def compose_cmd(m):
+    cmd = ['docker', 'compose']
+    for f in m.get('compose', {}).get('files', ['compose.yaml']):
+        cmd += ['-f', f]
+    return cmd
+
+
+def restic_env(c):
+    env = os.environ.copy()
+    env.update({
+        'RESTIC_REPOSITORY': c['repository'],
+        'RESTIC_PASSWORD_FILE': c['password_file'],
+        'RESTIC_CACHE_DIR': c['cache_root'],
+        'RCLONE_CONFIG': c['rclone_config'],
+    })
+    bwlimit = (c.get('rclone') or {}).get('bwlimit')
+    if bwlimit:
+        env['RCLONE_BWLIMIT'] = str(bwlimit)
+    return env
+
+
+def parse_duration(value, field):
+    if not isinstance(value, str):
+        raise ValueError(f'{field} must be a duration string such as 30m, 6h, or 1d')
+    match = DURATION_RE.fullmatch(value.strip().lower())
+    if not match:
+        raise ValueError(f'{field} must match <number><m|h|d|w>, for example 30m, 6h, 1d')
+    number = int(match.group(1))
+    if number <= 0:
+        raise ValueError(f'{field} must be greater than zero')
+    unit = match.group(2)
+    return number * {'m': 60, 'h': 3600, 'd': 86400, 'w': 604800}[unit]
+
+
+def _cron_atom(value, names, field):
+    token = value.strip().lower()
+    if names and token in names:
+        return names[token]
+    try:
+        return int(token)
+    except ValueError as err:
+        raise ValueError(f'{field}: invalid cron value {value!r}') from err
+
+
+def _parse_cron_field(expression, minimum, maximum, field, names=None, sunday_7=False):
+    if not isinstance(expression, str) or not expression.strip():
+        raise ValueError(f'{field}: cron field must not be empty')
+    values = set()
+    for item in expression.split(','):
+        item = item.strip()
+        if not item:
+            raise ValueError(f'{field}: empty cron list item')
+        if '/' in item:
+            base, step_text = item.split('/', 1)
+            try:
+                step = int(step_text)
+            except ValueError as err:
+                raise ValueError(f'{field}: invalid cron step {step_text!r}') from err
+            if step <= 0:
+                raise ValueError(f'{field}: cron step must be greater than zero')
+        else:
+            base, step = item, 1
+        if base == '*':
+            first, last = minimum, maximum
+        elif '-' in base:
+            left, right = base.split('-', 1)
+            first = _cron_atom(left, names, field)
+            last = _cron_atom(right, names, field)
+            if first > last:
+                raise ValueError(f'{field}: descending cron ranges are not supported: {base!r}')
+        else:
+            first = _cron_atom(base, names, field)
+            last = maximum if '/' in item else first
+        if first < minimum or first > maximum or last < minimum or last > maximum:
+            raise ValueError(f'{field}: cron value outside {minimum}-{maximum}: {base!r}')
+        values.update(range(first, last + 1, step))
+    if sunday_7 and 7 in values:
+        values.remove(7)
+        values.add(0)
+    return values
+
+
+def valid_service_name(value):
+    return isinstance(value, str) and SERVICE_RE.fullmatch(value) is not None
+
+
+def parse_cron(expression, field='schedule.cron'):
+    if not isinstance(expression, str):
+        raise ValueError(f'{field} must be a standard 5-field cron string')
+    parts = expression.split()
+    if len(parts) != 5:
+        raise ValueError(
+            f'{field} must contain exactly 5 fields: minute hour day-of-month month day-of-week'
+        )
+    month_names = {
+        'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6,
+        'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12,
+    }
+    weekday_names = {'sun': 7, 'mon': 1, 'tue': 2, 'wed': 3, 'thu': 4, 'fri': 5, 'sat': 6}
+    return {
+        'expression': expression,
+        'minutes': _parse_cron_field(parts[0], 0, 59, f'{field} minute'),
+        'hours': _parse_cron_field(parts[1], 0, 23, f'{field} hour'),
+        'days': _parse_cron_field(parts[2], 1, 31, f'{field} day-of-month'),
+        'months': _parse_cron_field(parts[3], 1, 12, f'{field} month', month_names),
+        'weekdays': _parse_cron_field(parts[4], 0, 7, f'{field} day-of-week', weekday_names, sunday_7=True),
+        'day_wildcard': parts[2].startswith('*'),
+        'weekday_wildcard': parts[4].startswith('*'),
+    }
+
+
+def cron_matches(spec, value):
+    if value.minute not in spec['minutes'] or value.hour not in spec['hours']:
+        return False
+    return cron_date_matches(spec, value)
+
+
+def cron_date_matches(spec, value):
+    if value.month not in spec['months']:
+        return False
+    day_match = value.day in spec['days']
+    cron_weekday = (value.weekday() + 1) % 7
+    weekday_match = cron_weekday in spec['weekdays']
+    if spec['day_wildcard'] and spec['weekday_wildcard']:
+        return True
+    if spec['day_wildcard']:
+        return weekday_match
+    if spec['weekday_wildcard']:
+        return day_match
+    # Traditional cron semantics: when both fields are restricted, either may match.
+    return day_match or weekday_match
+
+
+def cron_has_occurrence(spec):
+    # A complete Gregorian calendar cycle proves whether the date fields can match.
+    candidate = dt.date(2000, 1, 1)
+    end = dt.date(2400, 1, 1)
+    while candidate < end:
+        if cron_date_matches(spec, candidate):
+            return True
+        candidate += dt.timedelta(days=1)
+    return False
+
+
+def cron_previous(spec, now, search_minutes=366 * 24 * 60 * 5):
+    current = now.replace(second=0, microsecond=0)
+    boundary = current - dt.timedelta(minutes=search_minutes)
+    candidate_date = current.date()
+    while candidate_date >= boundary.date():
+        if cron_date_matches(spec, candidate_date):
+            for hour in sorted(spec['hours'], reverse=True):
+                for minute in sorted(spec['minutes'], reverse=True):
+                    candidate = dt.datetime.combine(
+                        candidate_date, dt.time(hour, minute), tzinfo=current.tzinfo,
+                    )
+                    if boundary <= candidate <= current:
+                        return candidate
+        candidate_date -= dt.timedelta(days=1)
+    return None
+
+
+def cron_next(spec, now, search_minutes=366 * 24 * 60 * 5):
+    current = now.replace(second=0, microsecond=0) + dt.timedelta(minutes=1)
+    boundary = current + dt.timedelta(minutes=search_minutes - 1)
+    candidate_date = current.date()
+    while candidate_date <= boundary.date():
+        if cron_date_matches(spec, candidate_date):
+            for hour in sorted(spec['hours']):
+                for minute in sorted(spec['minutes']):
+                    candidate = dt.datetime.combine(
+                        candidate_date, dt.time(hour, minute), tzinfo=current.tzinfo,
+                    )
+                    if current <= candidate <= boundary:
+                        return candidate
+        candidate_date += dt.timedelta(days=1)
+    return None
+
+
+def validate_schedule(m):
+    path = m.get('_path', '<manifest>')
+    schedule = m.get('schedule')
+    if not isinstance(schedule, dict):
+        raise ValueError(f'{path}: schedule must be a mapping')
+    allowed = {'cron', 'retry_after', 'max_lateness', 'enabled'}
+    unknown = sorted(set(schedule) - allowed)
+    if unknown:
+        raise ValueError(f'{path}: unsupported schedule fields: {unknown}; use cron only')
+    if not isinstance(schedule.get('enabled', True), bool):
+        raise ValueError(f'{path}: schedule.enabled must be boolean')
+    if schedule.get('enabled', True) is False:
+        return
+    if not schedule.get('cron'):
+        raise ValueError(f'{path}: schedule.cron is required')
+    spec = parse_cron(schedule['cron'], f'{path}: schedule.cron')
+    if not cron_has_occurrence(spec):
+        raise ValueError(f'{path}: schedule.cron never matches a real calendar date')
+    parse_duration(schedule.get('retry_after', '30m'), f'{path}: schedule.retry_after')
+    if schedule.get('max_lateness') is not None:
+        parse_duration(schedule['max_lateness'], f'{path}: schedule.max_lateness')
+
+
+def validate_retention(m):
+    path = m.get('_path', '<manifest>')
+    retention = m.get('retention')
+    if not isinstance(retention, dict) or not retention:
+        raise ValueError(f'{path}: retention must be a non-empty mapping')
+    allowed = {key for key, _flag in RETENTION_FLAGS}
+    unknown = sorted(set(retention) - allowed)
+    if unknown:
+        raise ValueError(f'{path}: unsupported retention fields: {unknown}')
+    found = False
+    for key, _ in RETENTION_FLAGS:
+        if key in retention:
+            value = retention[key]
+            if type(value) is not int or value < 0:
+                raise ValueError(f'{path}: retention.{key} must be an integer >= 0')
+            found = True
+    if not found:
+        raise ValueError(f'{path}: retention must define at least one keep_* rule')
+
+
+def validate_manifest(m):
+    if not isinstance(m, dict):
+        raise ValueError('manifest must be a mapping')
+    path = m.get('_path', '<manifest>')
+    allowed_manifest = {
+        'version', 'service', 'enabled', 'schedule', 'retention',
+        'compose', 'consistency', 'sources', '_path', '_dir',
+    }
+    unknown_manifest = sorted(set(m) - allowed_manifest)
+    if unknown_manifest:
+        raise ValueError(f'{path}: unsupported manifest fields: {unknown_manifest}')
+    if m.get('version') != 1:
+        raise ValueError(f'{path}: version must be 1')
+    if not m.get('service'):
+        raise ValueError(f'{path}: missing service')
+    if not valid_service_name(m['service']):
+        raise ValueError(f'{path}: service contains unsupported characters')
+    if m.get('_dir') and Path(m['_dir']).name != m['service']:
+        raise ValueError(
+            f"{path}: manifest directory must be named {m['service']!r}, "
+            f"not {Path(m['_dir']).name!r}"
+        )
+    if not isinstance(m.get('enabled', True), bool):
+        raise ValueError(f'{path}: enabled must be boolean')
+    consistency = m.get('consistency')
+    if consistency is None:
+        consistency = {}
+    if not isinstance(consistency, dict):
+        raise ValueError(f'{path}: consistency must be a mapping')
+    allowed_consistency = {'mode', 'timeout', 'services', 'before', 'after'}
+    unknown_consistency = sorted(set(consistency) - allowed_consistency)
+    if unknown_consistency:
+        raise ValueError(f'{path}: unsupported consistency fields: {unknown_consistency}')
+    mode = consistency.get('mode', 'stop')
+    if mode not in ('stop', 'hooks', 'none'):
+        raise ValueError(f'{path}: invalid consistency.mode {mode!r}; expected stop, hooks, or none')
+    timeout = consistency.get('timeout', 120)
+    if type(timeout) is not int or timeout <= 0:
+        raise ValueError(f'{path}: consistency.timeout must be an integer greater than zero')
+    services = consistency.get('services', [])
+    if not isinstance(services, list) or not all(
+        isinstance(x, str) and x for x in services
+    ):
+        raise ValueError(f'{path}: consistency.services must be a list of non-empty strings')
+    if len(services) != len(set(services)):
+        raise ValueError(f'{path}: consistency.services contains duplicates')
+    for hook_name in ('before', 'after'):
+        hook_values = consistency.get(hook_name, [])
+        if not isinstance(hook_values, list) or not all(
+            isinstance(x, str) and x for x in hook_values
+        ):
+            raise ValueError(
+                f'{path}: consistency.{hook_name} must be a list of non-empty strings'
+            )
+        if mode != 'hooks' and hook_values:
+            raise ValueError(
+                f'{path}: consistency.{hook_name} is only valid with mode hooks'
+            )
+    compose = m.get('compose')
+    if compose is None:
+        compose = {}
+    if not isinstance(compose, dict):
+        raise ValueError(f'{path}: compose must be a mapping')
+    unknown_compose = sorted(set(compose) - {'files'})
+    if unknown_compose:
+        raise ValueError(f'{path}: unsupported compose fields: {unknown_compose}')
+    compose_files = compose.get('files', ['compose.yaml'])
+    if not isinstance(compose_files, list) or not compose_files or not all(
+        isinstance(x, str) and x for x in compose_files
+    ):
+        raise ValueError(f'{path}: compose.files must be a non-empty list of strings')
+    validate_schedule(m)
+    validate_retention(m)
+    sources = m.get('sources')
+    if sources is None:
+        sources = {}
+    if not isinstance(sources, dict):
+        raise ValueError(f'{path}: sources must be a mapping')
+    unknown_sources = sorted(set(sources) - {'paths', 'volumes'})
+    if unknown_sources:
+        raise ValueError(f'{path}: unsupported sources fields: {unknown_sources}')
+    ids = set()
+    path_targets = set()
+    volume_targets = set()
+    for kind in ('paths', 'volumes'):
+        entries = sources.get(kind, [])
+        if not isinstance(entries, list):
+            raise ValueError(f'{path}: sources.{kind} must be a list')
+        for index, source in enumerate(entries):
+            if not isinstance(source, dict):
+                raise ValueError(f'{path}: sources.{kind}[{index}] must be a mapping')
+            allowed_source = (
+                {'id', 'path', 'required', 'exclude'} if kind == 'paths'
+                else {'id', 'name', 'compose_volume', 'required', 'exclude'}
+            )
+            unknown_source = sorted(set(source) - allowed_source)
+            if unknown_source:
+                raise ValueError(
+                    f'{path}: unsupported sources.{kind}[{index}] fields: {unknown_source}'
+                )
+            source_id = source.get('id')
+            if not source_id:
+                raise ValueError(f'{path}: sources.{kind}[{index}] is missing id')
+            if not isinstance(source_id, str) or not re.fullmatch(
+                r'[A-Za-z0-9][A-Za-z0-9_.-]*', source_id
+            ):
+                raise ValueError(
+                    f'{path}: sources.{kind}[{index}].id must be a safe single path component'
+                )
+            if source_id in ids:
+                raise ValueError(f'{path}: duplicate source id {source_id!r}')
+            ids.add(source_id)
+            excludes = source.get('exclude', [])
+            if not isinstance(excludes, list) or not all(isinstance(x, str) for x in excludes):
+                raise ValueError(f'{path}: sources.{kind}[{index}].exclude must be a list of strings')
+            if not isinstance(source.get('required', True), bool):
+                raise ValueError(f'{path}: sources.{kind}[{index}].required must be boolean')
+            if kind == 'paths':
+                if not isinstance(source.get('path'), str) or not source['path']:
+                    raise ValueError(f'{path}: sources.paths[{index}].path must be a non-empty string')
+                target = resolved_path(source_path(m, source))
+                if any(paths_overlap(target, existing) for existing in path_targets):
+                    raise ValueError(f'{path}: duplicate or overlapping path target: {target}')
+                path_targets.add(target)
+            else:
+                volume_fields = [key for key in ('name', 'compose_volume') if source.get(key)]
+                if len(volume_fields) != 1:
+                    raise ValueError(
+                        f'{path}: sources.volumes[{index}] must define exactly one of name or compose_volume'
+                    )
+                field_name = volume_fields[0]
+                if not isinstance(source[field_name], str):
+                    raise ValueError(
+                        f'{path}: sources.volumes[{index}].{field_name} must be a non-empty string'
+                    )
+                target = (field_name, source[field_name])
+                if target in volume_targets:
+                    raise ValueError(
+                        f'{path}: duplicate Docker volume target declaration: {source[field_name]}'
+                    )
+                volume_targets.add(target)
+    return True
+
+
+def compose_model(m):
+    cmd = compose_cmd(m) + ['config', '--format', 'json']
+    try:
+        result = run(cmd, cwd=m['_dir'], capture=True)
+    except CommandError as err:
+        _print_command_failure(err, context=(
+            f"Compose configuration validation failed for service "
+            f"'{m.get('service', '<unknown>')}' ({m['_path']})"
+        ))
+        print('  diagnostic hints:', file=sys.stderr)
+        print('    - Check that every compose.files entry exists.', file=sys.stderr)
+        print('    - Check required variables in .env and ${VAR:?message} expressions.', file=sys.stderr)
+        print('    - Run the printed docker compose command from the shown directory.', file=sys.stderr)
+        raise
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as err:
+        raise RuntimeError(f'invalid JSON from docker compose config: {err}') from err
+
+
+def actual_volume_name(m, item, model=None):
+    if item.get('name'):
+        return item['name']
+    key = item.get('compose_volume')
+    if not key:
+        raise ValueError(f"volume {item.get('id')} needs name or compose_volume")
+    if model is None:
+        model = compose_model(m)
+    volume = (model.get('volumes') or {}).get(key)
+    if not volume:
+        raise ValueError(f'compose volume key not found: {key}')
+    return volume.get('name') or key
+
+
+def source_path(m, source):
+    path = Path(source['path'])
+    return path if path.is_absolute() else Path(m['_dir']) / path
+
+
+def docker_volume_exists(name):
+    try:
+        run(['docker', 'volume', 'inspect', name], capture=True)
+        return True
+    except CommandError as err:
+        output = f'{err.stdout}\n{err.stderr}'
+        if re.search(r'\bno such volume\b', output, re.IGNORECASE):
+            return False
+        raise
+
+
+def resolved_volume_sources(m, model=None):
+    resolved = []
+    seen = {}
+    for source in (m.get('sources') or {}).get('volumes', []):
+        name = actual_volume_name(m, source, model=model)
+        if name in seen:
+            raise ValueError(
+                f"duplicate Docker volume target {name!r} for sources "
+                f"{seen[name]!r} and {source['id']!r}"
+            )
+        seen[name] = source['id']
+        resolved.append((source, name))
+    return resolved
+
+
+def validate_runtime_sources(c, m, model):
+    for source in (m.get('sources') or {}).get('paths', []):
+        path = source_path(m, source)
+        if source.get('required', True) and not path.exists():
+            raise ValueError(f'missing required source: {path}')
+    for source, name in resolved_volume_sources(m, model=model):
+        if not docker_volume_exists(name) and source.get('required', True):
+            raise RuntimeError(f'Docker volume does not exist or is inaccessible: {name}')
+    selected = set((m.get('consistency') or {}).get('services', []))
+    compose_services = set((model.get('services') or {}))
+    unknown = sorted(selected - compose_services)
+    if unknown:
+        raise ValueError(f'consistency.services not found in Compose model: {unknown}')
+
+
+def rsync(src, dst, excludes=None, delete=True):
+    Path(dst).mkdir(parents=True, exist_ok=True)
+    cmd = ['rsync', '-aHAX', '--numeric-ids']
+    if delete:
+        cmd.append('--delete')
+    for item in excludes or []:
+        cmd += ['--exclude', item]
+    source = str(Path(src)) + ('/' if Path(src).is_dir() else '')
+    target = str(dst) + ('/' if Path(src).is_dir() else '')
+    cmd += [source, target]
+    run(cmd)
+
+
+def sync_paths(m, stage):
+    for source in (m.get('sources') or {}).get('paths', []):
+        src = source_path(m, source)
+        if not src.exists():
+            if source.get('required', True):
+                die(f'missing source {src}')
+            continue
+        dst = stage / 'paths' / source['id']
+        if src.is_dir():
+            rsync(src, dst, source.get('exclude'))
+        else:
+            dst.mkdir(parents=True, exist_ok=True)
+            run(['rsync', '-aHAX', '--numeric-ids', str(src), str(dst) + '/'])
+
+
+def sync_volumes(c, m, stage, restore=False):
+    for source, name in resolved_volume_sources(m):
+        dst = stage / 'volumes' / source['id']
+        if restore:
+            if not dst.is_dir():
+                if source.get('required', True):
+                    raise RuntimeError(f'restored volume source is missing: {dst}')
+                continue
+        else:
+            if not docker_volume_exists(name):
+                if source.get('required', True):
+                    raise RuntimeError(
+                        f'Docker volume does not exist or is inaccessible: {name}'
+                    )
+                print(f'SKIP: optional Docker volume is unavailable: {name}')
+                continue
+            dst.mkdir(parents=True, exist_ok=True)
+            cmd = [
+                'docker', 'run', '--rm', '--network', 'none',
+                '-v', f'{name}:/src:ro', '-v', f'{dst}:/dst',
+                c['volume_helper_image'], 'rsync', '-aHAX', '--numeric-ids', '--delete',
+            ]
+        if restore:
+            cmd = [
+                'docker', 'run', '--rm', '--network', 'none',
+                '-v', f'{name}:/dst', '-v', f'{dst}:/src:ro',
+                c['volume_helper_image'], 'rsync', '-aHAX', '--numeric-ids', '--delete',
+            ]
+        for item in source.get('exclude', []):
+            cmd += ['--exclude', item]
+        cmd += ['/src/', '/dst/']
+        run(cmd)
+
+
+def hooks(m, key):
+    for hook in (m.get('consistency') or {}).get(key, []) or []:
+        run(['/bin/bash', '-euo', 'pipefail', '-c', hook], cwd=m['_dir'])
+
+
+def running_services(m):
+    result = run(
+        compose_cmd(m) + ['ps', '--services', '--filter', 'status=running'],
+        cwd=m['_dir'], capture=True,
+    )
+    return [x for x in result.stdout.splitlines() if x.strip()]
+
+
+def stage_service(c, m):
+    validate_manifest(m)
+    stage = resolved_path(Path(c['staging_root']) / m['service'])
+    protected = [resolved_path(m['_dir'])]
+    protected.extend(
+        resolved_path(source_path(m, source))
+        for source in (m.get('sources') or {}).get('paths', [])
+    )
+    for target in protected:
+        if paths_overlap(stage, target):
+            raise ValueError(f'staging directory {stage} overlaps protected path {target}')
+    if stage.exists():
+        shutil.rmtree(stage)
+    stage.mkdir(parents=True, exist_ok=True)
+    mode = (m.get('consistency') or {}).get('mode', 'stop')
+    selected = (m.get('consistency') or {}).get('services', [])
+    if mode == 'hooks':
+        try:
+            hooks(m, 'before')
+            sync_paths(m, stage)
+            sync_volumes(c, m, stage)
+        finally:
+            hooks(m, 'after')
+    elif mode == 'stop':
+        sync_paths(m, stage)
+        running = running_services(m)
+        targets = [x for x in selected if x in running] if selected else running
+        try:
+            if targets:
+                run(compose_cmd(m) + ['stop', '-t', str((m.get('consistency') or {}).get('timeout', 120))] + targets, cwd=m['_dir'])
+            sync_paths(m, stage)
+            sync_volumes(c, m, stage)
+        finally:
+            if targets:
+                run(compose_cmd(m) + ['up', '-d'] + targets, cwd=m['_dir'])
+    else:
+        sync_paths(m, stage)
+        sync_volumes(c, m, stage)
+    meta = stage / '_meta'
+    meta.mkdir(exist_ok=True)
+    # backup.yaml is always included as recovery metadata, even when it is not listed in sources.paths.
+    shutil.copy2(m['_path'], meta / 'backup.yaml')
+    inventory = {
+        'schema_version': 1,
+        'service': m['service'],
+        'service_directory': m['_dir'],
+        'paths': [],
+        'volumes': [],
+    }
+    for source in (m.get('sources') or {}).get('paths', []):
+        source_path = Path(source['path'])
+        source_path = source_path if source_path.is_absolute() else Path(m['_dir']) / source_path
+        inventory['paths'].append({
+            'id': source['id'],
+            'path': source['path'],
+            'type': 'directory' if source_path.is_dir() else 'file',
+        })
+    for source in (m.get('sources') or {}).get('volumes', []):
+        inventory['volumes'].append({
+            'id': source['id'],
+            'compose_volume': source.get('compose_volume'),
+            'name': source.get('name'),
+        })
+    atomic_write_json(meta / 'inventory.json', inventory)
+    return stage
+
+
+def state_path(c, service):
+    return Path(c['state_root']) / f'{service}.json'
+
+
+def load_state(c, service):
+    path = state_path(c, service)
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding='utf-8'))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_state(c, service, state):
+    atomic_write_json(state_path(c, service), state)
+
+
+def parse_iso(value):
+    if not value:
+        return None
+    try:
+        return dt.datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def due_status(c, m, now=None):
+    now = now or dt.datetime.now().astimezone()
+    schedule = m['schedule']
+    if schedule.get('enabled', True) is False:
+        return False, 'schedule disabled', None
+    spec = parse_cron(schedule['cron'], 'schedule.cron')
+    state = load_state(c, m['service'])
+    last_success = parse_iso(state.get('last_success_at'))
+    last_attempt = parse_iso(state.get('last_attempt_at'))
+    retry_after = parse_duration(schedule.get('retry_after', '30m'), 'schedule.retry_after')
+    if state.get('last_result') == 'failed' and last_attempt:
+        retry_at = last_attempt + dt.timedelta(seconds=retry_after)
+        if now < retry_at:
+            return False, f'retry at {retry_at.isoformat(timespec="minutes")}', retry_at
+    occurrence = cron_previous(spec, now)
+    if occurrence is None:
+        return False, 'no cron occurrence found in search window', None
+    if last_success is None or last_success < occurrence:
+        max_lateness = schedule.get('max_lateness')
+        if max_lateness is not None:
+            deadline = occurrence + dt.timedelta(
+                seconds=parse_duration(max_lateness, 'schedule.max_lateness')
+            )
+            if now > deadline:
+                next_time = cron_next(spec, now)
+                return False, (
+                    f'missed {occurrence.isoformat(timespec="minutes")}; '
+                    f'next at {next_time.isoformat(timespec="minutes") if next_time else "unknown"}'
+                ), next_time
+        return True, f'due since {occurrence.isoformat(timespec="minutes")}', occurrence
+    next_time = cron_next(spec, now)
+    return False, (
+        f'next at {next_time.isoformat(timespec="minutes") if next_time else "unknown"}'
+    ), next_time
+
+
+def retention_cmd(c, m, *, prune=False, dry_run=False):
+    cmd = [
+        'restic', 'forget', '--host', c['host_id'], '--tag', f"service:{m['service']}",
+        '--group-by', 'host,tags',
+    ]
+    for key, flag in RETENTION_FLAGS:
+        if key in m['retention']:
+            cmd += [flag, str(m['retention'][key])]
+    if prune:
+        cmd.append('--prune')
+    if dry_run:
+        cmd.append('--dry-run')
+    return cmd
+
+
+def backup_one(c, m, *, apply_retention=True):
+    started = dt.datetime.now().astimezone()
+    state = load_state(c, m['service'])
+    state.update({
+        'service': m['service'],
+        'last_attempt_at': started.isoformat(),
+        'last_result': 'running',
+        'last_error': None,
+        'last_retention_error': None,
+    })
+    state.setdefault('first_seen_at', started.isoformat())
+    save_state(c, m['service'], state)
+    try:
+        stage = stage_service(c, m)
+        run([
+            'restic', 'backup', '.', '--host', c['host_id'],
+            '--tag', f"service:{m['service']}",
+        ], cwd=stage, env=restic_env(c))
+        retention_error = None
+        if apply_retention:
+            try:
+                run(retention_cmd(c, m), env=restic_env(c))
+            except CommandError as err:
+                _print_command_failure(err, context=(
+                    f"Snapshot for {m['service']} succeeded, but retention failed; "
+                    'maintenance will retry it later'
+                ))
+                retention_error = err.stderr.strip() or str(err)
+        finished = dt.datetime.now().astimezone()
+        state.update({
+            'last_success_at': finished.isoformat(),
+            'last_finished_at': finished.isoformat(),
+            'last_result': 'success',
+            'last_duration_seconds': round((finished - started).total_seconds(), 3),
+            'last_error': None,
+            'last_retention_error': retention_error,
+        })
+        save_state(c, m['service'], state)
+        return True
+    except Exception as err:
+        finished = dt.datetime.now().astimezone()
+        state.update({
+            'last_finished_at': finished.isoformat(),
+            'last_result': 'failed',
+            'last_duration_seconds': round((finished - started).total_seconds(), 3),
+            'last_error': f'{type(err).__name__}: {err}',
+        })
+        save_state(c, m['service'], state)
+        raise
+
+
+class GlobalLock:
+    def __init__(self, path, nonblocking=False):
+        self.path = Path(path)
+        self.nonblocking = nonblocking
+        self.handle = None
+
+    def __enter__(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.handle = open(self.path, 'a+', encoding='utf-8')
+        flags = fcntl.LOCK_EX | (fcntl.LOCK_NB if self.nonblocking else 0)
+        try:
+            fcntl.flock(self.handle.fileno(), flags)
+        except BlockingIOError:
+            self.handle.close()
+            self.handle = None
+            return False
+        self.handle.seek(0)
+        self.handle.truncate()
+        self.handle.write(f'pid={os.getpid()} started={dt.datetime.now().astimezone().isoformat()}\n')
+        self.handle.flush()
+        return True
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.handle:
+            fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
+            self.handle.close()
+
+
+
+def repository_services(c):
+    """Return service names found in Restic snapshot tags for this host."""
+    result = run(
+        ['restic', 'snapshots', '--json', '--host', c['host_id']],
+        env=restic_env(c), capture=True,
+    )
+    try:
+        snapshots = json.loads(result.stdout or '[]')
+    except json.JSONDecodeError as err:
+        raise RuntimeError(f'invalid JSON from restic snapshots: {err}') from err
+    services = set()
+    for snapshot in snapshots:
+        for tag in snapshot.get('tags') or []:
+            if isinstance(tag, str) and tag.startswith('service:') and len(tag) > 8:
+                service = tag[8:]
+                if not valid_service_name(service):
+                    raise RuntimeError(f'invalid service tag in repository: {tag!r}')
+                services.add(service)
+    return sorted(services)
+
+
+def _selector_screen(stdscr, title, items):
+    curses.curs_set(0)
+    stdscr.keypad(True)
+    selected = [True] * len(items)
+    index = 0
+    while True:
+        stdscr.erase()
+        height, width = stdscr.getmaxyx()
+        stdscr.addnstr(0, 0, title, max(1, width - 1), curses.A_BOLD)
+        help_text = '↑/↓ 移動  Space 切換  A 全選/取消  Enter 確認  Q 取消'
+        stdscr.addnstr(1, 0, help_text, max(1, width - 1), curses.A_DIM)
+        max_rows = max(1, height - 4)
+        start = min(max(0, index - max_rows + 1), max(0, len(items) - max_rows))
+        for row, item_index in enumerate(range(start, min(len(items), start + max_rows)), start=3):
+            mark = '■' if selected[item_index] else '□'
+            pointer = '◆' if item_index == index else ' '
+            text = f'{pointer} {mark} {items[item_index]}'
+            attr = curses.A_REVERSE if item_index == index else curses.A_NORMAL
+            stdscr.addnstr(row, 0, text, max(1, width - 1), attr)
+        stdscr.refresh()
+        key = stdscr.getch()
+        if key in (curses.KEY_UP, ord('k')):
+            index = (index - 1) % len(items)
+        elif key in (curses.KEY_DOWN, ord('j')):
+            index = (index + 1) % len(items)
+        elif key == ord(' '):
+            selected[index] = not selected[index]
+        elif key in (ord('a'), ord('A')):
+            target = not all(selected)
+            selected = [target] * len(items)
+        elif key in (10, 13, curses.KEY_ENTER):
+            return [item for item, enabled in zip(items, selected) if enabled]
+        elif key in (ord('q'), ord('Q'), 27):
+            return None
+
+
+def select_services_interactively(services):
+    if not services:
+        return []
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        die('interactive service selection requires a TTY; specify service names or use --all')
+    return curses.wrapper(
+        _selector_screen,
+        'Which services should be restored? (all selected by default)',
+        services,
+    )
+
+
+def prompt_yes_no(question, default=False):
+    if not sys.stdin.isatty():
+        return default
+    suffix = ' [Y/n] ' if default else ' [y/N] '
+    while True:
+        answer = input(question + suffix).strip().lower()
+        if not answer:
+            return default
+        if answer in ('y', 'yes'):
+            return True
+        if answer in ('n', 'no'):
+            return False
+        print('Please answer y or n.')
+
+
+def restored_manifest_path(root):
+    return Path(root) / '_meta' / 'backup.yaml'
+
+
+def prepare_restored_manifest(c, service, root, *, policy='ask'):
+    source = restored_manifest_path(root)
+    if not source.is_file():
+        die(f'restored snapshot does not contain {source}; cannot reconstruct backup manifest')
+    if not valid_service_name(service):
+        die(f'invalid service name from repository: {service!r}')
+    service_dir = Path(c['services_root']) / service
+    target = service_dir / 'backup.yaml'
+    restore_it = not target.exists()
+    if target.exists():
+        if policy == 'restore':
+            restore_it = True
+        elif policy == 'keep':
+            restore_it = False
+        else:
+            restore_it = prompt_yes_no(
+                f'{target} already exists. Restore backup.yaml from the snapshot?',
+                default=False,
+            )
+    manifest_source = source if restore_it else target
+    m = load_yaml(manifest_source)
+    if not isinstance(m, dict):
+        raise ValueError(f'{manifest_source}: manifest must be a mapping')
+    m['_path'] = str(target)
+    m['_dir'] = str(service_dir)
+    if m.get('service') != service:
+        die(f'{target}: service is {m.get("service")!r}, expected {service!r}')
+    validate_manifest(m)
+    if restore_it:
+        service_dir.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(
+            dir=service_dir, prefix='.backup.yaml.', suffix='.tmp',
+        )
+        os.close(fd)
+        tmp = Path(tmp_name)
+        try:
+            shutil.copy2(source, tmp)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, target)
+        finally:
+            tmp.unlink(missing_ok=True)
+        print(f'Restored manifest: {target}')
+    else:
+        print(f'Keeping local manifest: {target}')
+    return m
+
+
+def restore_one(c, service, snapshot, manifest_policy):
+    if not valid_service_name(service):
+        die(f'invalid service name from repository: {service!r}')
+    root = Path(c['restore_root']) / service / time.strftime('%Y%m%d-%H%M%S')
+    root.mkdir(parents=True, exist_ok=False)
+    run([
+        'restic', 'restore', snapshot, '--host', c['host_id'],
+        '--tag', f'service:{service}', '--target', str(root),
+    ], env=restic_env(c))
+    m = prepare_restored_manifest(c, service, root, policy=manifest_policy)
+    print(f'Restored snapshot for {service}: {root}')
+    return m, root
+
+
+def compose_files_exist(m):
+    return all((Path(m['_dir']) / f).exists() for f in m.get('compose', {}).get('files', ['compose.yaml']))
+
+def cmd_list(c, args):
+    now = dt.datetime.now().astimezone()
+    for m in manifests(c):
+        due, reason, _ = due_status(c, m, now)
+        schedule = m['schedule']
+        schedule_text = f"cron {schedule['cron']}"
+        print(f"{m['service']}: {schedule_text}; {'DUE' if due else reason}; {m['_path']}")
+
+
+def cmd_status(c, args):
+    now = dt.datetime.now().astimezone()
+    for m in manifests(c):
+        due, reason, _ = due_status(c, m, now)
+        state = load_state(c, m['service'])
+        print(json.dumps({
+            'service': m['service'], 'due': due, 'schedule_status': reason,
+            'last_result': state.get('last_result'),
+            'last_success_at': state.get('last_success_at'),
+            'last_duration_seconds': state.get('last_duration_seconds'),
+            'last_error': state.get('last_error'),
+            'last_retention_error': state.get('last_retention_error'),
+        }, ensure_ascii=False))
+
+
+def cmd_validate(c, args):
+    errors = []
+    for command in ['docker', 'restic', 'rclone', 'rsync']:
+        if not shutil.which(command):
+            errors.append(f'missing command: {command}')
+    if shutil.which('docker'):
+        try:
+            run(['docker', 'compose', 'version'])
+        except CommandError as err:
+            _print_command_failure(err, context='Docker Compose is unavailable')
+            errors.append('docker compose version failed')
+        try:
+            run(['docker', 'image', 'inspect', c['volume_helper_image']], capture=True)
+        except CommandError:
+            errors.append(f"missing Docker helper image: {c['volume_helper_image']}")
+    for key in ('password_file', 'rclone_config'):
+        if not Path(c[key]).is_file():
+            errors.append(f'missing config file: {c[key]}')
+    ms = manifests(c, include_disabled=True)
+    if not any(m.get('enabled', True) for m in ms):
+        errors.append(f"no enabled backup.yaml manifests found under {c['services_root']}/*/")
+    seen = {}
+    for m in ms:
+        label = f"{m.get('service', '<unnamed>')} ({m['_path']})"
+        print(f'\n== Validating {label} ==')
+        try:
+            validate_manifest(m)
+            name = m['service']
+            if name in seen:
+                raise RuntimeError(f"duplicate service name '{name}' also used by {seen[name]}")
+            seen[name] = m['_path']
+            model = compose_model(m)
+            validate_runtime_sources(c, m, model)
+            print(f'OK: {label}')
+        except CommandError:
+            errors.append(f'{label}: Docker Compose configuration failed')
+        except (OSError, ValueError, RuntimeError, KeyError, TypeError) as err:
+            print(f'ERROR: {label}: {err}', file=sys.stderr)
+            errors.append(f'{label}: {err}')
+    if errors:
+        print('\nVALIDATION FAILED', file=sys.stderr)
+        for item in errors:
+            print(f'  - {item}', file=sys.stderr)
+        raise SystemExit(1)
+    print(f'\nOK: {len(ms)} service manifest(s) validated')
+
+
+def cmd_init(c, args):
+    run(['restic', 'init'], env=restic_env(c))
+
+
+def cmd_backup(c, args):
+    ms = [manifest(c, name) for name in args.services] if args.services else manifests(c)
+    with GlobalLock(c['lock_file']) as acquired:
+        if not acquired:
+            die('another backupctl process is running')
+        for m in ms:
+            backup_one(c, m)
+
+
+def cmd_run_due(c, args):
+    with GlobalLock(c['lock_file'], nonblocking=True) as acquired:
+        if not acquired:
+            print('SKIP: another backup or maintenance process is still running')
+            return
+        now = dt.datetime.now().astimezone()
+        due = []
+        for m in manifests(c):
+            is_due, reason, _ = due_status(c, m, now)
+            print(f"{m['service']}: {'DUE' if is_due else 'skip'} ({reason})")
+            if is_due:
+                due.append(m)
+        if not due:
+            print('No backups are due.')
+            return
+        failures = []
+        for m in due:
+            print(f"\n== Scheduled backup: {m['service']} ==")
+            try:
+                backup_one(c, m)
+            except Exception as err:
+                failures.append((m['service'], str(err)))
+                print(f"ERROR: scheduled backup failed for {m['service']}: {err}", file=sys.stderr)
+                if os.environ.get('BACKUPCTL_DEBUG') == '1':
+                    raise
+        if failures:
+            print('\nSCHEDULED BACKUP FAILURES', file=sys.stderr)
+            for service, error in failures:
+                print(f'  - {service}: {error}', file=sys.stderr)
+            raise SystemExit(1)
+
+
+def cmd_snapshots(c, args):
+    cmd = ['restic', 'snapshots', '--host', c['host_id']]
+    if args.service:
+        cmd += ['--tag', f'service:{args.service}']
+    run(cmd, env=restic_env(c))
+
+
+
+def load_restore_inventory(root):
+    path = Path(root) / '_meta' / 'inventory.json'
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError) as err:
+        raise RuntimeError(f'cannot read restore inventory {path}: {err}') from err
+    if not isinstance(data, dict):
+        raise RuntimeError(f'restore inventory must be a JSON object: {path}')
+    return data
+
+
+def validate_restore_inventory(m, inventory):
+    if inventory is None:
+        return
+    if inventory.get('schema_version') != 1:
+        raise RuntimeError(
+            f"unsupported restore inventory schema: {inventory.get('schema_version')!r}"
+        )
+    service = inventory.get('service')
+    if service != m['service']:
+        raise RuntimeError(
+            f"restore inventory belongs to service {service!r}, expected {m['service']!r}"
+        )
+
+
+def restored_path_details(m, root, source, inventory):
+    staged = Path(root) / 'paths' / source['id']
+    target = source_path(m, source)
+    entry = next(
+        (x for x in inventory.get('paths', []) if x.get('id') == source['id']),
+        {},
+    )
+    source_type = entry.get('type')
+    if source_type == 'file':
+        archived_path = entry.get('path') or source['path']
+        return 'file', staged / Path(archived_path).name, target
+    if source_type is None and staged.is_dir():
+        legacy_file = staged / target.name
+        if legacy_file.is_file():
+            return 'file', legacy_file, target
+    return 'directory', staged, target
+
+
+def validate_restore_sources(m, root, inventory):
+    for source in (m.get('sources') or {}).get('paths', []):
+        source_type, restored, _target = restored_path_details(
+            m, root, source, inventory,
+        )
+        exists = restored.is_file() if source_type == 'file' else restored.is_dir()
+        if not exists and source.get('required', True):
+            raise RuntimeError(f'restored {source_type} source is missing: {restored}')
+    for source in (m.get('sources') or {}).get('volumes', []):
+        restored = Path(root) / 'volumes' / source['id']
+        if not restored.is_dir() and source.get('required', True):
+            raise RuntimeError(f'restored volume source is missing: {restored}')
+
+
+def restore_path_source(m, root, source, inventory):
+    source_type, restored, target = restored_path_details(m, root, source, inventory)
+    if source_type == 'file':
+        restored_file = restored
+        if not restored_file.is_file():
+            if source.get('required', True):
+                raise RuntimeError(f'restored file source is missing: {restored_file}')
+            return
+        target.parent.mkdir(parents=True, exist_ok=True)
+        run(['rsync', '-aHAX', '--numeric-ids', str(restored_file), str(target)])
+        return
+
+    if restored.is_dir():
+        rsync(restored, target, source.get('exclude'))
+    elif source.get('required', True):
+        raise RuntimeError(f'restored directory source is missing: {restored}')
+
+
+def restore_missing_compose_files(m, root, inventory):
+    if compose_files_exist(m):
+        return
+    sources = (m.get('sources') or {}).get('paths', [])
+    by_target = {source_path(m, source): source for source in sources}
+    for compose_file in m.get('compose', {}).get('files', ['compose.yaml']):
+        target = Path(compose_file)
+        target = target if target.is_absolute() else Path(m['_dir']) / target
+        if target.exists():
+            continue
+        source = by_target.get(target)
+        if source is None:
+            raise RuntimeError(
+                f'Compose file is missing and is not restorable from this snapshot: {target}'
+            )
+        restore_path_source(m, root, source, inventory)
+    if not compose_files_exist(m):
+        raise RuntimeError('Compose files are still missing after restore preparation')
+
+
+def apply_one(c, m, root, *, start_services=False):
+    root = Path(root)
+    if not root.is_dir():
+        die(f'restore directory does not exist: {root}')
+
+    inventory = load_restore_inventory(root)
+    validate_restore_inventory(m, inventory)
+    inventory = inventory or {}
+    validate_restore_sources(m, root, inventory)
+    restore_missing_compose_files(m, root, inventory)
+
+    try:
+        running = running_services(m)
+        # Restore may replace an older manifest whose service selection no longer
+        # matches the running Compose project. Stop every running project service
+        # before writing shared paths or volumes.
+        targets = running
+    except CommandError as err:
+        _print_command_failure(err, context=f"Unable to inspect running Compose services for {m['service']}")
+        raise
+
+    if targets:
+        run(
+            compose_cmd(m) + ['stop', '-t', str((m.get('consistency') or {}).get('timeout', 120))] + targets,
+            cwd=m['_dir'],
+        )
+    # Paths are restored before volumes so compose.yaml is available to resolve logical volume names.
+    for source in (m.get('sources') or {}).get('paths', []):
+        restore_path_source(m, root, source, inventory)
+    sync_volumes(c, m, root, restore=True)
+
+    if start_services:
+        if not compose_files_exist(m):
+            die(f"cannot start {m['service']}: Compose files were not restored")
+        run(compose_cmd(m) + ['up', '-d'], cwd=m['_dir'])
+    elif targets:
+        run(compose_cmd(m) + ['up', '-d'] + targets, cwd=m['_dir'])
+
+
+def cmd_restore(c, args):
+    if args.start and not args.apply:
+        die('--start requires --apply')
+    available = repository_services(c)
+    if not available:
+        die(f"no service snapshots found for host {c['host_id']!r}")
+
+    if args.services:
+        unknown = sorted(set(args.services) - set(available))
+        if unknown:
+            die(f'services not found in repository: {", ".join(unknown)}')
+        selected = list(dict.fromkeys(args.services))
+    elif args.all:
+        selected = available
+    else:
+        selected = select_services_interactively(available)
+        if selected is None:
+            print('Restore cancelled.')
+            return
+        if not selected:
+            die('no services selected')
+
+    print('Selected services: ' + ', '.join(selected))
+    if not args.yes:
+        if not sys.stdin.isatty():
+            die('non-interactive restore requires --yes')
+        if not prompt_yes_no('Continue with restore?', default=False):
+            print('Restore cancelled.')
+            return
+
+    policy = 'restore' if args.restore_manifest else 'keep' if args.keep_manifest else 'ask'
+    restored = []
+    with GlobalLock(c['lock_file']) as acquired:
+        if not acquired:
+            die('another backupctl process is running')
+        for service in selected:
+            print(f'\n== Restore: {service} ==')
+            m, root = restore_one(c, service, args.snapshot, policy)
+            if args.apply:
+                apply_one(c, m, root, start_services=args.start)
+                print(f'Applied restore for {service}')
+            restored.append((service, root))
+
+    print('\nRESTORE SUMMARY')
+    for service, root in restored:
+        print(f'  - {service}: {root}')
+
+
+def cmd_apply(c, args):
+    m = manifest(c, args.service)
+    if not args.yes:
+        die('apply requires --yes')
+    with GlobalLock(c['lock_file']) as acquired:
+        if not acquired:
+            die('another backupctl process is running')
+        apply_one(c, m, Path(args.restore_dir), start_services=args.start)
+
+
+def cmd_maintenance(c, args):
+    with GlobalLock(c['lock_file'], nonblocking=args.no_wait) as acquired:
+        if not acquired:
+            print('SKIP: backup or maintenance is still running')
+            return
+        for m in manifests(c):
+            print(f"\n== Retention: {m['service']} ==")
+            run(retention_cmd(c, m, dry_run=args.dry_run), env=restic_env(c))
+        if not args.dry_run:
+            run(['restic', 'prune'], env=restic_env(c))
+
+
+def cmd_check(c, args):
+    with GlobalLock(c['lock_file'], nonblocking=args.no_wait) as acquired:
+        if not acquired:
+            print('SKIP: backup or maintenance is still running')
+            return
+        cmd = ['restic', 'check']
+        subset = (c.get('check') or {}).get('read_data_subset')
+        if subset:
+            cmd += ['--read-data-subset', str(subset)]
+        run(cmd, env=restic_env(c))
+
+
+def cmd_unlock(c, args):
+    with GlobalLock(c['lock_file'], nonblocking=True) as acquired:
+        if not acquired:
+            die('another backupctl process is running')
+        run(['restic', 'unlock'], env=restic_env(c))
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--version', action='version', version=f'backupctl {VERSION}')
+    sub = parser.add_subparsers(dest='cmd', required=True)
+    sub.add_parser('list')
+    sub.add_parser('status')
+    sub.add_parser('validate')
+    sub.add_parser('init')
+    command = sub.add_parser('backup')
+    command.add_argument('services', nargs='*')
+    sub.add_parser('run-due')
+    command = sub.add_parser('snapshots')
+    command.add_argument('service', nargs='?')
+    command = sub.add_parser('restore')
+    command.add_argument('services', nargs='*')
+    command.add_argument('--all', action='store_true', help='restore all services without the selector')
+    command.add_argument('--snapshot', default='latest')
+    command.add_argument('--apply', action='store_true', help='apply restored data after downloading it')
+    command.add_argument('--start', action='store_true', help='start selected Compose stacks after apply')
+    command.add_argument('--yes', action='store_true', help='skip the final restore confirmation')
+    manifest_group = command.add_mutually_exclusive_group()
+    manifest_group.add_argument('--restore-manifest', action='store_true', help='replace local backup.yaml from snapshot')
+    manifest_group.add_argument('--keep-manifest', action='store_true', help='keep an existing local backup.yaml')
+    command = sub.add_parser('apply')
+    command.add_argument('service')
+    command.add_argument('restore_dir')
+    command.add_argument('--start', action='store_true')
+    command.add_argument('--yes', action='store_true')
+    command = sub.add_parser('maintenance')
+    command.add_argument('--dry-run', action='store_true')
+    command.add_argument('--no-wait', action='store_true')
+    command = sub.add_parser('check')
+    command.add_argument('--no-wait', action='store_true')
+    sub.add_parser('unlock')
+    args = parser.parse_args()
+    try:
+        c = cfg()
+        globals()['cmd_' + args.cmd.replace('-', '_')](c, args)
+    except CommandError as err:
+        if not err.reported:
+            _print_command_failure(err)
+        raise SystemExit(err.returncode or 1)
+    except KeyboardInterrupt:
+        print('\nERROR: interrupted by user', file=sys.stderr)
+        raise SystemExit(130)
+    except SystemExit:
+        raise
+    except Exception as err:
+        print(f'ERROR: {type(err).__name__}: {err}', file=sys.stderr)
+        print('Run with BACKUPCTL_DEBUG=1 to display a Python traceback.', file=sys.stderr)
+        if os.environ.get('BACKUPCTL_DEBUG') == '1':
+            raise
+        raise SystemExit(1)
+
+
+if __name__ == '__main__':
+    main()
