@@ -53,6 +53,12 @@ class DeploymentScriptTests(unittest.TestCase):
         self.assertIn('ROOT_DIR=', script)
         self.assertIn('cd -- "$ROOT_DIR"', script)
 
+    def test_installer_installs_package(self):
+        script = (ROOT / 'install.sh').read_text(encoding='utf-8')
+        self.assertIn('LIB_ROOT=/usr/local/lib/homelab-backup', script)
+        self.assertNotIn('rm -rf -- "$LIB_ROOT"', script)
+        self.assertIn('homelab_backup/*.py "$LIB_ROOT/homelab_backup/"', script)
+
     def test_config_zip_is_created_under_private_umask(self):
         script = (ROOT / 'backup-configs.sh').read_text(encoding='utf-8')
         zip_branch = script.split('  2)', 1)[1].split('  q|Q)', 1)[0]

@@ -4,6 +4,9 @@ ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd -- "$ROOT_DIR"
 apt-get update
 apt-get install -y python3 python3-yaml rsync restic rclone ca-certificates openssl
+LIB_ROOT=/usr/local/lib/homelab-backup
+install -d -m 0755 "$LIB_ROOT/homelab_backup"
+install -m 0644 homelab_backup/*.py "$LIB_ROOT/homelab_backup/"
 install -m 0755 backupctl /usr/local/sbin/backupctl
 install -d -m 0700 /etc/homelab-backup/rclone
 install -d -m 0700 /var/lib/homelab-backup/{staging,restores,state}

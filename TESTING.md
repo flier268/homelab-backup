@@ -2,17 +2,22 @@
 
 已執行下列靜態與 smoke tests：
 
-- `python3 -m py_compile backupctl`
+- `python3 -m py_compile backupctl homelab_backup/*.py`
 - `bash -n install.sh`
 - `bash -n backup-configs.sh`
 - `bash -n restore-configs.sh`
 - `shellcheck install.sh backup-configs.sh restore-configs.sh`
 - `python3 -m unittest discover -s tests -v`
-- `backupctl --help`
+- repository 與模擬安裝後的 `backupctl --help`、`backupctl --version`
+
+Python 單元測試依 package 元件拆分為 `test_schedule.py`、`test_config.py`、
+`test_storage.py`、`test_backup.py`、`test_restore.py` 與 `test_cli.py`；共用測試
+fixture 集中在 `tests/helpers.py`。
 
 自動化測試涵蓋 manifest schema 與路徑安全、Cron 解析、staging 清理、
 hook／服務重啟、retention 狀態、snapshot host 範圍、restore preflight、
-required／excluded sources、volume 防清空、manifest 原子替換，以及部署腳本安全性。
+required／excluded sources、volume 防清空、manifest 原子替換、非 TTY restore
+確認政策，以及 repository／安裝後 launcher。
 
 仍需在實際主機執行：
 

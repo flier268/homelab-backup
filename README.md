@@ -77,4 +77,7 @@ sudo backupctl restore --all \
   --restore-manifest --apply --start --yes
 ```
 
+安全政策：只要 stdin 不是 TTY，所有 `restore`（包含只下載、不加
+`--apply`）都必須明確指定 `--yes`。
+
 完整說明請開啟 `GUIDE.html`。

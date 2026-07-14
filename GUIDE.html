@@ -183,7 +183,7 @@ sudo ./install.sh</code></pre>
 <p>安裝器會：</p>
 <ul>
 <li>安裝 Python、PyYAML、rsync、Restic、rclone、OpenSSL。</li>
-<li>安裝 <code>/usr/local/sbin/backupctl</code>。</li>
+<li>安裝 <code>/usr/local/sbin/backupctl</code> 與 <code>/usr/local/lib/homelab-backup/homelab_backup</code> package。</li>
 <li>建立全域設定、密碼、staging、restore、state 與 cache 路徑。</li>
 <li>建立 named-volume rsync helper image。</li>
 <li>安裝 systemd service 與 timer，但不立即啟用。</li>
@@ -587,7 +587,7 @@ sudo backupctl backup palworld</code></pre>
 </table>
 <h3>略過服務選單並還原全部服務</h3>
 <pre><code>sudo backupctl restore --all</code></pre>
-<p>仍會進行最後確認。stdin 不是 TTY（例如自動化或 pipe）時必須明確加入 <code>--yes</code>，否則命令會拒絕執行。</p>
+<p>仍會進行最後確認。安全政策規定 stdin 不是 TTY（例如自動化或 pipe）時，所有 restore（包含只下載、不使用 <code>--apply</code>）都必須明確加入 <code>--yes</code>，否則命令會拒絕執行。</p>
 <h3>還原、套用並啟動全部服務</h3>
 <pre><code>sudo backupctl restore --all --apply --start --yes</code></pre>
 <p>也可只指定部分服務：</p>
@@ -725,7 +725,6 @@ sudo systemctl enable --now homelab-backup-maintenance.timer</code></pre>
 <li><code>configs/</code> 三個必要檔案已有安全的外部副本。</li>
 <li>Restic 密碼、repository 設定與 OneDrive 授權資料可在主機外取得。</li>
 <li>systemd timers 正常執行且 journal 無錯誤。</li>
-<li>舊備份方案在新方案還原驗證完成前不要刪除。</li>
 </ul>
 <p class="small">本文件按首次部署流程編排。</p>
 </section>
