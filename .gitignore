@@ -3,6 +3,7 @@ __pycache__/
 
 state/
 homelab-backup-configs-*.zip
+homelab-backup-configs-*.zip.age
 
 configs/restic-password
 configs/rclone.conf
