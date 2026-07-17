@@ -1,10 +1,26 @@
 #!/usr/bin/env python3
+import os
 import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 if not (HERE / 'homelab_backup').is_dir():
-    sys.path.insert(0, str(HERE.parent / 'lib' / 'homelab-backup'))
+    install_root = HERE.parent / 'lib' / 'homelab-backup'
+    venv_root = install_root / 'venv'
+    if Path(sys.prefix) != venv_root:
+        venv_python = venv_root / 'bin' / 'python'
+        if not venv_python.is_file() or not os.access(venv_python, os.X_OK):
+            raise SystemExit(
+                f'ERROR: installed Python environment is missing: {venv_python}'
+            )
+        os.execv(
+            str(venv_python),
+            [str(venv_python), str(Path(__file__).resolve()), *sys.argv[1:]],
+        )
+    app_root = install_root / 'app'
+    if not (app_root / 'homelab_backup').is_dir():
+        raise SystemExit(f'ERROR: installed application is missing: {app_root}')
+    sys.path.insert(0, str(app_root))
 
 from homelab_backup.cli import main
 
