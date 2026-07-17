@@ -182,8 +182,9 @@ cd homelab-backup
 sudo ./install.sh</code></pre>
 <p>安裝器會：</p>
 <ul>
-<li>安裝 Python、PyYAML、rsync、Restic、rclone、OpenSSL。</li>
-<li>安裝 <code>/usr/local/sbin/backupctl</code> 與 <code>/usr/local/lib/homelab-backup/homelab_backup</code> package。</li>
+<li>安裝 Python 3.10 以上版本、Python venv、rsync、Restic、rclone、age、OpenSSL。</li>
+<li>建立 <code>/usr/local/lib/homelab-backup/venv</code> 虛擬環境，並將鎖定的 Python 依賴安裝在其中。</li>
+<li>安裝 <code>/usr/local/sbin/backupctl</code> 與 <code>/usr/local/lib/homelab-backup/app/homelab_backup</code> package。</li>
 <li>建立全域設定、密碼、staging、restore、state 與 cache 路徑。</li>
 <li>建立 named-volume rsync helper image。</li>
 <li>安裝 systemd service 與 timer，但不立即啟用。</li>
@@ -226,6 +227,9 @@ sudo rclone lsd onedrive: \
 <pre><code>version: 1
 host_id: server-a
 services_root: /srv/stacks
+trusted_data_roots:
+  - /srv/stacks
+  - /srv/data
 
 repository: rclone:onedrive:Backups/restic/server-a
 password_file: /etc/homelab-backup/restic-password
@@ -236,7 +240,7 @@ restore_root: /var/lib/homelab-backup/restores
 state_root: /var/lib/homelab-backup/state
 cache_root: /var/cache/homelab-backup/restic
 
-lock_file: /run/lock/homelab-backup.lock
+lock_file: /run/homelab-backup/backupctl.lock
 volume_helper_image: homelab/volume-rsync:1
 
 rclone:
@@ -244,6 +248,7 @@ rclone:
 
 check:
   read_data_subset: 5%</code></pre>
+<p>全域設定只接受文件列出的欄位；<code>rclone</code> 與 <code>check</code> 必須是 mapping。錯誤型別會在載入時停止，不會延後到備份或 repository check 才崩潰。</p>
 <h3>第二台主機</h3>
 <p>只需改成：</p>
 <pre><code>host_id: server-b
@@ -256,25 +261,28 @@ repository: rclone:onedrive:Backups/restic/server-b</code></pre>
 <p>完成 OneDrive 與全域設定後，在專案目錄執行：</p>
 <pre><code>cd ~/Apps/homelab-backup
 sudo ./backup-configs.sh</code></pre>
-<p>此腳本只允許 root 執行，因為輸出內容包含 Restic 密碼與 rclone 帳戶憑證。</p>
-<p>腳本會把以下三個必要檔案複製到專案的 <code>configs/</code>：</p>
-<pre><code>configs/restic-password
-configs/rclone.conf
-configs/config.yaml</code></pre>
+<p>此腳本只允許 root 執行。三個必要設定只會在 <code>/run</code> 的 root 專用暫存目錄封裝為 ZIP，離開該目錄前會先用貼入的 <code>ssh-ed25519</code> 或 <code>ssh-rsa</code> 公鑰經 <code>age</code> 加密。腳本會先確認 <code>/run</code> 確實位於 tmpfs。</p>
+<p><strong>功能邊界：</strong>這是全新專案，只支援目前的加密 archive，不提供舊明文設定、舊 archive 或 schema 遷移。全域設定、<code>backup.yaml</code> 與 snapshot inventory 都使用目前唯一的 <code>version: 1</code>。</p>
 <p>接著只能選一種保存方式：</p>
 <ol>
-<li><strong>Git：</strong>腳本先顯示 configured remotes；確認所有目的地都是嚴格控管的 private repository 後，必須輸入完整的 <code>PRIVATE</code>，腳本才會提交設定並詢問是否 <code>git push</code>。</li>
-<li><strong>ZIP：</strong>建立 <code>homelab-backup-configs-YYYYMMDD-HHMMSS.zip</code>。</li>
+<li><strong>Git：</strong>只建立並提交 <code>configs/homelab-backup-configs.zip.age</code>。腳本會先顯示 configured remotes；輸入完整的 <code>PRIVATE</code> 後才提交並詢問是否 <code>git push</code>。</li>
+<li><strong>加密檔：</strong>建立 timestamped <code>.zip.age</code>。</li>
 </ol>
-<div class="box warn"><code>restic-password</code> 與 <code>rclone.conf</code> 都是 secrets。Git 選項只能用於嚴格控管存取權的 private repository。ZIP 本身沒有加密，應放入加密密碼管理器或離線加密媒體。</div>
-<h3>從 <code>configs/</code> 放回設定</h3>
+<div class="box warn">私鑰必須另外保存在 Bitwarden 或離線安全媒體。沒有對應私鑰便無法還原；加密檔仍建議只放在嚴格控管的 private repository。</div>
+<p>腳本只以 root 讀取系統設定；選擇 Git 後，所有 Git 指令、hook 與 filter 都會降權成原本執行 <code>sudo</code> 的非 root 使用者。無法辨識非 root 使用者時會拒絕 Git 選項。</p>
+<h3>解密並放回設定</h3>
 <pre><code>cd ~/Apps/homelab-backup
-./restore-configs.sh</code></pre>
+sudo ./restore-configs.sh</code></pre>
+<p>依提示從 Bitwarden 貼入完整 SSH 私鑰，再按 Ctrl-D。也可在命令尾端指定另一個 <code>.zip.age</code> archive。</p>
 <p>還原腳本會將檔案安裝到：</p>
 <pre><code>/etc/homelab-backup/restic-password
 /etc/homelab-backup/rclone/rclone.conf
 /etc/homelab-backup/config.yaml</code></pre>
-<p>如果 <code>configs/</code> 缺少任何一個必要檔案，腳本會列出缺失項目、要求使用者先補齊，然後終止，不會執行部分還原。</p>
+<p>還原前會確認 ZIP 恰好含三個預期檔案。三個設定會先完整準備，安裝失敗時全部回滾，不留下新舊版本混合狀態。</p>
+<h3>換 SSH KEY</h3>
+<pre><code>sudo ./backup-configs.sh --rotate configs/homelab-backup-configs.zip.age</code></pre>
+<p>先貼入舊私鑰並按 Ctrl-D，再貼入新公鑰。archive 必須由執行 <code>sudo</code> 的非 root 使用者擁有；原檔讀取與最後替換都以該使用者權限執行。腳本只在完整解密、內容驗證及重新加密成功後原子替換舊檔。</p>
+<div class="box">功能邊界：本專案不管理 SSH agent、金鑰生命週期或遠端祕密服務。私鑰只從標準輸入直接交給 <code>age</code>，不寫入參數、環境變數或一般磁碟；換 KEY 後需自行更新 Bitwarden 備援。</div>
 </section>
 
 <section id="manifest">
@@ -307,8 +315,6 @@ compose:
 consistency:
   mode: stop
   timeout: 120
-  services:
-    - minecraft
   before: []
   after: []
 
@@ -334,17 +340,14 @@ sources:
 <h2>11. 一致性模式</h2>
 <table>
 <tr><th>模式</th><th>行為</th><th>用途</th></tr>
-<tr><td><code>stop</code></td><td>預同步 → 停止指定 Compose services → 最終同步與 volume 備份 → 重啟原本運行的 services。</td><td>Minecraft、Palworld、持續寫入檔案、raw database volume。</td></tr>
-<tr><td><code>hooks</code></td><td>執行 before hook → 同步 → 執行 after hook；不自動停服。</td><td>SQL dump、RCON save、應用內建 snapshot。</td></tr>
-<tr><td><code>none</code></td><td>直接同步，不停止、不執行一致性 hook。</td><td>靜態檔、唯讀資料、可重建內容。</td></tr>
+<tr><td><code>stop</code></td><td>停止整個 Compose project 中原本運行的 services → 動態 preflight → 單次同步與 volume 備份 → 重啟原本運行的 services。</td><td>Minecraft、Palworld、持續寫入檔案、raw database volume。</td></tr>
+<tr><td><code>hooks</code></td><td>執行 before hook → 動態 preflight → 同步 → 執行 after hook；before hook 可建立或更新 <code>sources.paths</code> payload artifact，且必須確實停止或隔離所有 target writer。所有 required Docker named volumes 必須在靜態 preflight 前已存在，不支援由 hook 動態建立。</td><td>SQL dump、RCON save、應用內建 snapshot。</td></tr>
+<tr><td><code>none</code></td><td>直接同步，不停止、不執行一致性 hook；Docker 對 target 的 mount 必須是唯讀。</td><td>靜態檔、唯讀資料、可重建內容。</td></tr>
 </table>
 <h3><code>stop</code> 範例</h3>
 <pre><code>consistency:
   mode: stop
-  timeout: 180
-  services:
-    - ghost
-    - db</code></pre>
+  timeout: 180</code></pre>
 <h3><code>hooks</code> 範例</h3>
 <pre><code>consistency:
   mode: hooks
@@ -370,6 +373,16 @@ sources:
       exclude:
         - logs/**
         - crash-reports/**</code></pre>
+<h3>路徑來源的安全邊界</h3>
+<ul>
+<li>每個 path 必須是完整 managed leaf，且必須嚴格位於 trusted root 之下，不能等於 trusted root。從系統 root 到 leaf parent 的目錄都必須由 root 擁有、不可 group/world write 且不是 symlink；leaf 目錄內可由容器 UID/GID 擁有。容器可寫資料樹中的深層檔案不能再作為獨立 target。</li>
+<li><code>sources.paths</code> 指到 symlink 時，只保存 link 物件與其目標字串；目標是檔案、目錄或不存在（dangling）都不會被跟隨。</li>
+<li>真實目錄內的 symlink 同樣由 rsync 以 link 保存。還原時會替換目標位置的 leaf 物件，不會沿著現場 symlink 寫入其 referent。</li>
+<li>只支援 ext4、xfs 與 Btrfs。trusted root 可為核准 filesystem mount 或已掛載 Btrfs subvolume，但其下不允許其他 mount、bind mount或 nested Btrfs subvolume。</li>
+<li>payload 支援普通檔案、目錄、symlink、ACL、xattr 與 payload 內 hardlink；FIFO、socket與 device node拒絕。Btrfs subvolume identity、snapshot、reflink、compression與 CoW 屬性不在保存承諾內。</li>
+<li>本版不支援 remote/rootless Docker、ZFS、ext2/3、FUSE、NFS、autofs、follow-link 或 cross-mount。</li>
+<li>staging 與 restore workspace 套用相同 filesystem allowlist、control ownership 與 nested mount 驗證。</li>
+</ul>
 <h3>Compose named volume</h3>
 <p>Compose：</p>
 <pre><code>services:
@@ -390,6 +403,7 @@ volumes:
   volumes:
     - id: shared-data
       name: company_shared_data</code></pre>
+<p><code>name</code> 只接受 Docker 管理的 named volume 名稱，不接受 <code>/etc</code>、相對 host path 或 mount option。工具以 <code>--mount type=volume</code> 明確掛載，絕不把 volume name 推測成 bind mount。</p>
 <h3>Anonymous volume</h3>
 <p>以下形式沒有穩定名稱，不適合宣告式備份：</p>
 <pre><code>volumes:
@@ -418,6 +432,7 @@ volumes:
 <tr><td><code>0 4 1 * *</code></td><td>每月 1 日 04:00</td></tr>
 </table>
 <p>排程器每 5 分鐘掃描，因此實際開始時間可能比 cron 時點晚數分鐘。</p>
+<p>cron 時點由 CronSim 依 Debian cron 語意計算。夏令時間向前跳時，落在略過區間的固定時刻會在跳時後立即執行；向後回撥時，同一固定時刻不會重複執行。</p>
 <h3>備份超過 5 分鐘</h3>
 <ul>
 <li>systemd oneshot 不會同時再啟動第二份相同 service。</li>
@@ -426,6 +441,7 @@ volumes:
 <li>執行期間經過的 cron 時點不建立工作佇列。</li>
 </ul>
 <div class="box">例如 02:00 開始，備份到 08:20，而 cron 也包含 08:00：08:00 不會另開第二份；完成後下一個有效時點是 14:00。</div>
+<div class="box">高頻排程同理：若 <code>*/5 * * * *</code> 的 12:00 備份到 12:17 才完成，12:05、12:10、12:15 全部跳過；下一次是 12:20，不會在完成後立即補跑。</div>
 <h3>失敗重試</h3>
 <pre><code>schedule:
   cron: "0 */6 * * *"
@@ -478,7 +494,6 @@ compose:
 consistency:
   mode: stop
   timeout: 120
-  services: [minecraft]
   before: []
   after: []
 
@@ -517,9 +532,6 @@ compose:
 consistency:
   mode: stop
   timeout: 180
-  services:
-    - ghost
-    - db
 
 sources:
   paths:
@@ -594,15 +606,17 @@ sudo backupctl backup palworld</code></pre>
 <pre><code>sudo backupctl restore minecraft ghost --apply</code></pre>
 <h3><code>backup.yaml</code> 的還原規則</h3>
 <ul>
-<li>本機不存在 <code>/srv/stacks/&lt;service&gt;/backup.yaml</code>：直接從 snapshot 的 <code>_meta/backup.yaml</code> 還原，並依該 manifest 套用資料。</li>
-<li>本機已存在：互動詢問是否以 snapshot 中的 <code>backup.yaml</code> 覆蓋。</li>
-<li>可用 <code>--restore-manifest</code> 強制採用 snapshot manifest。</li>
+<li>現有部署：本機 manifest 與所有 Compose files 都存在；snapshot inventory 必須與本機 project name、path/source declarations、volume mapping、volume 名稱及 labels 相符後才可覆寫。Compose service 清單只供診斷，新增或移除 service 不會單獨阻止舊 snapshot 還原。</li>
+<li>全新重建：manifest、Compose files、所有 present path與 named volume 都必須不存在，且 snapshot 中必須包含所有 required Compose file path source；資料完成後才發布 Compose files與 manifest。</li>
+<li>只有部分設定或 target 存在、project identity 不明、或有其他 container 引用 target時，一律拒絕，不猜測身份也不覆寫。</li>
+<li><code>--restore-manifest</code> 只允許更新與本機安全投影一致的 snapshot manifest。</li>
 <li>可用 <code>--keep-manifest</code> 強制保留本機 manifest。</li>
 </ul>
 <p>單純下載 snapshot 時，資料放在：</p>
 <pre><code>/var/lib/homelab-backup/restores/&lt;service&gt;/&lt;timestamp&gt;</code></pre>
 <div class="box warn">第一次上線前至少實際執行一次 <code>restore --apply</code> 測試。成功上傳不等於能成功還原。</div>
 <div class="box">套用前會先驗證所有 required path、volume 與 Compose 檔案均存在於還原資料中，並停止該 Compose project 目前所有運行中的 services；任何必要來源缺失都會中止，不會以空目錄覆寫正式 volume。設定的 exclude 也會在還原時保留。</div>
+<div class="box warn">操作期間不存在未受控 writer 是 operator obligation。程式會檢查已知 Docker containers，但無法證明主機上沒有共用 UID 程序、排程或其他 privileged process。</div>
 </section>
 
 <section id="enable">
@@ -652,12 +666,11 @@ sudo backupctl snapshots</code></pre>
 <table>
 <tr><th>材料</th><th>用途</th></tr>
 <tr><td>本專案程式碼</td><td>從 <code>https://github.com/flier268/homelab-backup.git</code> 重新 clone。</td></tr>
-<tr><td><code>configs/restic-password</code></td><td>解密 Restic repository。</td></tr>
-<tr><td><code>configs/rclone.conf</code></td><td>存取 OneDrive；也可以重新授權取代。</td></tr>
-<tr><td><code>configs/config.yaml</code></td><td>提供 host ID、repository 路徑與本機工作路徑。</td></tr>
+<tr><td><code>configs/homelab-backup-configs.zip.age</code></td><td>加密保存 Restic 密碼、rclone 設定與全域設定。</td></tr>
+<tr><td>對應 SSH 私鑰</td><td>解密設定 archive；應另外保存在 Bitwarden 或離線安全媒體。</td></tr>
 <tr><td>OneDrive Restic repository</td><td>保存服務資料、歷史 snapshots、Compose 等來源檔，以及自動保存的 <code>backup.yaml</code>。</td></tr>
 </table>
-<p>使用 <code>./backup-configs.sh</code> 產生並保存前三個設定檔。使用 <code>./restore-configs.sh</code> 放回對應系統路徑。</p>
+<p>使用 <code>sudo ./backup-configs.sh</code> 產生加密 archive；使用 <code>sudo ./restore-configs.sh</code> 貼入私鑰並放回對應系統路徑。</p>
 <div class="box ok">不需要另外備份 <code>/srv/stacks</code> 才能完成復原。用 private Git 保存 stacks 只會讓版本管理與人工查看更方便。</div>
 <div class="box warn">如果遺失 Restic 密碼，即使 OneDrive repository 還在，也無法解密資料。</div>
 </section>
@@ -668,30 +681,13 @@ sudo backupctl snapshots</code></pre>
 <pre><code>cd ~/Apps
 git clone https://github.com/flier268/homelab-backup.git
 cd homelab-backup</code></pre>
-<h3>2. 準備 <code>configs/</code></h3>
-<p>若設定已存入 private Git，clone 後應直接存在。若使用 ZIP，將 ZIP 解壓到專案目錄，最後必須是：</p>
-<pre><code>configs/restic-password
-configs/rclone.conf
-configs/config.yaml</code></pre>
+<h3>2. 準備加密設定 archive 與私鑰</h3>
+<p>若 archive 已存入 private Git，clone 後會位於 <code>configs/homelab-backup-configs.zip.age</code>。另從 Bitwarden 準備對應 SSH 私鑰。</p>
 <h3>3. 安裝工具</h3>
 <pre><code>sudo ./install.sh</code></pre>
 <h3>4. 放回必要設定</h3>
-<pre><code>./restore-configs.sh</code></pre>
-<p>此腳本實際執行等效於：</p>
-<pre><code>sudo install -d -o root -g root -m 0700 \
-  /etc/homelab-backup/rclone
-
-sudo install -o root -g root -m 0600 \
-  configs/restic-password \
-  /etc/homelab-backup/restic-password
-
-sudo install -o root -g root -m 0600 \
-  configs/rclone.conf \
-  /etc/homelab-backup/rclone/rclone.conf
-
-sudo install -o root -g root -m 0600 \
-  configs/config.yaml \
-  /etc/homelab-backup/config.yaml</code></pre>
+<pre><code>sudo ./restore-configs.sh</code></pre>
+<p>依提示貼入完整私鑰並按 Ctrl-D。使用外部 archive 時，將路徑附在命令後；內容驗證成功後才以 root、mode 0600 安裝三個設定，任一步失敗會回滾整組設定。</p>
 <h3>5. 測試 OneDrive 與 repository</h3>
 <pre><code>sudo rclone lsd onedrive: \
   --config /etc/homelab-backup/rclone/rclone.conf
@@ -704,7 +700,7 @@ sudo backupctl snapshots</code></pre>
 <p>完全非互動：</p>
 <pre><code>sudo backupctl restore --all \
   --restore-manifest --apply --start --yes</code></pre>
-<p>本機沒有 <code>backup.yaml</code> 時，程式會先從 snapshot 還原它；之後依其中的 path 與 volume 定義還原各服務，不需要 bootstrap 命令。</p>
+<p>本機沒有 <code>backup.yaml</code> 時，只有在 manifest、所有 Compose files、present paths、named volumes 與相關 container references 全部不存在的全新重建模式下才會套用；任何混合狀態都會拒絕。</p>
 <h3>7. 檢查服務</h3>
 <pre><code>docker ps
 cd /srv/stacks/ghost

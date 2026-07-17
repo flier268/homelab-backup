@@ -11,7 +11,7 @@ class ManifestValidationTests(unittest.TestCase):
     def test_version_must_be_one(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            for version in (None, 2):
+            for version in (None, 2, True):
                 value = manifest(root)
                 if version is None:
                     value.pop('version')
@@ -84,6 +84,18 @@ class ManifestValidationTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         config.validate_manifest(manifest(root, sources=sources))
 
+    def test_docker_volume_name_cannot_be_a_host_path_or_mount_option(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for unsafe in ('/etc', '../data', 'name,readonly', 'name:/dst'):
+                with self.subTest(unsafe=unsafe):
+                    value = manifest(root, sources={
+                        'paths': [],
+                        'volumes': [{'id': 'data', 'name': unsafe}],
+                    })
+                    with self.assertRaisesRegex(ValueError, 'Docker volume name'):
+                        config.validate_manifest(value)
+
     def test_unknown_manifest_fields_are_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -115,23 +127,6 @@ class ManifestValidationTests(unittest.TestCase):
                     })
                     with self.assertRaisesRegex(ValueError, 'only valid with mode hooks'):
                         config.validate_manifest(value)
-
-    def test_services_are_only_allowed_in_stop_mode(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            for mode in ('hooks', 'none'):
-                with self.subTest(mode=mode):
-                    value = manifest(root, consistency={
-                        'mode': mode, 'services': ['db'],
-                    })
-                    with self.assertRaisesRegex(ValueError, 'only valid with mode stop'):
-                        config.validate_manifest(value)
-                config.validate_manifest(manifest(root, consistency={
-                    'mode': mode, 'services': [],
-                }))
-            config.validate_manifest(manifest(root, consistency={
-                'mode': 'stop', 'services': ['db'],
-            }))
 
     def test_duplicate_or_overlapping_path_targets_are_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -171,14 +166,15 @@ class GlobalConfigValidationTests(unittest.TestCase):
             'services_root': str(root / 'services'),
             'staging_root': str(root / 'staging'),
             'restore_root': str(root / 'restore'),
+            'trusted_data_roots': [str(root / 'services')],
         }
 
-    def test_version_must_be_one(self):
+    def test_global_version_must_be_one(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             config_path = root / 'config.yaml'
             config_path.touch()
-            for version in (None, 2):
+            for version in (None, 2, True):
                 config_data = self.config_data(root)
                 if version is None:
                     config_data.pop('version')
@@ -189,6 +185,56 @@ class GlobalConfigValidationTests(unittest.TestCase):
                         mock.patch.object(config, 'load_yaml', return_value=config_data), \
                         self.assertRaisesRegex(SystemExit, '1'):
                     config.cfg()
+
+    def test_trusted_data_roots_are_required_absolute_and_non_overlapping(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / 'config.yaml'
+            config_path.touch()
+            cases = (None, [], ['relative'], [str(root / 'data'), str(root / 'data/app')])
+            for roots in cases:
+                value = self.config_data(root)
+                if roots is None:
+                    value.pop('trusted_data_roots')
+                else:
+                    value['trusted_data_roots'] = roots
+                with self.subTest(roots=roots), \
+                        mock.patch.object(config, 'CFG', config_path), \
+                        mock.patch.object(config, 'load_yaml', return_value=value), \
+                        self.assertRaisesRegex(SystemExit, '1'):
+                    config.cfg()
+
+    def test_optional_sections_must_be_mappings_with_known_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / 'config.yaml'
+            config_path.touch()
+            invalid = (
+                {'rclone': ['not-a-mapping']},
+                {'check': 'not-a-mapping'},
+                {'rclone': {'unknown': 'value'}},
+                {'check': {'unknown': 'value'}},
+                {'rclone': {'bwlimit': 10}},
+                {'check': {'read_data_subset': 5}},
+            )
+            for override in invalid:
+                values = dict(self.config_data(root), **override)
+                with self.subTest(override=override), \
+                        mock.patch.object(config, 'CFG', config_path), \
+                        mock.patch.object(config, 'load_yaml', return_value=values), \
+                        self.assertRaises(SystemExit):
+                    config.cfg()
+
+    def test_unknown_global_config_field_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / 'config.yaml'
+            config_path.touch()
+            values = dict(self.config_data(root), unexpected=True)
+            with mock.patch.object(config, 'CFG', config_path), \
+                    mock.patch.object(config, 'load_yaml', return_value=values), \
+                    self.assertRaises(SystemExit):
+                config.cfg()
 
     def test_primary_roots_must_be_pairwise_separate(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -217,6 +263,40 @@ class GlobalConfigValidationTests(unittest.TestCase):
                         with self.subTest(pair=(left_name, right_name), relation=relation), \
                                 mock.patch.object(config, 'CFG', config_path), \
                                 mock.patch.object(config, 'load_yaml', return_value=config_data):
+                            with self.assertRaises(SystemExit):
+                                config.cfg()
+
+    def test_destructive_roots_must_not_overlap_control_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / 'config.yaml'
+            config_path.touch()
+            base = self.config_data(root)
+            destructive_roots = ('staging_root', 'restore_root')
+            protected_paths = (
+                'password_file', 'rclone_config', 'cache_root',
+                'state_root', 'lock_file',
+            )
+            for destructive in destructive_roots:
+                for protected in protected_paths:
+                    for relation in ('equal', 'control-inside', 'root-inside'):
+                        shared = root / f'{destructive}-{protected}'
+                        values = dict(base)
+                        if relation == 'equal':
+                            values[destructive] = str(shared)
+                            values[protected] = str(shared)
+                        elif relation == 'control-inside':
+                            values[destructive] = str(shared)
+                            values[protected] = str(shared / 'control')
+                        else:
+                            values[destructive] = str(shared / 'work')
+                            values[protected] = str(shared)
+                        with self.subTest(
+                            destructive=destructive,
+                            protected=protected,
+                            relation=relation,
+                        ), mock.patch.object(config, 'CFG', config_path), \
+                                mock.patch.object(config, 'load_yaml', return_value=values):
                             with self.assertRaises(SystemExit):
                                 config.cfg()
 

@@ -5,73 +5,85 @@ import shutil
 import sys
 from pathlib import Path
 
-from .common import CommandError, GlobalLock, _print_command_failure, atomic_write_json, die, paths_overlap, resolved_path, restic_env, run
+from .common import CommandError, GlobalLock, _print_command_failure, die, restic_env, run
 from .config import RETENTION_FLAGS, compose_cmd, compose_model, manifest, manifests, source_path, validate_manifest
-from .schedule import cron_next, cron_previous, parse_cron, parse_duration
-from .storage import hooks, running_services, sync_paths, sync_volumes, validate_runtime_sources
+from .schedule import cron_next, cron_previous, local_now, parse_cron, parse_duration
+from .security import (
+    atomic_copy_file, atomic_write_json, ensure_control_directory,
+    ensure_private_directory, paths_overlap, validate_control_root,
+    validate_trusted_roots,
+)
+from .storage import (
+    compose_identity, hooks, resolved_volume_sources, running_services,
+    sync_paths, sync_volumes, validate_docker_bind_probe,
+    validate_docker_environment,
+    validate_no_docker_writers, validate_path_payloads, validate_runtime_sources,
+)
 
 def stage_service(c, m):
     validate_manifest(m)
-    stage = resolved_path(Path(c['staging_root']) / m['service'])
-    protected = [resolved_path(m['_dir'])]
-    protected.extend(
-        resolved_path(source_path(m, source))
-        for source in (m.get('sources') or {}).get('paths', [])
-    )
+    validate_trusted_roots(c['trusted_data_roots'])
+    staging_root = Path(c['staging_root'])
+    stage = staging_root / m['service']
+    protected = [Path(m['_dir'])]
+    protected.extend(source_path(m, source) for source in (m.get('sources') or {}).get('paths', []))
     for target in protected:
         if paths_overlap(stage, target):
             raise ValueError(f'staging directory {stage} overlaps protected path {target}')
-    if stage.exists():
-        shutil.rmtree(stage)
-    stage.mkdir(parents=True, exist_ok=True)
+    ensure_private_directory(staging_root)
+    ensure_private_directory(stage, replace=True)
+    validate_docker_environment()
+    validate_docker_bind_probe(c)
+    model = compose_model(m)
     mode = (m.get('consistency') or {}).get('mode', 'stop')
-    selected = (m.get('consistency') or {}).get('services', [])
+    validate_runtime_sources(c, m, model, allow_missing_paths=mode == 'hooks')
+    resolved_volumes = resolved_volume_sources(m, model=model)
+    identity = compose_identity(m, model=model, resolved=resolved_volumes)
     if mode == 'hooks':
         try:
             hooks(m, 'before')
-            sync_paths(m, stage)
-            sync_volumes(c, m, stage)
+            validate_no_docker_writers(
+                m, identity, resolved_volumes, project_must_be_stopped=False,
+            )
+            validate_path_payloads(c, m)
+            path_inventory = sync_paths(c, m, stage)
+            volume_inventory = list(sync_volumes(c, m, stage, resolved=resolved_volumes) or [])
         finally:
             hooks(m, 'after')
     elif mode == 'stop':
-        sync_paths(m, stage)
         running = running_services(m)
-        targets = [x for x in selected if x in running] if selected else running
+        targets = running
         try:
             if targets:
                 run(compose_cmd(m) + ['stop', '-t', str((m.get('consistency') or {}).get('timeout', 120))] + targets, cwd=m['_dir'])
-            sync_paths(m, stage)
-            sync_volumes(c, m, stage)
+            validate_no_docker_writers(
+                m, identity, resolved_volumes, project_must_be_stopped=True,
+            )
+            validate_path_payloads(c, m)
+            path_inventory = sync_paths(c, m, stage)
+            volume_inventory = list(sync_volumes(c, m, stage, resolved=resolved_volumes) or [])
         finally:
             if targets:
-                run(compose_cmd(m) + ['up', '-d'] + targets, cwd=m['_dir'])
+                run(compose_cmd(m) + ['start'] + targets, cwd=m['_dir'])
     else:
-        sync_paths(m, stage)
-        sync_volumes(c, m, stage)
+        validate_no_docker_writers(
+            m, identity, resolved_volumes, project_must_be_stopped=False,
+        )
+        validate_path_payloads(c, m)
+        path_inventory = sync_paths(c, m, stage)
+        volume_inventory = list(sync_volumes(c, m, stage, resolved=resolved_volumes) or [])
     meta = stage / '_meta'
-    meta.mkdir(exist_ok=True)
+    ensure_private_directory(meta)
     # backup.yaml is always included as recovery metadata, even when it is not listed in sources.paths.
-    shutil.copy2(m['_path'], meta / 'backup.yaml')
+    atomic_copy_file(m['_path'], meta / 'backup.yaml')
     inventory = {
+        'version': 1,
         'service': m['service'],
         'service_directory': m['_dir'],
-        'paths': [],
-        'volumes': [],
+        'paths': path_inventory,
+        'volumes': volume_inventory,
+        'compose': identity,
     }
-    for source in (m.get('sources') or {}).get('paths', []):
-        source_path = Path(source['path'])
-        source_path = source_path if source_path.is_absolute() else Path(m['_dir']) / source_path
-        inventory['paths'].append({
-            'id': source['id'],
-            'path': source['path'],
-            'type': 'directory' if source_path.is_dir() else 'file',
-        })
-    for source in (m.get('sources') or {}).get('volumes', []):
-        inventory['volumes'].append({
-            'id': source['id'],
-            'compose_volume': source.get('compose_volume'),
-            'name': source.get('name'),
-        })
     atomic_write_json(meta / 'inventory.json', inventory)
     return stage
 
@@ -92,20 +104,24 @@ def load_state(c, service):
 
 
 def save_state(c, service, state):
+    ensure_control_directory(c['state_root'])
     atomic_write_json(state_path(c, service), state)
 
 
 def parse_iso(value):
-    if not value:
+    if not isinstance(value, str) or not value:
         return None
     try:
-        return dt.datetime.fromisoformat(value)
+        parsed = dt.datetime.fromisoformat(value)
     except ValueError:
         return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(dt.timezone.utc)
 
 
 def due_status(c, m, now=None):
-    now = now or dt.datetime.now().astimezone()
+    now = now or local_now()
     schedule = m['schedule']
     if schedule.get('enabled', True) is False:
         return False, 'schedule disabled', None
@@ -124,7 +140,7 @@ def due_status(c, m, now=None):
     if last_success is None or last_success < occurrence:
         max_lateness = schedule.get('max_lateness')
         if max_lateness is not None:
-            deadline = occurrence + dt.timedelta(
+            deadline = occurrence.astimezone(dt.timezone.utc) + dt.timedelta(
                 seconds=parse_duration(max_lateness, 'schedule.max_lateness')
             )
             if now > deadline:
@@ -185,6 +201,8 @@ def backup_one(c, m, *, apply_retention=True):
                 retention_error = err.stderr.strip() or str(err)
         finished = dt.datetime.now().astimezone()
         state.update({
+            # Boundary: completion is the schedule watermark. Cron occurrences
+            # reached while this backup was running are skipped, not queued.
             'last_success_at': finished.isoformat(),
             'last_finished_at': finished.isoformat(),
             'last_result': 'success',
@@ -207,7 +225,7 @@ def backup_one(c, m, *, apply_retention=True):
 
 
 def cmd_list(c, args):
-    now = dt.datetime.now().astimezone()
+    now = local_now()
     for m in manifests(c):
         due, reason, _ = due_status(c, m, now)
         schedule = m['schedule']
@@ -216,7 +234,7 @@ def cmd_list(c, args):
 
 
 def cmd_status(c, args):
-    now = dt.datetime.now().astimezone()
+    now = local_now()
     for m in manifests(c):
         due, reason, _ = due_status(c, m, now)
         state = load_state(c, m['service'])
@@ -232,10 +250,24 @@ def cmd_status(c, args):
 
 def cmd_validate(c, args):
     errors = []
+    try:
+        validate_trusted_roots(c['trusted_data_roots'])
+    except (OSError, ValueError, RuntimeError) as err:
+        errors.append(f'trusted_data_roots are unsupported: {err}')
+    for key in ('staging_root', 'restore_root'):
+        try:
+            validate_control_root(c[key])
+        except (OSError, ValueError, RuntimeError) as err:
+            errors.append(f'{key} is unsupported: {err}')
     for command in ['docker', 'restic', 'rclone', 'rsync']:
         if not shutil.which(command):
             errors.append(f'missing command: {command}')
     if shutil.which('docker'):
+        try:
+            validate_docker_environment()
+            validate_docker_bind_probe(c)
+        except (CommandError, OSError, ValueError, RuntimeError) as err:
+            errors.append(f'Docker environment is unsupported: {err}')
         try:
             run(['docker', 'compose', 'version'])
         except CommandError as err:
@@ -248,7 +280,15 @@ def cmd_validate(c, args):
     for key in ('password_file', 'rclone_config'):
         if not Path(c[key]).is_file():
             errors.append(f'missing config file: {c[key]}')
-    ms = manifests(c, include_disabled=True)
+    def record_manifest_error(path, err):
+        print(f'ERROR: {path}: {err}', file=sys.stderr)
+        errors.append(f'{path}: {err}')
+
+    ms = manifests(
+        c,
+        include_disabled=True,
+        on_error=record_manifest_error,
+    )
     if not any(m.get('enabled', True) for m in ms):
         errors.append(f"no enabled backup.yaml manifests found under {c['services_root']}/*/")
     seen = {}
@@ -262,7 +302,10 @@ def cmd_validate(c, args):
                 raise RuntimeError(f"duplicate service name '{name}' also used by {seen[name]}")
             seen[name] = m['_path']
             model = compose_model(m)
-            validate_runtime_sources(c, m, model)
+            validate_runtime_sources(
+                c, m, model,
+                allow_missing_paths=(m.get('consistency') or {}).get('mode') == 'hooks',
+            )
             print(f'OK: {label}')
         except CommandError:
             errors.append(f'{label}: Docker Compose configuration failed')
@@ -295,17 +338,32 @@ def cmd_run_due(c, args):
         if not acquired:
             print('SKIP: another backup or maintenance process is still running')
             return
-        now = dt.datetime.now().astimezone()
+        now = local_now()
         due = []
-        for m in manifests(c):
-            is_due, reason, _ = due_status(c, m, now)
+        failures = []
+
+        def record_manifest_error(path, err):
+            failures.append((str(path), f'manifest loading failed: {err}'))
+            print(f'ERROR: manifest loading failed for {path}: {err}', file=sys.stderr)
+
+        for m in manifests(c, on_error=record_manifest_error):
+            service = m.get('service', '<unnamed>')
+            try:
+                is_due, reason, _ = due_status(c, m, now)
+            except Exception as err:
+                failures.append((service, f'schedule planning failed: {err}'))
+                print(
+                    f'ERROR: schedule planning failed for {service}: {err}',
+                    file=sys.stderr,
+                )
+                if os.environ.get('BACKUPCTL_DEBUG') == '1':
+                    raise
+                continue
             print(f"{m['service']}: {'DUE' if is_due else 'skip'} ({reason})")
             if is_due:
                 due.append(m)
         if not due:
             print('No backups are due.')
-            return
-        failures = []
         for m in due:
             print(f"\n== Scheduled backup: {m['service']} ==")
             try:
@@ -334,11 +392,44 @@ def cmd_maintenance(c, args):
         if not acquired:
             print('SKIP: backup or maintenance is still running')
             return
-        for m in manifests(c):
-            print(f"\n== Retention: {m['service']} ==")
-            run(retention_cmd(c, m, dry_run=args.dry_run), env=restic_env(c))
+        failures = []
+
+        def record_manifest_error(path, err):
+            failures.append((str(path), f'manifest loading failed: {err}'))
+            print(f'ERROR: manifest loading failed for {path}: {err}', file=sys.stderr)
+
+        for m in manifests(c, on_error=record_manifest_error):
+            service = m.get('service', '<unnamed>')
+            print(f"\n== Retention: {service} ==")
+            try:
+                run(retention_cmd(c, m, dry_run=args.dry_run), env=restic_env(c))
+            except Exception as err:
+                if isinstance(err, CommandError):
+                    _print_command_failure(
+                        err,
+                        context=f'Retention failed for {service}',
+                    )
+                else:
+                    print(f'ERROR: retention failed for {service}: {err}', file=sys.stderr)
+                failures.append((service, str(err)))
+                if os.environ.get('BACKUPCTL_DEBUG') == '1':
+                    raise
         if not args.dry_run:
-            run(['restic', 'prune'], env=restic_env(c))
+            try:
+                run(['restic', 'prune'], env=restic_env(c))
+            except Exception as err:
+                if isinstance(err, CommandError):
+                    _print_command_failure(err, context='Repository prune failed')
+                else:
+                    print(f'ERROR: repository prune failed: {err}', file=sys.stderr)
+                failures.append(('repository prune', str(err)))
+                if os.environ.get('BACKUPCTL_DEBUG') == '1':
+                    raise
+        if failures:
+            print('\nMAINTENANCE FAILURES', file=sys.stderr)
+            for operation, error in failures:
+                print(f'  - {operation}: {error}', file=sys.stderr)
+            raise SystemExit(1)
 
 
 def cmd_check(c, args):

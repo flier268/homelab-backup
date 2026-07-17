@@ -78,6 +78,9 @@ def build_parser():
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    if os.geteuid() != 0:
+        print('ERROR: backupctl must run as root', file=sys.stderr)
+        raise SystemExit(1)
     try:
         config = cfg()
         COMMANDS[args.cmd](config, args)

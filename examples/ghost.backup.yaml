@@ -21,14 +21,36 @@ compose:
 consistency:
   mode: hooks
   timeout: 180
-  services: []
   before:
-    - >-
-      mkdir -p ./backup-dumps &&
-      docker compose exec -T db sh -c
-      'exec mysqldump -uroot -p"$MYSQL_ROOT_PASSWORD" "$MYSQL_DATABASE"'
-      > ./backup-dumps/ghost.sql
-  after: []
+    - |-
+      state_dir="${BACKUPCTL_HOOK_STATE_DIR:-/run/homelab-backup/hooks}"
+      state_file="$state_dir/ghost.running-services"
+      pending_file="$state_file.pending"
+      install -d -m 0700 "$state_dir"
+      rm -f -- "$state_file" "$pending_file"
+      umask 077
+      docker compose ps --services --filter status=running > "$pending_file"
+      mkdir -p ./backup-dumps
+      docker compose exec -T db sh -c \
+        'exec mysqldump -uroot -p"$MYSQL_ROOT_PASSWORD" "$MYSQL_DATABASE"' \
+        > ./backup-dumps/ghost.sql
+      mv -f -- "$pending_file" "$state_file"
+      if [[ -s "$state_file" ]]; then
+        mapfile -t running_services < "$state_file"
+        docker compose stop "${running_services[@]}"
+      fi
+  after:
+    - |-
+      state_dir="${BACKUPCTL_HOOK_STATE_DIR:-/run/homelab-backup/hooks}"
+      state_file="$state_dir/ghost.running-services"
+      if [[ ! -f "$state_file" ]]; then
+        exit 0
+      fi
+      mapfile -t running_services < "$state_file"
+      if (( ${#running_services[@]} > 0 )); then
+        docker compose start "${running_services[@]}"
+      fi
+      rm -f -- "$state_file"
 
 sources:
   paths:

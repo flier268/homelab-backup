@@ -3,7 +3,8 @@ import re
 import sys
 from pathlib import Path
 
-from .common import CommandError, _print_command_failure, die, load_yaml, paths_overlap, resolved_path, run
+from .common import CommandError, _print_command_failure, die, load_yaml, run
+from .security import lexical_absolute, paths_overlap
 from .schedule import validate_schedule
 
 CFG = Path('/etc/homelab-backup/config.yaml')
@@ -16,6 +17,15 @@ RETENTION_FLAGS = (
     ('keep_yearly', '--keep-yearly'),
 )
 SERVICE_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]*')
+DOCKER_VOLUME_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]*')
+
+
+def validate_docker_volume_name(value, field='Docker volume name'):
+    # Boundary: only Docker-managed named volumes are accepted. Host paths,
+    # mount syntax, driver options, and anonymous volumes are out of scope.
+    if not isinstance(value, str) or DOCKER_VOLUME_RE.fullmatch(value) is None:
+        raise ValueError(f'{field} must be a safe Docker volume name')
+    return value
 
 def cfg():
     if not CFG.exists():
@@ -23,16 +33,58 @@ def cfg():
     c = load_yaml(CFG)
     if not isinstance(c, dict):
         die(f'{CFG} must contain a YAML mapping')
+    allowed = {
+        'version', 'host_id', 'services_root', 'repository', 'password_file',
+        'rclone_config', 'staging_root', 'restore_root', 'cache_root',
+        'volume_helper_image', 'state_root', 'lock_file', 'trusted_data_roots',
+        'rclone', 'check',
+    }
+    unknown = sorted(set(c) - allowed)
+    if unknown:
+        die(f'{CFG}: unsupported fields: {unknown}')
     required = [
         'host_id', 'services_root', 'repository', 'password_file',
         'rclone_config', 'staging_root', 'restore_root', 'cache_root',
         'volume_helper_image', 'state_root', 'lock_file',
     ]
     for key in required:
-        if not c.get(key):
-            die(f'config missing {key}')
-    if c.get('version') != 1:
+        if not isinstance(c.get(key), str) or not c[key]:
+            die(f'{CFG}: {key} must be a non-empty string')
+    if type(c.get('version')) is not int or c['version'] != 1:
         die(f'{CFG}: version must be 1')
+    trusted_roots = c.get('trusted_data_roots')
+    if not isinstance(trusted_roots, list) or not trusted_roots:
+        die(f'{CFG}: trusted_data_roots must be a non-empty list')
+    try:
+        trusted_roots = [lexical_absolute(path) for path in trusted_roots]
+    except (TypeError, ValueError) as err:
+        die(f'{CFG}: invalid trusted_data_roots: {err}')
+    if len(set(trusted_roots)) != len(trusted_roots):
+        die(f'{CFG}: trusted_data_roots contains duplicates')
+    for index, left in enumerate(trusted_roots):
+        if any(paths_overlap(left, right) for right in trusted_roots[index + 1:]):
+            die(f'{CFG}: trusted_data_roots must not overlap')
+    c['trusted_data_roots'] = [str(path) for path in trusted_roots]
+    optional_sections = {
+        'rclone': {'bwlimit'},
+        'check': {'read_data_subset'},
+    }
+    for section_name, section_fields in optional_sections.items():
+        if section_name not in c:
+            continue
+        section = c[section_name]
+        if not isinstance(section, dict):
+            die(f'{CFG}: {section_name} must be a mapping')
+        unknown_section = sorted(set(section) - section_fields)
+        if unknown_section:
+            die(f'{CFG}: unsupported {section_name} fields: {unknown_section}')
+    if 'bwlimit' in c.get('rclone', {}):
+        if not isinstance(c['rclone']['bwlimit'], str):
+            die(f'{CFG}: rclone.bwlimit must be a string')
+    if 'read_data_subset' in c.get('check', {}):
+        subset = c['check']['read_data_subset']
+        if not isinstance(subset, str) or not subset:
+            die(f'{CFG}: check.read_data_subset must be a non-empty string')
     roots = {
         'services_root': c['services_root'],
         'staging_root': c['staging_root'],
@@ -43,15 +95,40 @@ def cfg():
         for right_name in root_names[index + 1:]:
             if paths_overlap(roots[left_name], roots[right_name]):
                 die(f'{left_name} must not overlap {right_name}')
+    protected_paths = {
+        'password_file': c['password_file'],
+        'rclone_config': c['rclone_config'],
+        'cache_root': c['cache_root'],
+        'state_root': c['state_root'],
+        'lock_file': c['lock_file'],
+    }
+    for root_name in ('staging_root', 'restore_root'):
+        for path_name, path in protected_paths.items():
+            if paths_overlap(c[root_name], path):
+                die(f'{root_name} must not overlap {path_name}')
+    forbidden_data = {
+        'staging_root': c['staging_root'], 'restore_root': c['restore_root'],
+        **protected_paths,
+    }
+    for trusted_root in trusted_roots:
+        for path_name, path in forbidden_data.items():
+            if paths_overlap(trusted_root, path):
+                die(f'trusted_data_root {trusted_root} must not overlap {path_name}')
     return c
 
 
-def manifests(c, include_disabled=False):
+def manifests(c, include_disabled=False, on_error=None):
     out = []
     for path in sorted(Path(c['services_root']).glob('*/backup.yaml')):
-        m = load_yaml(path)
-        if not isinstance(m, dict):
-            raise ValueError(f'{path}: manifest must be a YAML mapping')
+        try:
+            m = load_yaml(path)
+            if not isinstance(m, dict):
+                raise ValueError(f'{path}: manifest must be a YAML mapping')
+        except Exception as err:
+            if on_error is None:
+                raise
+            on_error(path, err)
+            continue
         m['_path'] = str(path)
         m['_dir'] = str(path.parent)
         if include_disabled or m.get('enabled', True):
@@ -104,11 +181,12 @@ def validate_manifest(m):
     allowed_manifest = {
         'version', 'service', 'enabled', 'schedule', 'retention',
         'compose', 'consistency', 'sources', '_path', '_dir',
+        '_snapshot_manifest', '_restore_manifest_requested',
     }
     unknown_manifest = sorted(set(m) - allowed_manifest)
     if unknown_manifest:
         raise ValueError(f'{path}: unsupported manifest fields: {unknown_manifest}')
-    if m.get('version') != 1:
+    if type(m.get('version')) is not int or m['version'] != 1:
         raise ValueError(f'{path}: version must be 1')
     if not m.get('service'):
         raise ValueError(f'{path}: missing service')
@@ -126,7 +204,7 @@ def validate_manifest(m):
         consistency = {}
     if not isinstance(consistency, dict):
         raise ValueError(f'{path}: consistency must be a mapping')
-    allowed_consistency = {'mode', 'timeout', 'services', 'before', 'after'}
+    allowed_consistency = {'mode', 'timeout', 'before', 'after'}
     unknown_consistency = sorted(set(consistency) - allowed_consistency)
     if unknown_consistency:
         raise ValueError(f'{path}: unsupported consistency fields: {unknown_consistency}')
@@ -136,15 +214,6 @@ def validate_manifest(m):
     timeout = consistency.get('timeout', 120)
     if type(timeout) is not int or timeout <= 0:
         raise ValueError(f'{path}: consistency.timeout must be an integer greater than zero')
-    services = consistency.get('services', [])
-    if not isinstance(services, list) or not all(
-        isinstance(x, str) and x for x in services
-    ):
-        raise ValueError(f'{path}: consistency.services must be a list of non-empty strings')
-    if len(services) != len(set(services)):
-        raise ValueError(f'{path}: consistency.services contains duplicates')
-    if mode != 'stop' and services:
-        raise ValueError(f'{path}: consistency.services is only valid with mode stop')
     for hook_name in ('before', 'after'):
         hook_values = consistency.get(hook_name, [])
         if not isinstance(hook_values, list) or not all(
@@ -219,7 +288,7 @@ def validate_manifest(m):
             if kind == 'paths':
                 if not isinstance(source.get('path'), str) or not source['path']:
                     raise ValueError(f'{path}: sources.paths[{index}].path must be a non-empty string')
-                target = resolved_path(source_path(m, source))
+                target = lexical_absolute(source_path(m, source))
                 if any(paths_overlap(target, existing) for existing in path_targets):
                     raise ValueError(f'{path}: duplicate or overlapping path target: {target}')
                 path_targets.add(target)
@@ -233,6 +302,11 @@ def validate_manifest(m):
                 if not isinstance(source[field_name], str):
                     raise ValueError(
                         f'{path}: sources.volumes[{index}].{field_name} must be a non-empty string'
+                    )
+                if field_name == 'name':
+                    validate_docker_volume_name(
+                        source[field_name],
+                        f'{path}: sources.volumes[{index}].name',
                     )
                 target = (field_name, source[field_name])
                 if target in volume_targets:
@@ -265,7 +339,7 @@ def compose_model(m):
 
 def actual_volume_name(m, item, model=None):
     if item.get('name'):
-        return item['name']
+        return validate_docker_volume_name(item['name'])
     key = item.get('compose_volume')
     if not key:
         raise ValueError(f"volume {item.get('id')} needs name or compose_volume")
@@ -274,7 +348,7 @@ def actual_volume_name(m, item, model=None):
     volume = (model.get('volumes') or {}).get(key)
     if not volume:
         raise ValueError(f'compose volume key not found: {key}')
-    return volume.get('name') or key
+    return validate_docker_volume_name(volume.get('name') or key)
 
 
 def source_path(m, source):

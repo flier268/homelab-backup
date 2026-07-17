@@ -1,6 +1,8 @@
 import tempfile
 import unittest
+import os
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from homelab_backup import common, storage
@@ -8,6 +10,20 @@ from tests.helpers import manifest
 
 
 class RuntimeValidationTests(unittest.TestCase):
+    def test_docker_environment_requires_local_rootful_unix_socket(self):
+        cases = [
+            ('"tcp://host:2375"', '[]', 'local rootful'),
+            ('"unix:///run/user/1000/docker.sock"', '[]', 'local rootful'),
+            ('"unix:///var/run/docker.sock"', '["name=rootless"]', 'rootless'),
+        ]
+        for endpoint, options, message in cases:
+            with self.subTest(endpoint=endpoint), mock.patch.object(
+                storage, 'run', side_effect=[
+                    SimpleNamespace(stdout=endpoint), SimpleNamespace(stdout=options),
+                ],
+            ), self.assertRaisesRegex(RuntimeError, message):
+                storage.validate_docker_environment()
+
     def test_required_path_must_exist(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -113,6 +129,305 @@ class RuntimeValidationTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'duplicate Docker volume target'):
                     storage.validate_runtime_sources({}, value, model)
             run_mock.assert_not_called()
+
+    def test_compose_resolved_volume_name_cannot_be_a_host_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            value = manifest(Path(tmp), sources={
+                'paths': [],
+                'volumes': [{'id': 'db', 'compose_volume': 'db'}],
+            })
+            model = {'volumes': {'db': {'name': '/etc'}}}
+            with mock.patch.object(storage, 'run') as run_mock:
+                with self.assertRaisesRegex(ValueError, 'Docker volume name'):
+                    storage.validate_runtime_sources({}, value, model)
+            run_mock.assert_not_called()
+
+    def test_volume_helper_uses_explicit_named_volume_mount(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stage = root / 'stage'
+            value = manifest(root, sources={
+                'paths': [],
+                'volumes': [{'id': 'db', 'name': 'demo-db'}],
+            })
+            with mock.patch.object(storage, 'docker_volume_exists', return_value=True), \
+                    mock.patch.object(storage, 'run') as run_mock:
+                storage.sync_volumes(
+                    {'volume_helper_image': 'helper'}, value, stage,
+                )
+
+            command = run_mock.call_args.args[0]
+            self.assertIn('--mount', command)
+            self.assertIn('type=volume,src=demo-db,dst=/src,readonly', command)
+            self.assertNotIn('demo-db:/src:ro', command)
+            self.assertNotIn('-v', command)
+            self.assertNotIn('bind-create-src', ' '.join(command))
+
+    def test_pre_resolved_volume_name_is_revalidated_at_docker_boundary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stage = root / 'stage'
+            (stage / 'volumes' / 'db').mkdir(parents=True)
+            source = {'id': 'db', 'name': 'demo-db'}
+            with mock.patch.object(storage, 'run') as run_mock:
+                with self.assertRaisesRegex(ValueError, 'Docker volume name'):
+                    storage.sync_volumes(
+                        {'volume_helper_image': 'helper'},
+                        {'sources': {'volumes': [source]}},
+                        stage,
+                        restore=True,
+                        resolved=[(source, '/etc')],
+                    )
+            run_mock.assert_not_called()
+
+    def test_volume_restore_revalidates_staged_directory_without_following_links(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stage = root / 'stage'
+            referent = root / 'referent'
+            referent.mkdir()
+            staged = stage / 'volumes' / 'db'
+            staged.parent.mkdir(parents=True)
+            staged.symlink_to(referent, target_is_directory=True)
+            source = {'id': 'db', 'name': 'demo-db'}
+
+            with mock.patch.object(storage, 'run') as run_mock:
+                with self.assertRaisesRegex(RuntimeError, 'real directory'):
+                    storage.sync_volumes(
+                        {'volume_helper_image': 'helper'},
+                        {'sources': {'volumes': [source]}},
+                        stage,
+                        restore=True,
+                        resolved=[(source, 'demo-db')],
+                    )
+
+            run_mock.assert_not_called()
+
+
+class PathSyncTests(unittest.TestCase):
+    def test_fifo_payload_is_rejected_before_rsync(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payload = root / 'demo' / 'data'
+            payload.mkdir(parents=True)
+            os.mkfifo(payload / 'pipe')
+            value = manifest(root, sources={
+                'paths': [{'id': 'data', 'path': 'data'}], 'volumes': [],
+            })
+
+            with mock.patch.object(storage, 'rsync') as rsync_mock:
+                with self.assertRaisesRegex(ValueError, 'unsupported payload'):
+                    storage.sync_paths(value, root / 'stage')
+            rsync_mock.assert_not_called()
+
+    def test_payload_hardlinks_are_preserved_inside_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payload = root / 'demo' / 'data'
+            payload.mkdir(parents=True)
+            first = payload / 'first'
+            second = payload / 'second'
+            first.write_text('shared', encoding='utf-8')
+            os.link(first, second)
+            value = manifest(root, sources={
+                'paths': [{'id': 'data', 'path': 'data'}], 'volumes': [],
+            })
+
+            storage.sync_paths(value, root / 'stage')
+
+            archived = root / 'stage' / 'paths' / 'data'
+            self.assertEqual(
+                (archived / 'first').stat().st_ino,
+                (archived / 'second').stat().st_ino,
+            )
+
+
+    def test_symlink_sources_are_archived_as_links_without_following_targets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stack = root / 'demo'
+            stack.mkdir()
+            referent_file = root / 'referent-file'
+            referent_file.write_text('secret', encoding='utf-8')
+            referent_dir = root / 'referent-dir'
+            referent_dir.mkdir()
+            (referent_dir / 'secret').write_text('secret', encoding='utf-8')
+            (stack / 'file-link').symlink_to(referent_file)
+            (stack / 'dir-link').symlink_to(referent_dir, target_is_directory=True)
+            (stack / 'dangling-link').symlink_to(root / 'missing')
+            value = manifest(root, sources={
+                'paths': [
+                    {'id': name, 'path': name}
+                    for name in ('file-link', 'dir-link', 'dangling-link')
+                ],
+                'volumes': [],
+            })
+
+            inventory = storage.sync_paths(value, root / 'stage')
+
+            self.assertEqual([entry['type'] for entry in inventory], ['symlink'] * 3)
+            for name in ('file-link', 'dir-link', 'dangling-link'):
+                archived = root / 'stage' / 'paths' / name / name
+                self.assertTrue(archived.is_symlink())
+                self.assertEqual(archived.readlink(), (stack / name).readlink())
+
+    def test_top_level_symlink_timestamp_is_preserved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            value = manifest(root, sources={
+                'paths': [{'id': 'link', 'path': 'link'}], 'volumes': [],
+            })
+            link = Path(value['_dir']) / 'link'
+            link.symlink_to('missing')
+            timestamp = 1_700_000_000_123_456_789
+            os.utime(link, ns=(timestamp, timestamp), follow_symlinks=False)
+
+            storage.sync_paths(value, root / 'stage')
+
+            archived = root / 'stage' / 'paths' / 'link' / 'link'
+            self.assertEqual(archived.lstat().st_mtime_ns, link.lstat().st_mtime_ns)
+
+    def test_optional_missing_path_is_recorded_as_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            value = manifest(root, sources={
+                'paths': [{
+                    'id': 'optional', 'path': 'missing', 'required': False,
+                }],
+                'volumes': [],
+            })
+
+            inventory = storage.sync_paths(value, root / 'stage')
+
+            self.assertEqual(inventory, [{
+                'id': 'optional', 'path': 'missing', 'type': None,
+                'present': False,
+            }])
+
+    def test_inventory_type_is_captured_by_the_sync_operation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stack = root / 'demo'
+            stack.mkdir()
+            (stack / 'file.txt').write_text('file', encoding='utf-8')
+            (stack / 'directory').mkdir()
+            value = manifest(root, sources={
+                'paths': [
+                    {'id': 'file', 'path': 'file.txt'},
+                    {'id': 'directory', 'path': 'directory'},
+                ],
+                'volumes': [],
+            })
+
+            with mock.patch.object(storage, 'run'), \
+                    mock.patch.object(storage, 'rsync'):
+                inventory = storage.sync_paths(value, root / 'stage')
+
+            self.assertEqual(inventory, [
+                {'id': 'file', 'path': 'file.txt', 'type': 'file', 'present': True},
+                {'id': 'directory', 'path': 'directory', 'type': 'directory', 'present': True},
+            ])
+
+    def test_final_sync_removes_slot_when_optional_source_disappears(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stack = root / 'demo'
+            stack.mkdir()
+            source_path = stack / 'data'
+            source_path.write_text('pre-sync secret', encoding='utf-8')
+            stage = root / 'stage'
+            value = manifest(root, sources={
+                'paths': [{
+                    'id': 'data', 'path': 'data', 'required': False,
+                }],
+                'volumes': [],
+            })
+            storage.sync_paths(value, stage)
+            source_path.unlink()
+
+            inventory = storage.sync_paths(value, stage)
+
+            self.assertEqual(inventory[0]['present'], False)
+            self.assertFalse((stage / 'paths' / 'data').exists())
+
+    def test_final_file_sync_replaces_directory_slot_without_stale_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_path = root / 'demo' / 'data'
+            source_path.mkdir(parents=True)
+            (source_path / 'stale-secret.txt').write_text(
+                'secret', encoding='utf-8',
+            )
+            stage = root / 'stage'
+            value = manifest(root, sources={
+                'paths': [{'id': 'data', 'path': 'data'}],
+                'volumes': [],
+            })
+            storage.sync_paths(value, stage)
+            (source_path / 'stale-secret.txt').unlink()
+            source_path.rmdir()
+            source_path.write_text('final-file', encoding='utf-8')
+
+            inventory = storage.sync_paths(value, stage)
+
+            slot = stage / 'paths' / 'data'
+            self.assertEqual(inventory[0]['type'], 'file')
+            self.assertEqual(
+                sorted(path.name for path in slot.iterdir()), ['data'],
+            )
+            self.assertEqual(
+                (slot / 'data').read_text(encoding='utf-8'), 'final-file',
+            )
+
+    def test_directory_resync_replaces_private_slot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_path = root / 'demo' / 'data'
+            source_path.mkdir(parents=True)
+            payload = source_path / 'payload.txt'
+            payload.write_text('first', encoding='utf-8')
+            stage = root / 'stage'
+            value = manifest(root, sources={
+                'paths': [{'id': 'data', 'path': 'data'}],
+                'volumes': [],
+            })
+            storage.sync_paths(value, stage)
+            slot = stage / 'paths' / 'data'
+            slot_inode = slot.stat().st_ino
+            payload.write_text('second', encoding='utf-8')
+
+            storage.sync_paths(value, stage)
+
+            self.assertNotEqual(slot.stat().st_ino, slot_inode)
+            self.assertEqual(
+                (slot / 'payload.txt').read_text(encoding='utf-8'), 'second',
+            )
+
+    def test_final_directory_sync_deletes_prior_file_payload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_path = root / 'demo' / 'data'
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text('pre-sync file', encoding='utf-8')
+            stage = root / 'stage'
+            value = manifest(root, sources={
+                'paths': [{'id': 'data', 'path': 'data'}],
+                'volumes': [],
+            })
+            storage.sync_paths(value, stage)
+            slot = stage / 'paths' / 'data'
+            slot_inode = slot.stat().st_ino
+            source_path.unlink()
+            source_path.mkdir()
+            (source_path / 'final.txt').write_text('final', encoding='utf-8')
+
+            inventory = storage.sync_paths(value, stage)
+
+            self.assertEqual(inventory[0]['type'], 'directory')
+            self.assertNotEqual(slot.stat().st_ino, slot_inode)
+            self.assertEqual(
+                sorted(path.name for path in slot.iterdir()), ['final.txt'],
+            )
 
 
 if __name__ == '__main__':

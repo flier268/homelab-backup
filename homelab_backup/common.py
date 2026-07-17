@@ -1,6 +1,5 @@
 import datetime as dt
 import fcntl
-import json
 import os
 import shlex
 import subprocess
@@ -43,13 +42,13 @@ def _print_command_failure(err, *, context=None):
             print(f'    {line}', file=sys.stderr)
 
 
-def run(cmd, *, cwd=None, env=None, check=True, capture=False):
+def run(cmd, *, cwd=None, env=None, check=True, capture=False, pass_fds=()):
     printable = ' '.join(shlex.quote(str(x)) for x in cmd)
     print('+', printable)
     must_capture = capture or check
     result = subprocess.run(
         cmd, cwd=cwd, env=env, check=False, text=True,
-        capture_output=must_capture,
+        capture_output=must_capture, pass_fds=pass_fds,
     )
     if check and result.returncode != 0:
         raise CommandError(cmd, result.returncode, cwd=cwd, stdout=result.stdout, stderr=result.stderr)
@@ -64,24 +63,6 @@ def run(cmd, *, cwd=None, env=None, check=True, capture=False):
 def load_yaml(path):
     with open(path, encoding='utf-8') as f:
         return yaml.safe_load(f) or {}
-
-
-def atomic_write_json(path, data):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + '.tmp')
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
-    os.replace(tmp, path)
-
-
-def resolved_path(path):
-    return Path(path).expanduser().resolve(strict=False)
-
-
-def paths_overlap(left, right):
-    left = resolved_path(left)
-    right = resolved_path(right)
-    return left == right or left in right.parents or right in left.parents
 
 
 def restic_env(c):
@@ -105,8 +86,23 @@ class GlobalLock:
         self.handle = None
 
     def __enter__(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.handle = open(self.path, 'a+', encoding='utf-8')
+        from .security import ensure_control_directory
+
+        ensure_control_directory(self.path.parent)
+        parent_fd = os.open(
+            self.path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+        try:
+            fd = os.open(
+                self.path.name,
+                os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=parent_fd,
+            )
+        finally:
+            os.close(parent_fd)
+        os.fchmod(fd, 0o600)
+        self.handle = os.fdopen(fd, 'a+', encoding='utf-8')
         flags = fcntl.LOCK_EX | (fcntl.LOCK_NB if self.nonblocking else 0)
         try:
             fcntl.flock(self.handle.fileno(), flags)

@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/backupctl maintenance
-ExecStart=/usr/local/sbin/backupctl check
+ExecStopPost=/usr/local/sbin/backupctl check
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7
