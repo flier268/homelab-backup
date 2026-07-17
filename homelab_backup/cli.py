@@ -5,18 +5,15 @@ import sys
 from . import VERSION
 from .backup import (
     cmd_backup,
-    cmd_check,
     cmd_init,
-    cmd_list,
-    cmd_maintenance,
-    cmd_run_due,
-    cmd_snapshots,
-    cmd_status,
-    cmd_unlock,
     cmd_validate,
 )
 from .common import CommandError, _print_command_failure
 from .config import cfg
+from .maintenance import (
+    cmd_check, cmd_list, cmd_maintenance, cmd_run_due, cmd_snapshots,
+    cmd_status, cmd_unlock,
+)
 from .restore import cmd_apply, cmd_restore
 
 

@@ -6,7 +6,10 @@ import tempfile
 from pathlib import Path
 
 from .common import CommandError, die, run
-from .config import actual_volume_name, compose_cmd, compose_model, source_path, validate_docker_volume_name
+from .manifest import (
+    actual_volume_name, compose_cmd, compose_model, source_path,
+    validate_docker_volume_name,
+)
 from .security import (
     clear_control_leaf, containing_mount, docker_mount_users,
     ensure_private_directory,

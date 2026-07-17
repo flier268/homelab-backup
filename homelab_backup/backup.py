@@ -1,16 +1,18 @@
 import datetime as dt
-import json
-import os
 import shutil
 import sys
 from pathlib import Path
 
+from . import backup_state as _backup_state
+from .backup_state import load_state, parse_iso, save_state, state_path
 from .common import CommandError, GlobalLock, _print_command_failure, die, restic_env, run
-from .config import RETENTION_FLAGS, compose_cmd, compose_model, manifest, manifests, source_path, validate_manifest
-from .schedule import cron_next, cron_previous, local_now, parse_cron, parse_duration
+from .manifest import (
+    RETENTION_FLAGS, compose_cmd, compose_model, manifest, manifests,
+    source_path, validate_manifest,
+)
 from .security import (
-    atomic_copy_file, atomic_write_json, ensure_control_directory,
-    ensure_private_directory, paths_overlap, validate_control_root,
+    atomic_copy_file, atomic_write_json, ensure_private_directory, paths_overlap,
+    validate_control_root,
     validate_trusted_roots,
 )
 from .storage import (
@@ -88,72 +90,8 @@ def stage_service(c, m):
     return stage
 
 
-def state_path(c, service):
-    return Path(c['state_root']) / f'{service}.json'
-
-
-def load_state(c, service):
-    path = state_path(c, service)
-    if not path.exists():
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding='utf-8'))
-        return data if isinstance(data, dict) else {}
-    except (OSError, json.JSONDecodeError):
-        return {}
-
-
-def save_state(c, service, state):
-    ensure_control_directory(c['state_root'])
-    atomic_write_json(state_path(c, service), state)
-
-
-def parse_iso(value):
-    if not isinstance(value, str) or not value:
-        return None
-    try:
-        parsed = dt.datetime.fromisoformat(value)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
-        return None
-    return parsed.astimezone(dt.timezone.utc)
-
-
 def due_status(c, m, now=None):
-    now = now or local_now()
-    schedule = m['schedule']
-    if schedule.get('enabled', True) is False:
-        return False, 'schedule disabled', None
-    spec = parse_cron(schedule['cron'], 'schedule.cron')
-    state = load_state(c, m['service'])
-    last_success = parse_iso(state.get('last_success_at'))
-    last_attempt = parse_iso(state.get('last_attempt_at'))
-    retry_after = parse_duration(schedule.get('retry_after', '30m'), 'schedule.retry_after')
-    if state.get('last_result') == 'failed' and last_attempt:
-        retry_at = last_attempt + dt.timedelta(seconds=retry_after)
-        if now < retry_at:
-            return False, f'retry at {retry_at.isoformat(timespec="minutes")}', retry_at
-    occurrence = cron_previous(spec, now)
-    if occurrence is None:
-        return False, 'no cron occurrence found in search window', None
-    if last_success is None or last_success < occurrence:
-        max_lateness = schedule.get('max_lateness')
-        if max_lateness is not None:
-            deadline = occurrence.astimezone(dt.timezone.utc) + dt.timedelta(
-                seconds=parse_duration(max_lateness, 'schedule.max_lateness')
-            )
-            if now > deadline:
-                next_time = cron_next(spec, now)
-                return False, (
-                    f'missed {occurrence.isoformat(timespec="minutes")}; '
-                    f'next at {next_time.isoformat(timespec="minutes") if next_time else "unknown"}'
-                ), next_time
-        return True, f'due since {occurrence.isoformat(timespec="minutes")}', occurrence
-    next_time = cron_next(spec, now)
-    return False, (
-        f'next at {next_time.isoformat(timespec="minutes") if next_time else "unknown"}'
-    ), next_time
+    return _backup_state.due_status(c, m, now, state_loader=load_state)
 
 
 def retention_cmd(c, m, *, prune=False, dry_run=False):
@@ -225,27 +163,13 @@ def backup_one(c, m, *, apply_retention=True):
 
 
 def cmd_list(c, args):
-    now = local_now()
-    for m in manifests(c):
-        due, reason, _ = due_status(c, m, now)
-        schedule = m['schedule']
-        schedule_text = f"cron {schedule['cron']}"
-        print(f"{m['service']}: {schedule_text}; {'DUE' if due else reason}; {m['_path']}")
+    from .maintenance import cmd_list as implementation
+    return implementation(c, args)
 
 
 def cmd_status(c, args):
-    now = local_now()
-    for m in manifests(c):
-        due, reason, _ = due_status(c, m, now)
-        state = load_state(c, m['service'])
-        print(json.dumps({
-            'service': m['service'], 'due': due, 'schedule_status': reason,
-            'last_result': state.get('last_result'),
-            'last_success_at': state.get('last_success_at'),
-            'last_duration_seconds': state.get('last_duration_seconds'),
-            'last_error': state.get('last_error'),
-            'last_retention_error': state.get('last_retention_error'),
-        }, ensure_ascii=False))
+    from .maintenance import cmd_status as implementation
+    return implementation(c, args)
 
 
 def cmd_validate(c, args):
@@ -334,118 +258,25 @@ def cmd_backup(c, args):
 
 
 def cmd_run_due(c, args):
-    with GlobalLock(c['lock_file'], nonblocking=True) as acquired:
-        if not acquired:
-            print('SKIP: another backup or maintenance process is still running')
-            return
-        now = local_now()
-        due = []
-        failures = []
-
-        def record_manifest_error(path, err):
-            failures.append((str(path), f'manifest loading failed: {err}'))
-            print(f'ERROR: manifest loading failed for {path}: {err}', file=sys.stderr)
-
-        for m in manifests(c, on_error=record_manifest_error):
-            service = m.get('service', '<unnamed>')
-            try:
-                is_due, reason, _ = due_status(c, m, now)
-            except Exception as err:
-                failures.append((service, f'schedule planning failed: {err}'))
-                print(
-                    f'ERROR: schedule planning failed for {service}: {err}',
-                    file=sys.stderr,
-                )
-                if os.environ.get('BACKUPCTL_DEBUG') == '1':
-                    raise
-                continue
-            print(f"{m['service']}: {'DUE' if is_due else 'skip'} ({reason})")
-            if is_due:
-                due.append(m)
-        if not due:
-            print('No backups are due.')
-        for m in due:
-            print(f"\n== Scheduled backup: {m['service']} ==")
-            try:
-                backup_one(c, m)
-            except Exception as err:
-                failures.append((m['service'], str(err)))
-                print(f"ERROR: scheduled backup failed for {m['service']}: {err}", file=sys.stderr)
-                if os.environ.get('BACKUPCTL_DEBUG') == '1':
-                    raise
-        if failures:
-            print('\nSCHEDULED BACKUP FAILURES', file=sys.stderr)
-            for service, error in failures:
-                print(f'  - {service}: {error}', file=sys.stderr)
-            raise SystemExit(1)
+    from .maintenance import cmd_run_due as implementation
+    return implementation(c, args)
 
 
 def cmd_snapshots(c, args):
-    cmd = ['restic', 'snapshots', '--host', c['host_id']]
-    if args.service:
-        cmd += ['--tag', f'service:{args.service}']
-    run(cmd, env=restic_env(c))
+    from .maintenance import cmd_snapshots as implementation
+    return implementation(c, args)
 
 
 def cmd_maintenance(c, args):
-    with GlobalLock(c['lock_file'], nonblocking=args.no_wait) as acquired:
-        if not acquired:
-            print('SKIP: backup or maintenance is still running')
-            return
-        failures = []
-
-        def record_manifest_error(path, err):
-            failures.append((str(path), f'manifest loading failed: {err}'))
-            print(f'ERROR: manifest loading failed for {path}: {err}', file=sys.stderr)
-
-        for m in manifests(c, on_error=record_manifest_error):
-            service = m.get('service', '<unnamed>')
-            print(f"\n== Retention: {service} ==")
-            try:
-                run(retention_cmd(c, m, dry_run=args.dry_run), env=restic_env(c))
-            except Exception as err:
-                if isinstance(err, CommandError):
-                    _print_command_failure(
-                        err,
-                        context=f'Retention failed for {service}',
-                    )
-                else:
-                    print(f'ERROR: retention failed for {service}: {err}', file=sys.stderr)
-                failures.append((service, str(err)))
-                if os.environ.get('BACKUPCTL_DEBUG') == '1':
-                    raise
-        if not args.dry_run:
-            try:
-                run(['restic', 'prune'], env=restic_env(c))
-            except Exception as err:
-                if isinstance(err, CommandError):
-                    _print_command_failure(err, context='Repository prune failed')
-                else:
-                    print(f'ERROR: repository prune failed: {err}', file=sys.stderr)
-                failures.append(('repository prune', str(err)))
-                if os.environ.get('BACKUPCTL_DEBUG') == '1':
-                    raise
-        if failures:
-            print('\nMAINTENANCE FAILURES', file=sys.stderr)
-            for operation, error in failures:
-                print(f'  - {operation}: {error}', file=sys.stderr)
-            raise SystemExit(1)
+    from .maintenance import cmd_maintenance as implementation
+    return implementation(c, args)
 
 
 def cmd_check(c, args):
-    with GlobalLock(c['lock_file'], nonblocking=args.no_wait) as acquired:
-        if not acquired:
-            print('SKIP: backup or maintenance is still running')
-            return
-        cmd = ['restic', 'check']
-        subset = (c.get('check') or {}).get('read_data_subset')
-        if subset:
-            cmd += ['--read-data-subset', str(subset)]
-        run(cmd, env=restic_env(c))
+    from .maintenance import cmd_check as implementation
+    return implementation(c, args)
 
 
 def cmd_unlock(c, args):
-    with GlobalLock(c['lock_file'], nonblocking=True) as acquired:
-        if not acquired:
-            die('another backupctl process is running')
-        run(['restic', 'unlock'], env=restic_env(c))
+    from .maintenance import cmd_unlock as implementation
+    return implementation(c, args)
