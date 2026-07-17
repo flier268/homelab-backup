@@ -18,6 +18,16 @@ class FailureSummary:
     def append(self, operation, error):
         self.items.append((operation, error))
 
+    def record_exception(
+            self, operation, error, *, message, command_context=None,
+            summary_error=None,
+    ):
+        if command_context is not None and isinstance(error, CommandError):
+            _print_command_failure(error, context=command_context)
+        else:
+            print(message.format(error=error), file=sys.stderr)
+        self.append(operation, summary_error or str(error))
+
     def raise_if_any(self, title):
         if not self.items:
             return
@@ -25,6 +35,14 @@ class FailureSummary:
         for operation, error in self.items:
             print(f'  - {operation}: {error}', file=sys.stderr)
         raise SystemExit(1)
+
+
+def _manifest_error_recorder(failures):
+    def record(path, err):
+        failures.append(str(path), f'manifest loading failed: {err}')
+        print(f'ERROR: manifest loading failed for {path}: {err}', file=sys.stderr)
+
+    return record
 
 
 def cmd_list(c, args):
@@ -59,20 +77,15 @@ def cmd_run_due(c, args):
         now = local_now()
         due = []
         failures = FailureSummary()
-
-        def record_manifest_error(path, err):
-            failures.append(str(path), f'manifest loading failed: {err}')
-            print(f'ERROR: manifest loading failed for {path}: {err}', file=sys.stderr)
-
-        for m in manifests(c, on_error=record_manifest_error):
+        for m in manifests(c, on_error=_manifest_error_recorder(failures)):
             service = m.get('service', '<unnamed>')
             try:
                 is_due, reason, _ = due_status(c, m, now)
             except Exception as err:
-                failures.append(service, f'schedule planning failed: {err}')
-                print(
-                    f'ERROR: schedule planning failed for {service}: {err}',
-                    file=sys.stderr,
+                failures.record_exception(
+                    service, err,
+                    message=f'ERROR: schedule planning failed for {service}: {{error}}',
+                    summary_error=f'schedule planning failed: {err}',
                 )
                 if os.environ.get('BACKUPCTL_DEBUG') == '1':
                     raise
@@ -87,8 +100,10 @@ def cmd_run_due(c, args):
             try:
                 backup_one(c, m)
             except Exception as err:
-                failures.append(m['service'], str(err))
-                print(f"ERROR: scheduled backup failed for {m['service']}: {err}", file=sys.stderr)
+                failures.record_exception(
+                    m['service'], err,
+                    message=f"ERROR: scheduled backup failed for {m['service']}: {{error}}",
+                )
                 if os.environ.get('BACKUPCTL_DEBUG') == '1':
                     raise
         failures.raise_if_any('SCHEDULED BACKUP FAILURES')
@@ -107,36 +122,28 @@ def cmd_maintenance(c, args):
             print('SKIP: backup or maintenance is still running')
             return
         failures = FailureSummary()
-
-        def record_manifest_error(path, err):
-            failures.append(str(path), f'manifest loading failed: {err}')
-            print(f'ERROR: manifest loading failed for {path}: {err}', file=sys.stderr)
-
-        for m in manifests(c, on_error=record_manifest_error):
+        for m in manifests(c, on_error=_manifest_error_recorder(failures)):
             service = m.get('service', '<unnamed>')
             print(f"\n== Retention: {service} ==")
             try:
                 run(retention_cmd(c, m, dry_run=args.dry_run), env=restic_env(c))
             except Exception as err:
-                if isinstance(err, CommandError):
-                    _print_command_failure(
-                        err,
-                        context=f'Retention failed for {service}',
-                    )
-                else:
-                    print(f'ERROR: retention failed for {service}: {err}', file=sys.stderr)
-                failures.append(service, str(err))
+                failures.record_exception(
+                    service, err,
+                    command_context=f'Retention failed for {service}',
+                    message=f'ERROR: retention failed for {service}: {{error}}',
+                )
                 if os.environ.get('BACKUPCTL_DEBUG') == '1':
                     raise
         if not args.dry_run:
             try:
                 run(['restic', 'prune'], env=restic_env(c))
             except Exception as err:
-                if isinstance(err, CommandError):
-                    _print_command_failure(err, context='Repository prune failed')
-                else:
-                    print(f'ERROR: repository prune failed: {err}', file=sys.stderr)
-                failures.append('repository prune', str(err))
+                failures.record_exception(
+                    'repository prune', err,
+                    command_context='Repository prune failed',
+                    message='ERROR: repository prune failed: {error}',
+                )
                 if os.environ.get('BACKUPCTL_DEBUG') == '1':
                     raise
         failures.raise_if_any('MAINTENANCE FAILURES')

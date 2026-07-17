@@ -4,13 +4,14 @@ from pathlib import Path
 
 from .schedule import cron_next, cron_previous, local_now, parse_cron, parse_duration
 from .security import atomic_write_json, ensure_control_directory
+from .types import BackupState, GlobalConfig, ServiceManifest
 
 
 def state_path(c, service):
     return Path(c['state_root']) / f'{service}.json'
 
 
-def load_state(c, service):
+def load_state(c: GlobalConfig, service: str) -> BackupState:
     path = state_path(c, service)
     if not path.exists():
         return {}
@@ -21,7 +22,7 @@ def load_state(c, service):
         return {}
 
 
-def save_state(c, service, state):
+def save_state(c: GlobalConfig, service: str, state: BackupState):
     ensure_control_directory(c['state_root'])
     atomic_write_json(state_path(c, service), state)
 
@@ -38,7 +39,9 @@ def parse_iso(value):
     return parsed.astimezone(dt.timezone.utc)
 
 
-def due_status(c, m, now=None, *, state_loader=None):
+def due_status(
+        c: GlobalConfig, m: ServiceManifest, now=None, *, state_loader=None,
+):
     now = now or local_now()
     state_loader = state_loader or load_state
     schedule = m['schedule']

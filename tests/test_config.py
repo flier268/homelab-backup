@@ -1,5 +1,7 @@
 import tempfile
 import unittest
+from contextlib import redirect_stderr
+from io import StringIO
 from pathlib import Path
 from unittest import mock
 
@@ -8,6 +10,16 @@ from tests.helpers import manifest
 
 
 class ManifestValidationTests(unittest.TestCase):
+    def test_validation_precedence_keeps_consistency_before_compose(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            value = manifest(Path(tmp))
+            value['consistency'] = {'mode': 'invalid'}
+            value['compose'] = []
+            with self.assertRaisesRegex(
+                ValueError, 'invalid consistency.mode',
+            ):
+                config.validate_manifest(value)
+
     def test_version_must_be_one(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -235,6 +247,25 @@ class GlobalConfigValidationTests(unittest.TestCase):
                     mock.patch.object(config, 'load_yaml', return_value=values), \
                     self.assertRaises(SystemExit):
                 config.cfg()
+
+    def test_optional_section_errors_precede_root_separation_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / 'config.yaml'
+            config_path.touch()
+            values = self.config_data(root)
+            values['rclone'] = []
+            values['staging_root'] = values['restore_root']
+            error = StringIO()
+            with mock.patch.object(config, 'CFG', config_path), \
+                    mock.patch.object(config, 'load_yaml', return_value=values), \
+                    redirect_stderr(error), self.assertRaises(SystemExit):
+                config.cfg()
+
+            self.assertEqual(
+                error.getvalue(),
+                f'ERROR: {config_path}: rclone must be a mapping\n',
+            )
 
     def test_primary_roots_must_be_pairwise_separate(self):
         with tempfile.TemporaryDirectory() as tmp:

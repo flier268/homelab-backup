@@ -333,6 +333,39 @@ class RestoreApplyPreflightTests(unittest.TestCase):
 
 class RestoreApplyLifecycleTests(unittest.TestCase):
 
+    def test_apply_runs_preflight_data_publication_and_restart_in_order(self):
+        root = Path('/restore')
+        value = {'service': 'demo'}
+        plan = restore_plan.RestorePlan(
+            root, {}, value, 'existing', (), (), (), (), 'demo',
+        )
+        events = []
+
+        with mock.patch.object(
+            restore_apply, 'prepare_restore_plan', return_value=plan,
+        ), mock.patch.object(
+            restore_apply, '_stop_running_services',
+            side_effect=lambda _plan: events.append('stop') or [],
+        ), mock.patch.object(
+            restore_apply, '_dynamic_preflight',
+            side_effect=lambda _config, _plan: events.append('preflight'),
+        ), mock.patch.object(
+            restore_apply, '_restore_data',
+            side_effect=lambda _config, _plan, _changed: events.append('data'),
+        ), mock.patch.object(
+            restore_apply, '_publish_controls',
+            side_effect=lambda _config, _manifest, _plan, _changed:
+            events.append('publish'),
+        ), mock.patch.object(
+            restore_apply, '_restart_services',
+            side_effect=lambda _plan, _targets, _start: events.append('restart'),
+        ):
+            restore_apply.apply_one({}, value, root)
+
+        self.assertEqual(
+            events, ['stop', 'preflight', 'data', 'publish', 'restart'],
+        )
+
     def test_dynamic_rebuild_rejects_snapshot_absent_path_that_appeared(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

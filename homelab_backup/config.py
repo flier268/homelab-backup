@@ -8,13 +8,13 @@ from .manifest import (
     validate_retention,
 )
 from .security import lexical_absolute, paths_overlap
+from .types import GlobalConfig
 
 CFG = Path('/etc/homelab-backup/config.yaml')
 
-def cfg():
-    if not CFG.exists():
-        die(f'missing {CFG}')
-    c = load_yaml(CFG)
+
+
+def _validate_config_header(c):
     if not isinstance(c, dict):
         die(f'{CFG} must contain a YAML mapping')
     allowed = {
@@ -36,6 +36,9 @@ def cfg():
             die(f'{CFG}: {key} must be a non-empty string')
     if type(c.get('version')) is not int or c['version'] != 1:
         die(f'{CFG}: version must be 1')
+
+
+def _normalize_trusted_roots(c):
     trusted_roots = c.get('trusted_data_roots')
     if not isinstance(trusted_roots, list) or not trusted_roots:
         die(f'{CFG}: trusted_data_roots must be a non-empty list')
@@ -49,6 +52,10 @@ def cfg():
         if any(paths_overlap(left, right) for right in trusted_roots[index + 1:]):
             die(f'{CFG}: trusted_data_roots must not overlap')
     c['trusted_data_roots'] = [str(path) for path in trusted_roots]
+    return trusted_roots
+
+
+def _validate_optional_sections(c):
     optional_sections = {
         'rclone': {'bwlimit'},
         'check': {'read_data_subset'},
@@ -69,6 +76,9 @@ def cfg():
         subset = c['check']['read_data_subset']
         if not isinstance(subset, str) or not subset:
             die(f'{CFG}: check.read_data_subset must be a non-empty string')
+
+
+def _validate_root_separation(c, trusted_roots):
     roots = {
         'services_root': c['services_root'],
         'staging_root': c['staging_root'],
@@ -98,4 +108,14 @@ def cfg():
         for path_name, path in forbidden_data.items():
             if paths_overlap(trusted_root, path):
                 die(f'trusted_data_root {trusted_root} must not overlap {path_name}')
+
+
+def cfg() -> GlobalConfig:
+    if not CFG.exists():
+        die(f'missing {CFG}')
+    c = load_yaml(CFG)
+    _validate_config_header(c)
+    trusted_roots = _normalize_trusted_roots(c)
+    _validate_optional_sections(c)
+    _validate_root_separation(c, trusted_roots)
     return c

@@ -21,8 +21,10 @@ from .storage import (
     validate_docker_environment,
     validate_no_docker_writers, validate_path_payloads, validate_runtime_sources,
 )
+from .types import GlobalConfig, ServiceManifest
 
-def stage_service(c, m):
+
+def stage_service(c: GlobalConfig, m: ServiceManifest):
     validate_manifest(m)
     validate_trusted_roots(c['trusted_data_roots'])
     staging_root = Path(c['staging_root'])
@@ -94,7 +96,9 @@ def due_status(c, m, now=None):
     return _backup_state.due_status(c, m, now, state_loader=load_state)
 
 
-def retention_cmd(c, m, *, prune=False, dry_run=False):
+def retention_cmd(
+        c: GlobalConfig, m: ServiceManifest, *, prune=False, dry_run=False,
+):
     cmd = [
         'restic', 'forget', '--host', c['host_id'], '--tag', f"service:{m['service']}",
         '--group-by', 'host,tags',
@@ -109,7 +113,9 @@ def retention_cmd(c, m, *, prune=False, dry_run=False):
     return cmd
 
 
-def backup_one(c, m, *, apply_retention=True):
+def backup_one(
+        c: GlobalConfig, m: ServiceManifest, *, apply_retention=True,
+):
     started = dt.datetime.now().astimezone()
     state = load_state(c, m['service'])
     state.update({

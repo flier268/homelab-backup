@@ -3,9 +3,10 @@ from pathlib import Path
 
 from .manifest import source_path, validate_docker_volume_name
 from .security import lexical_absolute, paths_overlap, validate_payload
+from .types import RestoreInventory, ServiceManifest
 
 
-def load_restore_inventory(root):
+def load_restore_inventory(root) -> RestoreInventory:
     path = Path(root) / '_meta' / 'inventory.json'
     if not path.is_file():
         raise RuntimeError(f'restore inventory is missing: {path}')
@@ -18,7 +19,9 @@ def load_restore_inventory(root):
     return data
 
 
-def validate_restore_inventory(m, inventory):
+def validate_restore_inventory(
+        m: ServiceManifest, inventory: RestoreInventory,
+):
     if inventory.get('version') != 1:
         raise RuntimeError('restore inventory version must be 1')
     service = inventory.get('service')
@@ -87,7 +90,9 @@ def validate_restore_inventory(m, inventory):
         raise RuntimeError('restore inventory Compose file list differs from manifest')
 
 
-def restored_path_details(m, root, source, inventory):
+def restored_path_details(
+        m: ServiceManifest, root, source, inventory: RestoreInventory,
+):
     staged = Path(root) / 'paths' / source['id']
     target = source_path(m, source)
     entry = next(
@@ -112,7 +117,9 @@ def restored_path_details(m, root, source, inventory):
     return 'directory', staged, target
 
 
-def validate_restore_sources(m, root, inventory):
+def validate_restore_sources(
+        m: ServiceManifest, root, inventory: RestoreInventory,
+):
     for source in (m.get('sources') or {}).get('paths', []):
         source_type, restored, _target = restored_path_details(
             m, root, source, inventory,
@@ -145,7 +152,9 @@ def validate_restore_sources(m, root, inventory):
             validate_payload(restored)
 
 
-def validate_restore_path_separation(m, root, inventory):
+def validate_restore_path_separation(
+        m: ServiceManifest, root, inventory: RestoreInventory,
+):
     root = lexical_absolute(root)
     path_sources = (m.get('sources') or {}).get('paths', [])
     staged_sources = [

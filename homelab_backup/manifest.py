@@ -6,6 +6,7 @@ from pathlib import Path
 from .common import CommandError, _print_command_failure, die, load_yaml, run
 from .security import lexical_absolute, paths_overlap
 from .schedule import validate_schedule
+from .types import ServiceManifest
 
 
 RETENTION_FLAGS = (
@@ -28,7 +29,7 @@ def validate_docker_volume_name(value, field='Docker volume name'):
     return value
 
 
-def manifests(c, include_disabled=False, on_error=None):
+def manifests(c, include_disabled=False, on_error=None) -> list[ServiceManifest]:
     out = []
     for path in sorted(Path(c['services_root']).glob('*/backup.yaml')):
         try:
@@ -47,7 +48,7 @@ def manifests(c, include_disabled=False, on_error=None):
     return out
 
 
-def manifest(c, name):
+def manifest(c, name) -> ServiceManifest:
     for m in manifests(c):
         if m.get('service') == name:
             return m
@@ -85,7 +86,7 @@ def validate_retention(m):
         raise ValueError(f'{path}: retention must define at least one keep_* rule')
 
 
-def validate_manifest(m):
+def _validate_manifest_header(m):
     if not isinstance(m, dict):
         raise ValueError('manifest must be a mapping')
     path = m.get('_path', '<manifest>')
@@ -110,6 +111,10 @@ def validate_manifest(m):
         )
     if not isinstance(m.get('enabled', True), bool):
         raise ValueError(f'{path}: enabled must be boolean')
+    return path
+
+
+def _validate_consistency(m, path):
     consistency = m.get('consistency')
     if consistency is None:
         consistency = {}
@@ -137,6 +142,9 @@ def validate_manifest(m):
             raise ValueError(
                 f'{path}: consistency.{hook_name} is only valid with mode hooks'
             )
+
+
+def _validate_compose(m, path):
     compose = m.get('compose')
     if compose is None:
         compose = {}
@@ -150,8 +158,71 @@ def validate_manifest(m):
         isinstance(x, str) and x for x in compose_files
     ):
         raise ValueError(f'{path}: compose.files must be a non-empty list of strings')
-    validate_schedule(m)
-    validate_retention(m)
+
+
+def _validate_source_common(path, kind, index, source, ids):
+    allowed_source = (
+        {'id', 'path', 'required', 'exclude'} if kind == 'paths'
+        else {'id', 'name', 'compose_volume', 'required', 'exclude'}
+    )
+    unknown_source = sorted(set(source) - allowed_source)
+    if unknown_source:
+        raise ValueError(
+            f'{path}: unsupported sources.{kind}[{index}] fields: {unknown_source}'
+        )
+    source_id = source.get('id')
+    if not source_id:
+        raise ValueError(f'{path}: sources.{kind}[{index}] is missing id')
+    if not isinstance(source_id, str) or not re.fullmatch(
+        r'[A-Za-z0-9][A-Za-z0-9_.-]*', source_id
+    ):
+        raise ValueError(
+            f'{path}: sources.{kind}[{index}].id must be a safe single path component'
+        )
+    if source_id in ids:
+        raise ValueError(f'{path}: duplicate source id {source_id!r}')
+    ids.add(source_id)
+    excludes = source.get('exclude', [])
+    if not isinstance(excludes, list) or not all(isinstance(x, str) for x in excludes):
+        raise ValueError(f'{path}: sources.{kind}[{index}].exclude must be a list of strings')
+    if not isinstance(source.get('required', True), bool):
+        raise ValueError(f'{path}: sources.{kind}[{index}].required must be boolean')
+
+
+def _validate_path_source(m, path, index, source, path_targets):
+    if not isinstance(source.get('path'), str) or not source['path']:
+        raise ValueError(f'{path}: sources.paths[{index}].path must be a non-empty string')
+    target = lexical_absolute(source_path(m, source))
+    if any(paths_overlap(target, existing) for existing in path_targets):
+        raise ValueError(f'{path}: duplicate or overlapping path target: {target}')
+    path_targets.add(target)
+
+
+def _validate_volume_source(path, index, source, volume_targets):
+    volume_fields = [key for key in ('name', 'compose_volume') if source.get(key)]
+    if len(volume_fields) != 1:
+        raise ValueError(
+            f'{path}: sources.volumes[{index}] must define exactly one of name or compose_volume'
+        )
+    field_name = volume_fields[0]
+    if not isinstance(source[field_name], str):
+        raise ValueError(
+            f'{path}: sources.volumes[{index}].{field_name} must be a non-empty string'
+        )
+    if field_name == 'name':
+        validate_docker_volume_name(
+            source[field_name],
+            f'{path}: sources.volumes[{index}].name',
+        )
+    target = (field_name, source[field_name])
+    if target in volume_targets:
+        raise ValueError(
+            f'{path}: duplicate Docker volume target declaration: {source[field_name]}'
+        )
+    volume_targets.add(target)
+
+
+def _validate_sources(m, path):
     sources = m.get('sources')
     if sources is None:
         sources = {}
@@ -170,61 +241,20 @@ def validate_manifest(m):
         for index, source in enumerate(entries):
             if not isinstance(source, dict):
                 raise ValueError(f'{path}: sources.{kind}[{index}] must be a mapping')
-            allowed_source = (
-                {'id', 'path', 'required', 'exclude'} if kind == 'paths'
-                else {'id', 'name', 'compose_volume', 'required', 'exclude'}
-            )
-            unknown_source = sorted(set(source) - allowed_source)
-            if unknown_source:
-                raise ValueError(
-                    f'{path}: unsupported sources.{kind}[{index}] fields: {unknown_source}'
-                )
-            source_id = source.get('id')
-            if not source_id:
-                raise ValueError(f'{path}: sources.{kind}[{index}] is missing id')
-            if not isinstance(source_id, str) or not re.fullmatch(
-                r'[A-Za-z0-9][A-Za-z0-9_.-]*', source_id
-            ):
-                raise ValueError(
-                    f'{path}: sources.{kind}[{index}].id must be a safe single path component'
-                )
-            if source_id in ids:
-                raise ValueError(f'{path}: duplicate source id {source_id!r}')
-            ids.add(source_id)
-            excludes = source.get('exclude', [])
-            if not isinstance(excludes, list) or not all(isinstance(x, str) for x in excludes):
-                raise ValueError(f'{path}: sources.{kind}[{index}].exclude must be a list of strings')
-            if not isinstance(source.get('required', True), bool):
-                raise ValueError(f'{path}: sources.{kind}[{index}].required must be boolean')
+            _validate_source_common(path, kind, index, source, ids)
             if kind == 'paths':
-                if not isinstance(source.get('path'), str) or not source['path']:
-                    raise ValueError(f'{path}: sources.paths[{index}].path must be a non-empty string')
-                target = lexical_absolute(source_path(m, source))
-                if any(paths_overlap(target, existing) for existing in path_targets):
-                    raise ValueError(f'{path}: duplicate or overlapping path target: {target}')
-                path_targets.add(target)
+                _validate_path_source(m, path, index, source, path_targets)
             else:
-                volume_fields = [key for key in ('name', 'compose_volume') if source.get(key)]
-                if len(volume_fields) != 1:
-                    raise ValueError(
-                        f'{path}: sources.volumes[{index}] must define exactly one of name or compose_volume'
-                    )
-                field_name = volume_fields[0]
-                if not isinstance(source[field_name], str):
-                    raise ValueError(
-                        f'{path}: sources.volumes[{index}].{field_name} must be a non-empty string'
-                    )
-                if field_name == 'name':
-                    validate_docker_volume_name(
-                        source[field_name],
-                        f'{path}: sources.volumes[{index}].name',
-                    )
-                target = (field_name, source[field_name])
-                if target in volume_targets:
-                    raise ValueError(
-                        f'{path}: duplicate Docker volume target declaration: {source[field_name]}'
-                    )
-                volume_targets.add(target)
+                _validate_volume_source(path, index, source, volume_targets)
+
+
+def validate_manifest(m: ServiceManifest):
+    path = _validate_manifest_header(m)
+    _validate_consistency(m, path)
+    _validate_compose(m, path)
+    validate_schedule(m)
+    validate_retention(m)
+    _validate_sources(m, path)
     return True
 
 

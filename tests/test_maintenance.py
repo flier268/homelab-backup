@@ -2,7 +2,7 @@ import io
 import json
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -10,6 +10,40 @@ from homelab_backup import common, maintenance
 
 
 class MaintenanceCommandTests(unittest.TestCase):
+    def test_failure_summary_records_exact_operation_and_error(self):
+        summary = maintenance.FailureSummary()
+        error = io.StringIO()
+        with redirect_stderr(error):
+            summary.record_exception(
+                'demo', ValueError('invalid schedule'),
+                message='ERROR: schedule planning failed for demo: {error}',
+                summary_error='schedule planning failed: invalid schedule',
+            )
+            with self.assertRaises(SystemExit):
+                summary.raise_if_any('SCHEDULED BACKUP FAILURES')
+
+        self.assertEqual(
+            error.getvalue(),
+            'ERROR: schedule planning failed for demo: invalid schedule\n'
+            '\nSCHEDULED BACKUP FAILURES\n'
+            '  - demo: schedule planning failed: invalid schedule\n',
+        )
+
+    def test_run_due_debug_reraises_original_planning_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = {'lock_file': str(Path(tmp) / 'backupctl.lock')}
+            failure = ValueError('invalid schedule')
+            with mock.patch.object(
+                maintenance, 'manifests', return_value=[{'service': 'bad'}],
+            ), mock.patch.object(
+                maintenance, 'due_status', side_effect=failure,
+            ), mock.patch.dict(
+                'os.environ', {'BACKUPCTL_DEBUG': '1'},
+            ), self.assertRaises(ValueError) as caught:
+                maintenance.cmd_run_due(config, mock.Mock())
+
+            self.assertIs(caught.exception, failure)
+
     def test_global_lock_creates_custom_private_parent(self):
         with tempfile.TemporaryDirectory() as tmp:
             lock = Path(tmp) / 'custom' / 'locks' / 'backupctl.lock'
