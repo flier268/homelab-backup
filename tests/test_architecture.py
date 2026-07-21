@@ -2,9 +2,7 @@ import ast
 import unittest
 from pathlib import Path
 
-from homelab_backup import (
-    config, manifest, restore, restore_apply, restore_inventory, restore_plan,
-)
+from homelab_backup import config, restore
 
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1] / 'homelab_backup'
@@ -18,14 +16,18 @@ def top_level_dependencies():
     dependencies = {}
     for path in PACKAGE_ROOT.glob('*.py'):
         tree = ast.parse(path.read_text(encoding='utf-8'))
-        dependencies[path.stem] = {
-            node.module.split('.')[0]
-            for node in tree.body
-            if isinstance(node, ast.ImportFrom)
-            and node.level == 1
-            and node.module
-            and node.module.split('.')[0] in modules
-        }
+        dependencies[path.stem] = set()
+        for node in tree.body:
+            if not isinstance(node, ast.ImportFrom) or node.level != 1:
+                continue
+            if node.module:
+                dependency = node.module.split('.')[0]
+                if dependency in modules:
+                    dependencies[path.stem].add(dependency)
+            else:
+                dependencies[path.stem].update(
+                    alias.name for alias in node.names if alias.name in modules
+                )
     return dependencies
 
 
@@ -65,15 +67,26 @@ class ArchitectureTests(unittest.TestCase):
         )
         self.assertFalse(dependencies['restore_inventory'] & RESTORE_LAYERS)
 
-    def test_compatibility_modules_reexport_owned_symbols(self):
-        self.assertIs(config.validate_manifest, manifest.validate_manifest)
-        self.assertIs(config.compose_model, manifest.compose_model)
-        self.assertIs(restore.apply_one, restore_apply.apply_one)
-        self.assertIs(restore.prepare_restore_plan, restore_plan.prepare_restore_plan)
-        self.assertIs(
-            restore.validate_restore_inventory,
-            restore_inventory.validate_restore_inventory,
-        )
+    def test_owned_symbols_are_not_reexported_by_compatibility_modules(self):
+        for name in (
+                'DOCKER_VOLUME_RE', 'RETENTION_FLAGS', 'SERVICE_RE',
+                'actual_volume_name', 'compose_cmd', 'compose_model', 'manifest',
+                'manifests', 'source_path', 'valid_service_name',
+                'validate_docker_volume_name', 'validate_manifest',
+                'validate_retention',
+        ):
+            self.assertFalse(hasattr(config, name), name)
+        for name in (
+                'RestorePlan', 'apply_one', 'compose_authorization_projection',
+                'compose_files_exist', 'compose_targets',
+                'deferred_compose_sources', 'inventory_volumes',
+                'load_restore_inventory', 'normalize_restore_target',
+                'prepare_restore_plan', 'restore_authorization_projection',
+                'restore_path_source', 'restored_path_details',
+                'validate_restore_inventory', 'validate_restore_path_separation',
+                'validate_restore_sources',
+        ):
+            self.assertFalse(hasattr(restore, name), name)
 
 
 if __name__ == '__main__':

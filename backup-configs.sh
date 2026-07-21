@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "$ROOT_DIR/config-ops-runtime.sh"
 CONFIGS_DIR="$ROOT_DIR/configs"
 GIT_ARCHIVE="$CONFIGS_DIR/homelab-backup-configs.zip.age"
 RUNTIME_DIR=/run
@@ -40,7 +41,7 @@ die() {
 
 require_tools() {
   local tool
-  for tool in age python3; do
+  for tool in age flock python3; do
     command -v "$tool" >/dev/null 2>&1 || die "$tool is required; run install.sh first."
   done
 }
@@ -127,126 +128,11 @@ copy_rotation_archive_as_user() {
 publish_ciphertext_for_user() {
   local source=$1 user=$2 uid=$3 gid=$4 archive=$5 mode=$6
   local fail_after_publish=${7:-0} status=0
-  local runner=()
-  if ((EUID != uid)); then
-    runner=(runuser --user "$user" --)
-  fi
+  local arguments=(publish-archive)
   prepare_ciphertext_for_user "$source" "$uid" "$gid" || return
-  "${runner[@]}" python3 - "$PUBLISH_FILE" "$archive" "$mode" \
-    "$fail_after_publish" <<'PY' || status=$?
-import os
-from pathlib import Path
-import secrets
-import shutil
-import stat
-import sys
-
-source = Path(sys.argv[1])
-archive = Path(sys.argv[2])
-mode = sys.argv[3]
-fail_after_publish = int(sys.argv[4])
-directory = archive.parent
-name = archive.name
-directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
-token = secrets.token_hex(8)
-temporary = f'.{name}.next.{token}'
-rollback = f'.{name}.rollback.{token}'
-published = False
-
-def existing_metadata():
-    fd = os.open(
-        name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
-        dir_fd=directory_fd,
-    )
-    try:
-        metadata = os.fstat(fd)
-        if not stat.S_ISREG(metadata.st_mode):
-            raise SystemExit(f'ERROR: encrypted archive is not a regular file: {archive}')
-        if metadata.st_uid != os.geteuid():
-            raise SystemExit(f'ERROR: encrypted archive is not owned by the output user: {archive}')
-    finally:
-        os.close(fd)
-
-def copy_into_temporary():
-    fd = os.open(
-        temporary,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-        0o600,
-        dir_fd=directory_fd,
-    )
-    try:
-        with source.open('rb') as input_file, os.fdopen(
-            fd, 'wb', closefd=False,
-        ) as output_file:
-            shutil.copyfileobj(input_file, output_file)
-            output_file.flush()
-            os.fsync(output_file.fileno())
-    finally:
-        os.close(fd)
-
-try:
-    if mode not in ('create', 'replace'):
-        raise SystemExit(f'ERROR: invalid archive publication mode: {mode}')
-    if mode == 'replace':
-        existing_metadata()
-    else:
-        try:
-            os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            pass
-        else:
-            raise SystemExit(f'ERROR: output already exists: {archive}')
-
-    copy_into_temporary()
-    if mode == 'replace':
-        os.link(
-            name, rollback,
-            src_dir_fd=directory_fd, dst_dir_fd=directory_fd,
-            follow_symlinks=False,
-        )
-        os.replace(
-            temporary, name,
-            src_dir_fd=directory_fd, dst_dir_fd=directory_fd,
-        )
-    else:
-        os.link(
-            temporary, name,
-            src_dir_fd=directory_fd, dst_dir_fd=directory_fd,
-            follow_symlinks=False,
-        )
-        os.unlink(temporary, dir_fd=directory_fd)
-    published = True
-    try:
-        if fail_after_publish:
-            raise OSError('injected late publication failure')
-        os.fsync(directory_fd)
-    except OSError as publication_error:
-        try:
-            if mode == 'replace':
-                os.replace(
-                    rollback, name,
-                    src_dir_fd=directory_fd, dst_dir_fd=directory_fd,
-                )
-            else:
-                os.unlink(name, dir_fd=directory_fd)
-            published = False
-            os.fsync(directory_fd)
-        except OSError as rollback_error:
-            print(
-                f'ERROR: archive publication state is uncertain: '
-                f'{rollback_error}',
-                file=sys.stderr,
-            )
-            raise SystemExit(75) from rollback_error
-        raise publication_error
-finally:
-    for candidate in (temporary, rollback):
-        try:
-            os.unlink(candidate, dir_fd=directory_fd)
-        except FileNotFoundError:
-            pass
-    os.close(directory_fd)
-PY
+  arguments+=("$PUBLISH_FILE" "$archive" "$mode")
+  ((fail_after_publish == 0)) || arguments+=(--fail-after-publish)
+  run_config_ops_as_user "$user" "$uid" "${arguments[@]}" || status=$?
   cleanup_publish_dir
   return "$status"
 }
@@ -394,54 +280,13 @@ commit_git_archive_transaction() {
   return "$failure_status"
 }
 
-config_validator_python() {
-  if [[ -x /usr/local/lib/homelab-backup/current/venv/bin/python ]]; then
-    printf '%s\n' /usr/local/lib/homelab-backup/current/venv/bin/python
-  elif [[ -x "$ROOT_DIR/.venv/bin/python" ]]; then
-    printf '%s\n' "$ROOT_DIR/.venv/bin/python"
-  else
-    printf '%s\n' python3
-  fi
-}
-
 configured_lock_file() {
-  "$(config_validator_python)" - /etc/homelab-backup/config.yaml <<'PY'
-from pathlib import Path
-import sys
-import yaml
-
-with Path(sys.argv[1]).open(encoding='utf-8') as source:
-    config = yaml.safe_load(source) or {}
-lock_file = config.get('lock_file')
-if not isinstance(lock_file, str) or not lock_file.startswith('/'):
-    raise SystemExit('ERROR: config lock_file must be an absolute path')
-print(lock_file)
-PY
+  run_config_ops lock-path /etc/homelab-backup/config.yaml
 }
 
 acquire_global_operation_lock() {
   local lock_file=$1 old_umask
-  python3 - "$lock_file" <<'PY'
-import os
-from pathlib import Path
-import stat
-import sys
-
-path = Path(sys.argv[1])
-parent = path.parent
-metadata = os.lstat(parent)
-if not stat.S_ISDIR(metadata.st_mode):
-    raise SystemExit(f'ERROR: lock parent is not a real directory: {parent}')
-if metadata.st_uid != os.geteuid() or metadata.st_mode & 0o022:
-    raise SystemExit(f'ERROR: lock parent is not private and root-controlled: {parent}')
-try:
-    metadata = os.lstat(path)
-except FileNotFoundError:
-    pass
-else:
-    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid():
-        raise SystemExit(f'ERROR: lock file is not a root-owned regular file: {path}')
-PY
+  run_config_ops validate-lock "$lock_file"
   old_umask="$(umask)"
   umask 077
   exec {CONFIG_BACKUP_LOCK_FD}<>"$lock_file"
@@ -452,6 +297,7 @@ PY
 
 acquire_consistent_global_operation_lock() {
   local selected_lock confirmed_lock
+  resolve_config_ops_runtime
   while true; do
     selected_lock="$(configured_lock_file)"
     acquire_global_operation_lock "$selected_lock"
@@ -596,7 +442,6 @@ if (($#)); then
   exit 2
 fi
 
-command -v flock >/dev/null 2>&1 || die 'flock is required.'
 acquire_consistent_global_operation_lock
 
 for source in \

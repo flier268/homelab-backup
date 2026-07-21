@@ -7,27 +7,14 @@ from pathlib import Path
 
 import yaml
 
+from . import restore_apply
 from .common import FailureSummary, GlobalLock, die, restic_env, run
 from .manifest import manifest, valid_service_name, validate_manifest
-from .restore_apply import (
-    RestorePlan, apply_one,
-    compose_authorization_projection as _compose_authorization_projection,
-    compose_files_exist,
-    compose_targets as _compose_targets,
-    deferred_compose_sources as _deferred_compose_sources,
-    inventory_volumes as _inventory_volumes,
-    load_restore_inventory, restored_path_details, validate_restore_inventory,
-    validate_restore_path_separation, validate_restore_sources,
-    restore_authorization_projection as _restore_authorization_projection,
-    normalize_restore_target, prepare_restore_plan, restore_path_source,
-)
 from .security import (
     clear_control_leaf, ensure_private_directory, lexical_absolute,
     read_control_text, validate_control_root, validate_trusted_roots,
 )
 from .storage import (
-    compose_model, docker_mount_conflicts, docker_project_containers,
-    docker_volume_exists, rsync, running_services, sync_volumes,
     validate_docker_bind_probe, validate_docker_environment,
 )
 
@@ -342,7 +329,7 @@ def cmd_restore(c, args):
             try:
                 m, root = restore_one(c, service, snapshot, policy)
                 if args.apply:
-                    apply_one(c, m, root, start_services=args.start)
+                    restore_apply.apply_one(c, m, root, start_services=args.start)
                     try:
                         clear_control_leaf(root)
                     except Exception as cleanup_error:
@@ -412,4 +399,4 @@ def cmd_apply(c, args):
         validate_trusted_roots(c['trusted_data_roots'])
         root = _validated_apply_workspace(c, args.service, args.restore_dir)
         m = manifest(c, args.service)
-        apply_one(c, m, root, start_services=args.start)
+        restore_apply.apply_one(c, m, root, start_services=args.start)

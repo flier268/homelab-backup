@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest import mock
 
 from homelab_backup import restore as backupctl
-from homelab_backup import restore_plan
+from homelab_backup import restore_apply, restore_plan
 from tests.helpers import manifest as make_manifest
 
 
@@ -258,7 +258,7 @@ class RestoreCommandTests(unittest.TestCase):
             ), mock.patch.object(
                 backupctl, 'validate_trusted_roots',
             ), mock.patch.object(
-                backupctl, 'apply_one', side_effect=authorize_local_manifest,
+                restore_apply, 'apply_one', side_effect=authorize_local_manifest,
             ) as apply_mock:
                 with self.assertRaises(SystemExit):
                     backupctl.cmd_restore(config_data, args)
@@ -293,7 +293,7 @@ class RestoreCommandTests(unittest.TestCase):
                 backupctl, 'validate_docker_bind_probe',
             ), mock.patch.object(
                 backupctl, 'validate_trusted_roots',
-            ), mock.patch.object(backupctl, 'apply_one'):
+            ), mock.patch.object(restore_apply, 'apply_one'):
                 backupctl.cmd_restore(config_data, args)
 
         self.assertFalse(restored.exists())
@@ -405,7 +405,7 @@ class ApplyCommandTests(unittest.TestCase):
             with mock.patch.object(backupctl, 'validate_docker_environment'), \
                     mock.patch.object(backupctl, 'validate_docker_bind_probe'), \
                     mock.patch.object(backupctl, 'manifest', return_value=mock.Mock()), \
-                    mock.patch.object(backupctl, 'apply_one') as apply_mock:
+                    mock.patch.object(restore_apply, 'apply_one') as apply_mock:
                 with self.assertRaises(ValueError):
                     backupctl.cmd_apply(config_data, args)
 
@@ -476,7 +476,7 @@ class ApplyCommandTests(unittest.TestCase):
                         side_effect=require_lock,
                     ) as control_mock, mock.patch.object(
                         backupctl, 'manifest', return_value=mock.Mock(),
-                    ), mock.patch.object(backupctl, 'apply_one') as apply_mock:
+                    ), mock.patch.object(restore_apply, 'apply_one') as apply_mock:
                 backupctl.cmd_apply(config_data, args)
 
             trust_mock.assert_called_once_with([])

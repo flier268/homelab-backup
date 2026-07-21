@@ -5,7 +5,7 @@ from io import StringIO
 from pathlib import Path
 from unittest import mock
 
-from homelab_backup import config
+from homelab_backup import config, manifest as manifest_module
 from tests.helpers import manifest
 
 
@@ -18,7 +18,7 @@ class ManifestValidationTests(unittest.TestCase):
             with self.assertRaisesRegex(
                 ValueError, 'invalid consistency.mode',
             ):
-                config.validate_manifest(value)
+                manifest_module.validate_manifest(value)
 
     def test_version_must_be_one(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -31,18 +31,18 @@ class ManifestValidationTests(unittest.TestCase):
                     value['version'] = version
                 with self.subTest(version=version), \
                         self.assertRaisesRegex(ValueError, 'version must be 1'):
-                    config.validate_manifest(value)
+                    manifest_module.validate_manifest(value)
 
     def test_impossible_calendar_schedule_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             value = manifest(Path(tmp), schedule={'cron': '0 0 31 2 *'})
             with self.assertRaisesRegex(ValueError, 'never matches'):
-                config.validate_manifest(value)
+                manifest_module.validate_manifest(value)
 
     def test_service_must_be_a_string(self):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(ValueError):
-                config.validate_manifest(manifest(Path(tmp), service=123))
+                manifest_module.validate_manifest(manifest(Path(tmp), service=123))
 
     def test_consistency_schema_is_validated(self):
         invalid = (
@@ -58,17 +58,17 @@ class ManifestValidationTests(unittest.TestCase):
             for consistency in invalid:
                 with self.subTest(consistency=consistency):
                     with self.assertRaises(ValueError):
-                        config.validate_manifest(manifest(root, consistency=consistency))
+                        manifest_module.validate_manifest(manifest(root, consistency=consistency))
 
     def test_boolean_is_not_a_retention_count(self):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(ValueError):
-                config.validate_manifest(manifest(Path(tmp), retention={'keep_last': True}))
+                manifest_module.validate_manifest(manifest(Path(tmp), retention={'keep_last': True}))
 
     def test_sources_must_be_a_mapping(self):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(ValueError):
-                config.validate_manifest(manifest(Path(tmp), sources=[]))
+                manifest_module.validate_manifest(manifest(Path(tmp), sources=[]))
 
     def test_source_id_must_be_a_safe_single_component(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -79,7 +79,7 @@ class ManifestValidationTests(unittest.TestCase):
                         'volumes': [],
                     })
                     with self.assertRaises(ValueError):
-                        config.validate_manifest(value)
+                        manifest_module.validate_manifest(value)
 
     def test_path_and_volume_required_fields_are_validated(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -94,7 +94,7 @@ class ManifestValidationTests(unittest.TestCase):
             for sources in invalid_sources:
                 with self.subTest(sources=sources):
                     with self.assertRaises(ValueError):
-                        config.validate_manifest(manifest(root, sources=sources))
+                        manifest_module.validate_manifest(manifest(root, sources=sources))
 
     def test_docker_volume_name_cannot_be_a_host_path_or_mount_option(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -106,7 +106,7 @@ class ManifestValidationTests(unittest.TestCase):
                         'volumes': [{'id': 'data', 'name': unsafe}],
                     })
                     with self.assertRaisesRegex(ValueError, 'Docker volume name'):
-                        config.validate_manifest(value)
+                        manifest_module.validate_manifest(value)
 
     def test_unknown_manifest_fields_are_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -127,7 +127,7 @@ class ManifestValidationTests(unittest.TestCase):
             for override in invalid:
                 with self.subTest(override=override):
                     with self.assertRaisesRegex(ValueError, 'unsupported'):
-                        config.validate_manifest(manifest(root, **override))
+                        manifest_module.validate_manifest(manifest(root, **override))
 
     def test_hooks_are_only_allowed_in_hooks_mode(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -138,7 +138,7 @@ class ManifestValidationTests(unittest.TestCase):
                         'mode': mode, 'before': ['echo freeze'], 'after': [],
                     })
                     with self.assertRaisesRegex(ValueError, 'only valid with mode hooks'):
-                        config.validate_manifest(value)
+                        manifest_module.validate_manifest(value)
 
     def test_duplicate_or_overlapping_path_targets_are_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -153,14 +153,14 @@ class ManifestValidationTests(unittest.TestCase):
                         'volumes': [],
                     })
                     with self.assertRaisesRegex(ValueError, 'overlapping path target'):
-                        config.validate_manifest(value)
+                        manifest_module.validate_manifest(value)
 
     def test_manifest_directory_must_match_service(self):
         with tempfile.TemporaryDirectory() as tmp:
             value = manifest(Path(tmp))
             value['_dir'] = str(Path(tmp) / 'other-name')
             with self.assertRaisesRegex(ValueError, 'directory'):
-                config.validate_manifest(value)
+                manifest_module.validate_manifest(value)
 
 
 class GlobalConfigValidationTests(unittest.TestCase):

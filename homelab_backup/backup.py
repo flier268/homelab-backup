@@ -4,7 +4,7 @@ import sys
 from pathlib import Path
 
 from . import backup_state as _backup_state
-from .backup_state import load_state, parse_iso, save_state, state_path
+from .backup_state import load_state, save_state
 from .common import (
     CommandError, FailureSummary, GlobalLock, _print_command_failure, die,
     restic_env, run, run_cleanup,
@@ -202,16 +202,6 @@ def backup_one(
     return True
 
 
-def cmd_list(c, args):
-    from .maintenance import cmd_list as implementation
-    return implementation(c, args)
-
-
-def cmd_status(c, args):
-    from .maintenance import cmd_status as implementation
-    return implementation(c, args)
-
-
 def cmd_validate(c, args):
     errors = []
     try:
@@ -325,28 +315,3 @@ def cmd_backup(c, args):
                     command_context=f'Backup failed for {service}',
                 )
     failures.raise_if_any('BACKUP FAILURES')
-
-
-def cmd_run_due(c, args):
-    from .maintenance import cmd_run_due as implementation
-    return implementation(c, args)
-
-
-def cmd_snapshots(c, args):
-    from .maintenance import cmd_snapshots as implementation
-    return implementation(c, args)
-
-
-def cmd_maintenance(c, args):
-    from .maintenance import cmd_maintenance as implementation
-    return implementation(c, args)
-
-
-def cmd_check(c, args):
-    from .maintenance import cmd_check as implementation
-    return implementation(c, args)
-
-
-def cmd_unlock(c, args):
-    from .maintenance import cmd_unlock as implementation
-    return implementation(c, args)

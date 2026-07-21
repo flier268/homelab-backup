@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest import mock
 
 from homelab_backup import (
-    common, restore as backupctl, restore_apply, restore_plan, storage,
+    common, restore_apply, restore_plan, storage,
 )
 from tests.helpers import manifest, path_inventory, write_restore_inventory
 
@@ -58,9 +58,9 @@ class RestoreSourceTests(unittest.TestCase):
             root = Path(tmp) / 'restore'
             root.mkdir()
             value = {'sources': {'volumes': [{'id': 'db', 'name': 'demo-db'}]}}
-            with mock.patch.object(backupctl, 'run') as run_mock:
+            with mock.patch.object(storage, 'run') as run_mock:
                 with self.assertRaisesRegex(RuntimeError, 'missing'):
-                    backupctl.sync_volumes(
+                    storage.sync_volumes(
                         {'volume_helper_image': 'helper'}, value, root, restore=True,
                     )
             run_mock.assert_not_called()
@@ -77,7 +77,7 @@ class RestoreSourceTests(unittest.TestCase):
 
             with mock.patch.object(storage, 'run') as run_mock:
                 with self.assertRaisesRegex(RuntimeError, 'real directory'):
-                    backupctl.sync_volumes(
+                    storage.sync_volumes(
                         {'volume_helper_image': 'helper'}, value, root,
                         restore=True,
                     )
@@ -134,7 +134,7 @@ class RestoreSourceTests(unittest.TestCase):
                 'id': 'db', 'name': 'demo-db', 'exclude': ['cache/**'],
             }]}}
             with mock.patch.object(storage, 'run') as run_mock:
-                backupctl.sync_volumes(
+                storage.sync_volumes(
                     {'volume_helper_image': 'helper'}, value, root, restore=True,
                 )
             command = run_mock.call_args.args[0]

@@ -2,12 +2,6 @@ import os
 from pathlib import Path
 
 from .common import die, load_yaml
-from .manifest import (
-    DOCKER_VOLUME_RE, RETENTION_FLAGS, SERVICE_RE, actual_volume_name,
-    compose_cmd, compose_model, manifest, manifests, source_path,
-    valid_service_name, validate_docker_volume_name, validate_manifest,
-    validate_retention,
-)
 from .security import lexical_absolute, paths_overlap
 from .types import GlobalConfig
 

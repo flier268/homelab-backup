@@ -158,7 +158,8 @@ install -m 0644 homelab_backup/*.py "$RELEASE_NEXT/app/homelab_backup/"
 (
   cd -- "$RELEASE_NEXT"
   PYTHONPATH="$RELEASE_NEXT/app" \
-    "$RELEASE_NEXT/venv/bin/python" -c 'import homelab_backup.cli'
+    "$RELEASE_NEXT/venv/bin/python" -c \
+      'import homelab_backup.cli, homelab_backup.config_ops'
 )
 
 # Prepare every shared runtime dependency before publishing the new Python

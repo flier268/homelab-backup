@@ -12,7 +12,8 @@
 - `bash -n install.sh`
 - `bash -n backup-configs.sh`
 - `bash -n restore-configs.sh`
-- `shellcheck install.sh backup-configs.sh restore-configs.sh`
+- `bash -n config-ops-runtime.sh`
+- `shellcheck install.sh backup-configs.sh restore-configs.sh config-ops-runtime.sh`
 - `python3 -m unittest discover -s tests -v`
 - repository 與模擬安裝後的 `backupctl --help`、`backupctl --version`
 

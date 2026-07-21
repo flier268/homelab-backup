@@ -129,13 +129,11 @@ class RestoreConfigsTests(unittest.TestCase):
 
     def test_restore_validates_archive_members_before_installing(self):
         script = (ROOT / 'restore-configs.sh').read_text(encoding='utf-8')
-        validation = script.index("expected = {")
+        extraction = script.index('validate_and_extract_archive ')
+        validation = script.index('preflight_config_bundle "$WORK_DIR/extracted"')
         publish = script.index('publish_config_bundle "$WORK_DIR/extracted"')
+        self.assertLess(extraction, validation)
         self.assertLess(validation, publish)
-        for member in (
-            'configs/restic-password', 'configs/rclone.conf', 'configs/config.yaml',
-        ):
-            self.assertIn(repr(member), script)
 
     def test_config_bundle_publish_has_rollback_for_partial_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -495,12 +493,42 @@ class DeploymentScriptTests(unittest.TestCase):
         self.assertIn('continue', function)
         self.assertIn('acquire_consistent_global_operation_lock', script)
 
-    def test_restore_validator_resolves_one_release_per_invocation(self):
-        script = (ROOT / 'restore-configs.sh').read_text(encoding='utf-8')
-        self.assertIn('resolve_validator_runtime', script)
-        self.assertNotIn('validator_python()', script)
-        self.assertNotIn('validator_pythonpath()', script)
-        self.assertIn('readlink -f -- /usr/local/lib/homelab-backup/current', script)
+    def test_config_backup_pins_helper_runtime_before_lock_path_subshell(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            resolutions = Path(tmp) / 'resolutions'
+            command = (
+                'CONFIG_OPS_PYTHON=""; CONFIG_OPS_MODULE=""; '
+                'resolve_config_ops_runtime() { '
+                '  [[ -z "$CONFIG_OPS_PYTHON" ]] || return 0; '
+                f'  printf x >> {shlex.quote(str(resolutions))}; '
+                '  CONFIG_OPS_PYTHON=/pinned/python; '
+                '  CONFIG_OPS_MODULE=/pinned/module; '
+                '}; '
+                'configured_lock_file() { '
+                '  resolve_config_ops_runtime; printf "/tmp/config.lock\\n"; '
+                '}; '
+                'acquire_global_operation_lock() { '
+                '  [[ "$CONFIG_OPS_PYTHON" == /pinned/python ]]; '
+                '}; '
+                'acquire_consistent_global_operation_lock'
+            )
+
+            result = run_sourced('backup-configs.sh', command)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(resolutions.read_text(encoding='utf-8'), 'x')
+
+    def test_config_scripts_share_one_pinned_helper_runtime(self):
+        adapter = (ROOT / 'config-ops-runtime.sh').read_text(encoding='utf-8')
+        for name in ('backup-configs.sh', 'restore-configs.sh'):
+            script = (ROOT / name).read_text(encoding='utf-8')
+            self.assertIn('source "$ROOT_DIR/config-ops-runtime.sh"', script)
+        self.assertIn('resolve_config_ops_runtime', adapter)
+        self.assertIn('[[ -z "$CONFIG_OPS_PYTHON" ]] || return 0', adapter)
+        self.assertIn(
+            'readlink -f -- /usr/local/lib/homelab-backup/current', adapter,
+        )
+        self.assertIn('flock -s "$lease_fd"', adapter)
 
     def test_installer_anchors_relative_sources_to_its_own_directory(self):
         script = (ROOT / 'install.sh').read_text(encoding='utf-8')
@@ -518,6 +546,7 @@ class DeploymentScriptTests(unittest.TestCase):
             'homelab_backup/*.py "$RELEASE_NEXT/app/homelab_backup/"',
             script,
         )
+        self.assertIn('homelab_backup.config_ops', script)
 
     def test_installer_atomically_publishes_app_and_venv_as_one_release(self):
         script = (ROOT / 'install.sh').read_text(encoding='utf-8')
