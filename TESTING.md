@@ -10,10 +10,11 @@
 - 以下 Python 指令請以 `.venv/bin/python` 執行。
 - `python3 -m py_compile backupctl homelab_backup/*.py`
 - `bash -n install.sh`
+- `bash -n uninstall.sh`
 - `bash -n backup-configs.sh`
 - `bash -n restore-configs.sh`
 - `bash -n config-ops-runtime.sh`
-- `shellcheck install.sh backup-configs.sh restore-configs.sh config-ops-runtime.sh`
+- `shellcheck install.sh uninstall.sh backup-configs.sh restore-configs.sh config-ops-runtime.sh`
 - `python3 -m unittest discover -s tests -v`
 - repository 與模擬安裝後的 `backupctl --help`、`backupctl --version`
 

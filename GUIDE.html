@@ -197,6 +197,15 @@ sudo ./install.sh</code></pre>
 <li>安裝 systemd service 與 timer，但不立即啟用。</li>
 </ul>
 <div class="box warn">安裝期間不要關機。本專案不維護跨斷電安裝 journal；若安裝因斷電中止，重新執行 <code>sudo ./install.sh</code>，讓完整 release 重新發布。</div>
+<h3>解除安裝</h3>
+<p>停止排程並移除程式、systemd units、已安裝 releases 與 Docker helper images：</p>
+<pre><code>sudo ./uninstall.sh</code></pre>
+<p>預設保留 <code>/etc/homelab-backup</code>、<code>/var/lib/homelab-backup</code>
+與 <code>/var/cache/homelab-backup</code>，方便稍後重新安裝。確定連本機設定、密碼、
+state、staging、restore workspace 與 cache 都不需要時，才使用：</p>
+<pre><code>sudo ./uninstall.sh --purge</code></pre>
+<div class="box warn">兩種模式都不會移除共用系統套件、遠端 Restic repository，
+也不會刪除 <code>/srv/stacks</code> 或 <code>/srv/data</code>。</div>
 <p>確認：</p>
 <pre><code>command -v backupctl
 backupctl --help

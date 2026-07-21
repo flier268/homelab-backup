@@ -536,6 +536,39 @@ class DeploymentScriptTests(unittest.TestCase):
         self.assertIn('ROOT_DIR=', script)
         self.assertIn('cd -- "$ROOT_DIR"', script)
 
+    def test_uninstaller_removes_installed_assets_but_preserves_data_by_default(self):
+        script = (ROOT / 'uninstall.sh').read_text(encoding='utf-8')
+        self.assertIn('systemctl disable --now "$unit"', script)
+        self.assertIn('systemctl daemon-reload', script)
+        self.assertIn('rm -f -- "$LAUNCHER"', script)
+        self.assertIn('docker image rm "$helper_image"', script)
+        self.assertIn('rm -rf -- "$LIB_ROOT"', script)
+        purge_block = script.split('if (( PURGE )); then', 1)[1]
+        self.assertIn('/etc/homelab-backup', purge_block)
+        self.assertIn('/var/lib/homelab-backup', purge_block)
+        self.assertIn('/var/cache/homelab-backup', purge_block)
+        self.assertNotIn('rm -rf -- /srv', script)
+        self.assertNotIn('apt-get remove', script)
+
+    def test_uninstaller_refuses_to_remove_an_active_release(self):
+        script = (ROOT / 'uninstall.sh').read_text(encoding='utf-8')
+        lease = script.index('exec {lease_fd}<"$release/.lease"')
+        exclusive = script.index('flock -n -x "$lease_fd"', lease)
+        removal = script.index('rm -rf -- "$LIB_ROOT"', exclusive)
+        self.assertLess(lease, exclusive)
+        self.assertLess(exclusive, removal)
+        self.assertIn('an active process still uses release', script)
+
+    def test_uninstaller_help_does_not_require_root(self):
+        result = subprocess.run(
+            ['bash', str(ROOT / 'uninstall.sh'), '--help'],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('sudo ./uninstall.sh [--purge]', result.stdout)
+
     def test_installer_installs_package(self):
         script = (ROOT / 'install.sh').read_text(encoding='utf-8')
         self.assertIn('LIB_ROOT=/usr/local/lib/homelab-backup', script)

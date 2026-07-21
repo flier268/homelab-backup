@@ -53,6 +53,27 @@ checksum。一般 push 與 pull request 只執行 CI，不會發布。
 7. 執行 `sudo ./backup-configs.sh`，貼入 SSH 公鑰並加密災難復原必要設定。
 8. 最後才啟用 systemd timers。
 
+## 解除安裝
+
+停止並停用 timers、移除 systemd units、`backupctl`、已安裝 releases 與其
+Docker helper images：
+
+```bash
+sudo ./uninstall.sh
+```
+
+預設保留 `/etc/homelab-backup`、`/var/lib/homelab-backup` 與
+`/var/cache/homelab-backup`，方便稍後重新安裝。若確定連本機設定、密碼、state、
+staging、restore workspace 與 cache 都不再需要，可明確要求清除：
+
+```bash
+sudo ./uninstall.sh --purge
+```
+
+兩種模式都不會移除安裝器透過 APT 安裝的共用系統套件、遠端 Restic repository，
+也不會刪除 `/srv/stacks` 或 `/srv/data`。執行中的手動 `backupctl` 程序仍在使用
+release 時，解除安裝會拒絕刪除程式檔。
+
 ## 災難復原必要設定
 
 Git 保存模式只建立加密 archive：
