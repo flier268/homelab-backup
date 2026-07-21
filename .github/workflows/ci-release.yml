@@ -63,9 +63,7 @@ jobs:
         run: python -m pip install --require-hashes -r requirements.txt
 
       - name: Run unit tests
-        # The supported runtime and security tests require root-owned control
-        # paths. Use the exact Python selected by setup-python under sudo.
-        run: sudo "$(command -v python)" -m unittest discover -s tests -v
+        run: python -m unittest discover -s tests -v
 
       - name: Smoke-test repository launcher
         run: |
