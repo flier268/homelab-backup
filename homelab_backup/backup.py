@@ -5,14 +5,17 @@ from pathlib import Path
 
 from . import backup_state as _backup_state
 from .backup_state import load_state, parse_iso, save_state, state_path
-from .common import CommandError, GlobalLock, _print_command_failure, die, restic_env, run
+from .common import (
+    CommandError, FailureSummary, GlobalLock, _print_command_failure, die,
+    restic_env, run, run_cleanup,
+)
 from .manifest import (
     RETENTION_FLAGS, compose_cmd, compose_model, manifest, manifests,
     source_path, validate_manifest,
 )
 from .security import (
-    atomic_copy_file, atomic_write_json, ensure_private_directory, paths_overlap,
-    validate_control_root,
+    atomic_copy_file, atomic_write_json, clear_control_leaf,
+    ensure_private_directory, paths_overlap, validate_control_root,
     validate_trusted_roots,
 )
 from .storage import (
@@ -53,7 +56,7 @@ def stage_service(c: GlobalConfig, m: ServiceManifest):
             path_inventory = sync_paths(c, m, stage)
             volume_inventory = list(sync_volumes(c, m, stage, resolved=resolved_volumes) or [])
         finally:
-            hooks(m, 'after')
+            run_cleanup(lambda: hooks(m, 'after'), 'after hook')
     elif mode == 'stop':
         running = running_services(m)
         targets = running
@@ -68,7 +71,12 @@ def stage_service(c: GlobalConfig, m: ServiceManifest):
             volume_inventory = list(sync_volumes(c, m, stage, resolved=resolved_volumes) or [])
         finally:
             if targets:
-                run(compose_cmd(m) + ['start'] + targets, cwd=m['_dir'])
+                run_cleanup(
+                    lambda: run(
+                        compose_cmd(m) + ['start'] + targets, cwd=m['_dir'],
+                    ),
+                    'service restart',
+                )
     else:
         validate_no_docker_writers(
             m, identity, resolved_volumes, project_must_be_stopped=False,
@@ -116,6 +124,11 @@ def retention_cmd(
 def backup_one(
         c: GlobalConfig, m: ServiceManifest, *, apply_retention=True,
 ):
+    validate_manifest(m)
+    partial_stage = (
+        Path(c['staging_root']) / m['service']
+        if c.get('staging_root') else None
+    )
     started = dt.datetime.now().astimezone()
     state = load_state(c, m['service'])
     state.update({
@@ -123,7 +136,6 @@ def backup_one(
         'last_attempt_at': started.isoformat(),
         'last_result': 'running',
         'last_error': None,
-        'last_retention_error': None,
     })
     state.setdefault('first_seen_at', started.isoformat())
     save_state(c, m['service'], state)
@@ -133,30 +145,16 @@ def backup_one(
             'restic', 'backup', '.', '--host', c['host_id'],
             '--tag', f"service:{m['service']}",
         ], cwd=stage, env=restic_env(c))
-        retention_error = None
-        if apply_retention:
-            try:
-                run(retention_cmd(c, m), env=restic_env(c))
-            except CommandError as err:
-                _print_command_failure(err, context=(
-                    f"Snapshot for {m['service']} succeeded, but retention failed; "
-                    'maintenance will retry it later'
-                ))
-                retention_error = err.stderr.strip() or str(err)
-        finished = dt.datetime.now().astimezone()
-        state.update({
-            # Boundary: completion is the schedule watermark. Cron occurrences
-            # reached while this backup was running are skipped, not queued.
-            'last_success_at': finished.isoformat(),
-            'last_finished_at': finished.isoformat(),
-            'last_result': 'success',
-            'last_duration_seconds': round((finished - started).total_seconds(), 3),
-            'last_error': None,
-            'last_retention_error': retention_error,
-        })
-        save_state(c, m['service'], state)
-        return True
     except Exception as err:
+        if partial_stage is not None:
+            def remove_partial_stage():
+                if partial_stage.exists() or partial_stage.is_symlink():
+                    clear_control_leaf(partial_stage)
+
+            run_cleanup(
+                remove_partial_stage,
+                f"remove partial staging for {m['service']}",
+            )
         finished = dt.datetime.now().astimezone()
         state.update({
             'last_finished_at': finished.isoformat(),
@@ -166,6 +164,42 @@ def backup_one(
         })
         save_state(c, m['service'], state)
         raise
+
+    # The restic command returning successfully is the durability boundary.
+    # Failures after this point must not make the committed snapshot retryable
+    # or remove its complete staging data.
+    retention_error = state.get('last_retention_error')
+    if apply_retention:
+        try:
+            run(retention_cmd(c, m), env=restic_env(c))
+            retention_error = None
+        except Exception as err:
+            context = (
+                f"Snapshot for {m['service']} succeeded, but retention failed; "
+                'maintenance will retry it later'
+            )
+            if isinstance(err, CommandError):
+                _print_command_failure(err, context=context)
+                retention_error = err.stderr.strip() or str(err)
+            else:
+                print(
+                    f'ERROR: {context}: {type(err).__name__}: {err}',
+                    file=sys.stderr,
+                )
+                retention_error = f'{type(err).__name__}: {err}'
+    finished = dt.datetime.now().astimezone()
+    state.update({
+        # Boundary: completion is the schedule watermark. Cron occurrences
+        # reached while this backup was running are skipped, not queued.
+        'last_success_at': finished.isoformat(),
+        'last_finished_at': finished.isoformat(),
+        'last_result': 'success',
+        'last_duration_seconds': round((finished - started).total_seconds(), 3),
+        'last_error': None,
+        'last_retention_error': retention_error,
+    })
+    save_state(c, m['service'], state)
+    return True
 
 
 def cmd_list(c, args):
@@ -255,12 +289,42 @@ def cmd_init(c, args):
 
 
 def cmd_backup(c, args):
-    ms = [manifest(c, name) for name in args.services] if args.services else manifests(c)
+    failures = FailureSummary()
+    ms = []
+    if args.services:
+        for name in dict.fromkeys(args.services):
+            try:
+                ms.append(manifest(c, name))
+            except Exception as err:
+                failures.record_exception(
+                    name, err,
+                    message=f'ERROR: cannot load service {name}: {{error}}',
+                    summary_error=f'manifest loading failed: {err}',
+                )
+    else:
+        def record_manifest_error(path, err):
+            failures.record_exception(
+                str(path), err,
+                message=f'ERROR: cannot load manifest {path}: {{error}}',
+                summary_error=f'manifest loading failed: {err}',
+            )
+
+        ms = manifests(c, on_error=record_manifest_error)
+
     with GlobalLock(c['lock_file']) as acquired:
         if not acquired:
             die('another backupctl process is running')
         for m in ms:
-            backup_one(c, m)
+            service = m.get('service', '<unnamed>')
+            try:
+                backup_one(c, m)
+            except Exception as err:
+                failures.record_exception(
+                    service, err,
+                    message=f'ERROR: backup failed for {service}: {{error}}',
+                    command_context=f'Backup failed for {service}',
+                )
+    failures.raise_if_any('BACKUP FAILURES')
 
 
 def cmd_run_due(c, args):

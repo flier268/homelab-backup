@@ -1,7 +1,6 @@
 from dataclasses import dataclass
 from pathlib import Path
 
-from .common import die
 from .manifest import (
     compose_model, manifest, source_path, validate_manifest,
 )
@@ -97,7 +96,7 @@ def _load_and_validate_restore_input(m, root):
     validate_manifest(m)
     root = Path(root)
     if not root.is_dir():
-        die(f'restore directory does not exist: {root}')
+        raise RuntimeError(f'restore directory does not exist: {root}')
     inventory = load_restore_inventory(root)
     validate_restore_inventory(m, inventory)
     validate_restore_sources(m, root, inventory)

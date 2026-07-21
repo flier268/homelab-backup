@@ -198,6 +198,28 @@ class GlobalConfigValidationTests(unittest.TestCase):
                         self.assertRaisesRegex(SystemExit, '1'):
                     config.cfg()
 
+    def test_installed_release_helper_image_overrides_persistent_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / 'config.yaml'
+            config_path.touch()
+            value = self.config_data(root)
+            with mock.patch.object(config, 'CFG', config_path), \
+                    mock.patch.object(config, 'load_yaml', return_value=value), \
+                    mock.patch.dict(
+                        'os.environ',
+                        {
+                            'HOMELAB_BACKUP_RELEASE_VOLUME_HELPER_IMAGE':
+                                'homelab/volume-rsync:release.test',
+                        },
+                    ):
+                loaded = config.cfg()
+
+        self.assertEqual(
+            loaded['volume_helper_image'],
+            'homelab/volume-rsync:release.test',
+        )
+
     def test_trusted_data_roots_are_required_absolute_and_non_overlapping(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

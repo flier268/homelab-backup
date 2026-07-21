@@ -5,6 +5,8 @@ from pathlib import Path
 from unittest import mock
 
 from homelab_backup import restore as backupctl
+from homelab_backup import restore_plan
+from tests.helpers import manifest as make_manifest
 
 
 class RepositoryBoundaryTests(unittest.TestCase):
@@ -15,7 +17,61 @@ class RepositoryBoundaryTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'invalid service tag'):
                 backupctl.repository_services({'host_id': 'host'})
 
+    def test_explicit_snapshot_is_resolved_for_the_requested_service(self):
+        snapshot_id = 'a' * 64
+        result = mock.Mock(stdout=json.dumps([{
+            'id': snapshot_id,
+            'hostname': 'host',
+            'tags': ['service:demo'],
+        }]))
+        with mock.patch.object(backupctl, 'run', return_value=result), \
+                mock.patch.object(backupctl, 'restic_env', return_value={}):
+            resolved = backupctl.resolve_explicit_snapshot(
+                {'host_id': 'host'}, 'demo', snapshot_id[:8],
+            )
+
+        self.assertEqual(resolved, snapshot_id)
+
+    def test_explicit_snapshot_from_another_service_is_rejected(self):
+        result = mock.Mock(stdout=json.dumps([{
+            'id': 'a' * 64,
+            'hostname': 'host',
+            'tags': ['service:other'],
+        }]))
+        with mock.patch.object(backupctl, 'run', return_value=result), \
+                mock.patch.object(backupctl, 'restic_env', return_value={}):
+            with self.assertRaises(SystemExit):
+                backupctl.resolve_explicit_snapshot(
+                    {'host_id': 'host'}, 'demo', 'aaaaaaaa',
+                )
+
+    def test_invalid_explicit_snapshot_id_is_rejected_before_repository_access(self):
+        with mock.patch.object(backupctl, 'run') as run_mock:
+            with self.assertRaises(SystemExit):
+                backupctl.resolve_explicit_snapshot(
+                    {'host_id': 'host'}, 'demo', 'latest:subfolder',
+                )
+        run_mock.assert_not_called()
+
 class RestoredManifestTests(unittest.TestCase):
+
+    def test_snapshot_manifest_symlink_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            restored = root / 'restored'
+            meta = restored / '_meta'
+            meta.mkdir(parents=True)
+            outside = root / 'outside.yaml'
+            outside.write_text(
+                'version: 1\nservice: demo\n', encoding='utf-8',
+            )
+            (meta / 'backup.yaml').symlink_to(outside)
+
+            with self.assertRaisesRegex(ValueError, 'regular file'):
+                backupctl.prepare_restored_manifest(
+                    {'services_root': str(root / 'services')},
+                    'demo', restored, policy='restore',
+                )
 
     def test_invalid_snapshot_manifest_does_not_replace_local_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -32,7 +88,7 @@ class RestoredManifestTests(unittest.TestCase):
             original = 'original local manifest\n'
             target.write_text(original, encoding='utf-8')
 
-            with self.assertRaises(SystemExit):
+            with self.assertRaises(ValueError):
                 backupctl.prepare_restored_manifest(
                     {'services_root': str(root / 'services')},
                     'demo', restored, policy='restore',
@@ -41,6 +97,31 @@ class RestoredManifestTests(unittest.TestCase):
             self.assertEqual(target.read_text(encoding='utf-8'), original)
 
 class RestoreCommandTests(unittest.TestCase):
+
+    def test_positional_services_cannot_be_combined_with_all(self):
+        args = mock.Mock(
+            services=['demo'], all=True, yes=True, apply=False, start=False,
+            restore_manifest=False, keep_manifest=True, snapshot='latest',
+        )
+        with mock.patch.object(backupctl, 'repository_services') as repository_mock:
+            with self.assertRaises(SystemExit):
+                backupctl.cmd_restore({}, args)
+
+        repository_mock.assert_not_called()
+
+    def test_explicit_snapshot_rejects_multiple_services_before_download(self):
+        args = mock.Mock(
+            services=['one', 'two'], all=False, yes=True, apply=False,
+            start=False, restore_manifest=False, keep_manifest=True,
+            snapshot='a' * 8,
+        )
+        with mock.patch.object(
+            backupctl, 'repository_services', return_value=['one', 'two'],
+        ), mock.patch.object(backupctl, 'restore_one') as restore_mock:
+            with self.assertRaises(SystemExit):
+                backupctl.cmd_restore({}, args)
+
+        restore_mock.assert_not_called()
 
     def test_noninteractive_apply_requires_explicit_yes(self):
         args = mock.Mock(
@@ -82,6 +163,339 @@ class RestoreCommandTests(unittest.TestCase):
                     mock.patch.object(backupctl, 'restore_one', return_value=restored) as restore_mock:
                 backupctl.cmd_restore(config_data, args)
         restore_mock.assert_called_once()
+
+    def test_explicit_snapshot_is_resolved_before_download(self):
+        args = mock.Mock(
+            services=['demo'], all=False, yes=True, apply=False, start=False,
+            restore_manifest=False, keep_manifest=True, snapshot='a' * 8,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            config_data = {'host_id': 'host', 'lock_file': str(Path(tmp) / 'lock')}
+            restored = (mock.Mock(), Path(tmp) / 'restored')
+            with mock.patch.object(
+                backupctl, 'repository_services', return_value=['demo'],
+            ), mock.patch.object(
+                backupctl, 'resolve_explicit_snapshot', return_value='a' * 64,
+            ) as resolve_mock, mock.patch.object(
+                backupctl, 'restore_one', return_value=restored,
+            ) as restore_mock:
+                backupctl.cmd_restore(config_data, args)
+
+        resolve_mock.assert_called_once_with(config_data, 'demo', 'a' * 8)
+        self.assertEqual(restore_mock.call_args.args[2], 'a' * 64)
+
+    def test_one_service_failure_does_not_skip_later_services(self):
+        args = mock.Mock(
+            services=[], all=True, yes=True, apply=False, start=False,
+            restore_manifest=False, keep_manifest=True, snapshot='latest',
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            config_data = {'host_id': 'host', 'lock_file': str(Path(tmp) / 'lock')}
+
+            def restore_service(_config, service, _snapshot, _policy):
+                if service == 'one':
+                    raise RuntimeError('first failed')
+                return mock.Mock(), Path(tmp) / service
+
+            with mock.patch.object(
+                backupctl, 'repository_services', return_value=['one', 'two'],
+            ), mock.patch.object(
+                backupctl, 'restore_one', side_effect=restore_service,
+            ) as restore_mock:
+                with self.assertRaises(SystemExit):
+                    backupctl.cmd_restore(config_data, args)
+
+        self.assertEqual(
+            [call.args[1] for call in restore_mock.call_args_list],
+            ['one', 'two'],
+        )
+
+    def test_missing_local_manifest_does_not_skip_later_apply(self):
+        args = mock.Mock(
+            services=[], all=True, yes=True, apply=True, start=False,
+            restore_manifest=False, keep_manifest=True, snapshot='latest',
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            services_root = root / 'services'
+            second_service = services_root / 'two'
+            second_service.mkdir(parents=True)
+            services_root.chmod(0o755)
+            second_service.chmod(0o755)
+            (second_service / 'backup.yaml').write_text(
+                'service: two\n', encoding='utf-8',
+            )
+            (second_service / 'backup.yaml').chmod(0o600)
+            restore_roots = {
+                service: root / 'restores' / service / (
+                    f'20260717-120000-00000000{index}'
+                )
+                for index, service in enumerate(('one', 'two'), start=1)
+            }
+            for restore_root in restore_roots.values():
+                restore_root.mkdir(parents=True)
+            config_data = {
+                'host_id': 'host',
+                'lock_file': str(root / 'lock'),
+                'services_root': str(services_root),
+                'trusted_data_roots': [],
+            }
+
+            def restore_service(_config, service, _snapshot, _policy):
+                return {'service': service}, restore_roots[service]
+
+            def authorize_local_manifest(config, value, _root, **_kwargs):
+                backupctl.manifest(config, value['service'])
+
+            with mock.patch.object(
+                backupctl, 'repository_services', return_value=['one', 'two'],
+            ), mock.patch.object(
+                backupctl, 'restore_one', side_effect=restore_service,
+            ), mock.patch.object(
+                backupctl, 'validate_docker_environment',
+            ), mock.patch.object(
+                backupctl, 'validate_docker_bind_probe',
+            ), mock.patch.object(
+                backupctl, 'validate_trusted_roots',
+            ), mock.patch.object(
+                backupctl, 'apply_one', side_effect=authorize_local_manifest,
+            ) as apply_mock:
+                with self.assertRaises(SystemExit):
+                    backupctl.cmd_restore(config_data, args)
+
+        self.assertEqual(
+            [call.args[1]['service'] for call in apply_mock.call_args_list],
+            ['one', 'two'],
+        )
+
+    def test_successful_apply_removes_downloaded_restore(self):
+        args = mock.Mock(
+            services=['demo'], all=False, yes=True, apply=True, start=False,
+            restore_manifest=False, keep_manifest=True, snapshot='latest',
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            restored = root / 'restores' / 'demo' / '20260717-120000-000000001'
+            restored.mkdir(parents=True)
+            (restored / 'payload').write_text('restored', encoding='utf-8')
+            config_data = {
+                'host_id': 'host',
+                'lock_file': str(root / 'lock'),
+                'trusted_data_roots': [],
+            }
+            with mock.patch.object(
+                backupctl, 'repository_services', return_value=['demo'],
+            ), mock.patch.object(
+                backupctl, 'restore_one', return_value=(mock.Mock(), restored),
+            ), mock.patch.object(
+                backupctl, 'validate_docker_environment',
+            ), mock.patch.object(
+                backupctl, 'validate_docker_bind_probe',
+            ), mock.patch.object(
+                backupctl, 'validate_trusted_roots',
+            ), mock.patch.object(backupctl, 'apply_one'):
+                backupctl.cmd_restore(config_data, args)
+
+        self.assertFalse(restored.exists())
+
+
+class RestoreCleanupCommandTests(unittest.TestCase):
+
+    def test_selected_restore_can_be_deleted_manually(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            restore = root / 'restores' / 'demo' / '20260717-120000-000000001'
+            restore.mkdir(parents=True)
+            for directory in (root / 'restores', restore.parent, restore):
+                directory.chmod(0o700)
+            (restore / 'payload').write_text('restored', encoding='utf-8')
+            args = mock.Mock(
+                targets=['demo/20260717-120000-000000001'],
+                all=False,
+                yes=True,
+            )
+
+            backupctl.cmd_cleanup_restores({
+                'restore_root': str(root / 'restores'),
+                'lock_file': str(root / 'lock'),
+            }, args)
+
+            self.assertFalse(restore.exists())
+
+    def test_duplicate_explicit_restore_target_is_deleted_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            restore = root / 'restores' / 'demo' / '20260717-120000-000000001'
+            restore.mkdir(parents=True)
+            for directory in (root / 'restores', restore.parent, restore):
+                directory.chmod(0o700)
+            label = 'demo/20260717-120000-000000001'
+            args = mock.Mock(targets=[label, label], all=False, yes=True)
+
+            backupctl.cmd_cleanup_restores({
+                'restore_root': str(root / 'restores'),
+                'lock_file': str(root / 'lock'),
+            }, args)
+
+            self.assertFalse(restore.exists())
+
+    def test_all_restores_can_be_deleted_in_one_batch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            restores = root / 'restores'
+            targets = [
+                restores / 'one' / '20260717-120000-000000001',
+                restores / 'two' / '20260717-120000-000000002',
+            ]
+            for target in targets:
+                target.mkdir(parents=True)
+                for directory in (restores, target.parent, target):
+                    directory.chmod(0o700)
+                (target / 'payload').write_text('restored', encoding='utf-8')
+            args = mock.Mock(targets=[], all=True, yes=True)
+
+            backupctl.cmd_cleanup_restores({
+                'restore_root': str(restores),
+                'lock_file': str(root / 'lock'),
+            }, args)
+
+            self.assertTrue(all(not target.exists() for target in targets))
+
+    def test_cleanup_rejects_path_traversal(self):
+        args = mock.Mock(targets=['../victim'], all=False, yes=True)
+        with self.assertRaises(SystemExit):
+            backupctl.cmd_cleanup_restores({
+                'restore_root': '/var/lib/homelab-backup/restores',
+                'lock_file': '/run/homelab-backup/backupctl.lock',
+            }, args)
+
+
+class ApplyCommandTests(unittest.TestCase):
+
+    def test_apply_rejects_unvalidated_restore_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            restore_root = root / 'restores'
+            workspace = restore_root / 'demo' / 'latest'
+            workspace.mkdir(parents=True)
+
+            with self.assertRaisesRegex(ValueError, 'invalid restore directory'):
+                backupctl._validated_apply_workspace(
+                    {'restore_root': str(restore_root)},
+                    'demo', str(workspace),
+                )
+
+    def test_apply_rejects_workspace_outside_configured_restore_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            restore_root = root / 'restores'
+            restore_root.mkdir()
+            restore_root.chmod(0o700)
+            outside = root / 'outside' / '20260717-120000-000000001'
+            outside.mkdir(parents=True)
+            args = mock.Mock(
+                service='demo', restore_dir=str(outside), start=False, yes=True,
+            )
+            config_data = {
+                'restore_root': str(restore_root),
+                'lock_file': str(root / 'lock'),
+                'trusted_data_roots': [],
+            }
+
+            with mock.patch.object(backupctl, 'validate_docker_environment'), \
+                    mock.patch.object(backupctl, 'validate_docker_bind_probe'), \
+                    mock.patch.object(backupctl, 'manifest', return_value=mock.Mock()), \
+                    mock.patch.object(backupctl, 'apply_one') as apply_mock:
+                with self.assertRaises(ValueError):
+                    backupctl.cmd_apply(config_data, args)
+
+            apply_mock.assert_not_called()
+
+    def test_apply_rejects_symlinked_restore_workspace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            restore_root = root / 'restores'
+            service_root = restore_root / 'demo'
+            service_root.mkdir(parents=True)
+            for directory in (restore_root, service_root):
+                directory.chmod(0o700)
+            outside = root / 'outside'
+            outside.mkdir()
+            workspace = service_root / '20260717-120000-000000001'
+            workspace.symlink_to(outside, target_is_directory=True)
+
+            with self.assertRaisesRegex(ValueError, 'not a real directory'):
+                backupctl._validated_apply_workspace(
+                    {'restore_root': str(restore_root)},
+                    'demo', str(workspace),
+                )
+
+    def test_apply_validates_trust_and_workspace_while_lock_is_held(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            restore_root = root / 'restores'
+            workspace = (
+                restore_root / 'demo' / '20260717-120000-000000001'
+            )
+            workspace.mkdir(parents=True)
+            for directory in (restore_root, workspace.parent, workspace):
+                directory.chmod(0o700)
+            args = mock.Mock(
+                service='demo', restore_dir=str(workspace),
+                start=False, yes=True,
+            )
+            config_data = {
+                'restore_root': str(restore_root),
+                'lock_file': str(root / 'lock'),
+                'trusted_data_roots': [],
+            }
+            lock_state = {'held': False}
+
+            class TrackingLock:
+                def __init__(self, _path):
+                    pass
+
+                def __enter__(self):
+                    lock_state['held'] = True
+                    return True
+
+                def __exit__(self, *_args):
+                    lock_state['held'] = False
+
+            def require_lock(*_args, **_kwargs):
+                self.assertTrue(lock_state['held'])
+
+            with mock.patch.object(backupctl, 'GlobalLock', TrackingLock), \
+                    mock.patch.object(backupctl, 'validate_docker_environment'), \
+                    mock.patch.object(backupctl, 'validate_docker_bind_probe'), \
+                    mock.patch.object(
+                        backupctl, 'validate_trusted_roots',
+                        side_effect=require_lock,
+                    ) as trust_mock, mock.patch.object(
+                        backupctl, 'validate_control_root',
+                        side_effect=require_lock,
+                    ) as control_mock, mock.patch.object(
+                        backupctl, 'manifest', return_value=mock.Mock(),
+                    ), mock.patch.object(backupctl, 'apply_one') as apply_mock:
+                backupctl.cmd_apply(config_data, args)
+
+            trust_mock.assert_called_once_with([])
+            self.assertGreaterEqual(control_mock.call_count, 3)
+            apply_mock.assert_called_once_with(
+                config_data, mock.ANY, workspace, start_services=False,
+            )
+
+
+class RestorePlanErrorTests(unittest.TestCase):
+
+    def test_missing_restore_workspace_is_a_normal_exception(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            value = make_manifest(Path(tmp))
+            with self.assertRaisesRegex(RuntimeError, 'does not exist'):
+                restore_plan._load_and_validate_restore_input(
+                    value, Path(tmp) / 'missing',
+                )
+
 
 if __name__ == '__main__':
     unittest.main()

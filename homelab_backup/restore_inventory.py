@@ -2,17 +2,19 @@ import json
 from pathlib import Path
 
 from .manifest import source_path, validate_docker_volume_name
-from .security import lexical_absolute, paths_overlap, validate_payload
+from .security import (
+    lexical_absolute, paths_overlap, read_control_text, validate_payload,
+)
 from .types import RestoreInventory, ServiceManifest
 
 
 def load_restore_inventory(root) -> RestoreInventory:
     path = Path(root) / '_meta' / 'inventory.json'
-    if not path.is_file():
-        raise RuntimeError(f'restore inventory is missing: {path}')
     try:
-        data = json.loads(path.read_text(encoding='utf-8'))
-    except (OSError, json.JSONDecodeError) as err:
+        data = json.loads(read_control_text(path, require_protected=False))
+    except FileNotFoundError as err:
+        raise RuntimeError(f'restore inventory is missing: {path}') from err
+    except (OSError, ValueError, json.JSONDecodeError) as err:
         raise RuntimeError(f'cannot read restore inventory {path}: {err}') from err
     if not isinstance(data, dict):
         raise RuntimeError(f'restore inventory must be a JSON object: {path}')

@@ -3,8 +3,13 @@ import re
 import sys
 from pathlib import Path
 
-from .common import CommandError, _print_command_failure, die, load_yaml, run
-from .security import lexical_absolute, paths_overlap
+import yaml
+
+from .common import CommandError, _print_command_failure, run
+from .security import (
+    lexical_absolute, path_contains, paths_overlap, read_control_text,
+    validate_control_directory,
+)
 from .schedule import validate_schedule
 from .types import ServiceManifest
 
@@ -21,6 +26,13 @@ SERVICE_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]*')
 DOCKER_VOLUME_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]*')
 
 
+def _load_manifest_yaml(path):
+    try:
+        return yaml.safe_load(read_control_text(path)) or {}
+    except yaml.YAMLError as err:
+        raise ValueError(f'{path}: invalid manifest YAML: {err}') from err
+
+
 def validate_docker_volume_name(value, field='Docker volume name'):
     # Boundary: only Docker-managed named volumes are accepted. Host paths,
     # mount syntax, driver options, and anonymous volumes are out of scope.
@@ -31,11 +43,15 @@ def validate_docker_volume_name(value, field='Docker volume name'):
 
 def manifests(c, include_disabled=False, on_error=None) -> list[ServiceManifest]:
     out = []
-    for path in sorted(Path(c['services_root']).glob('*/backup.yaml')):
+    services_root = validate_control_directory(c['services_root'])
+    for path in sorted(services_root.glob('*/backup.yaml')):
         try:
-            m = load_yaml(path)
+            m = _load_manifest_yaml(path)
             if not isinstance(m, dict):
                 raise ValueError(f'{path}: manifest must be a YAML mapping')
+            enabled = m.get('enabled', True)
+            if not isinstance(enabled, bool):
+                raise ValueError(f'{path}: enabled must be boolean')
         except Exception as err:
             if on_error is None:
                 raise
@@ -43,16 +59,32 @@ def manifests(c, include_disabled=False, on_error=None) -> list[ServiceManifest]
             continue
         m['_path'] = str(path)
         m['_dir'] = str(path.parent)
-        if include_disabled or m.get('enabled', True):
+        if include_disabled or enabled is not False:
             out.append(m)
     return out
 
 
 def manifest(c, name) -> ServiceManifest:
-    for m in manifests(c):
-        if m.get('service') == name:
-            return m
-    die(f'unknown or disabled service: {name}')
+    if not valid_service_name(name):
+        raise ValueError(f'unknown or disabled service: {name}')
+    services_root = lexical_absolute(c['services_root'])
+    path = services_root / name / 'backup.yaml'
+    if not path_contains(services_root, path):
+        raise ValueError(f'unknown or disabled service: {name}')
+    try:
+        m = _load_manifest_yaml(path)
+    except FileNotFoundError as err:
+        raise ValueError(f'unknown or disabled service: {name}') from err
+    if not isinstance(m, dict):
+        raise ValueError(f'{path}: manifest must be a YAML mapping')
+    m['_path'] = str(path)
+    m['_dir'] = str(path.parent)
+    enabled = m.get('enabled', True)
+    if not isinstance(enabled, bool):
+        raise ValueError(f'{path}: enabled must be boolean')
+    if m.get('service') != name or enabled is False:
+        raise ValueError(f'unknown or disabled service: {name}')
+    return m
 
 
 def compose_cmd(m):

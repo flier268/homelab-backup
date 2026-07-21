@@ -3,38 +3,13 @@ import os
 import sys
 
 from .backup import backup_one, retention_cmd
-from .backup_state import due_status, load_state
+from .backup_state import due_status, load_state, save_state
 from .common import (
-    CommandError, GlobalLock, _print_command_failure, die, restic_env, run,
+    CommandError, FailureSummary, GlobalLock, _print_command_failure, die,
+    restic_env, run,
 )
-from .manifest import manifests
+from .manifest import manifests, valid_service_name
 from .schedule import local_now
-
-
-class FailureSummary:
-    def __init__(self):
-        self.items = []
-
-    def append(self, operation, error):
-        self.items.append((operation, error))
-
-    def record_exception(
-            self, operation, error, *, message, command_context=None,
-            summary_error=None,
-    ):
-        if command_context is not None and isinstance(error, CommandError):
-            _print_command_failure(error, context=command_context)
-        else:
-            print(message.format(error=error), file=sys.stderr)
-        self.append(operation, summary_error or str(error))
-
-    def raise_if_any(self, title):
-        if not self.items:
-            return
-        print(f'\n{title}', file=sys.stderr)
-        for operation, error in self.items:
-            print(f'  - {operation}: {error}', file=sys.stderr)
-        raise SystemExit(1)
 
 
 def _manifest_error_recorder(failures):
@@ -45,28 +20,72 @@ def _manifest_error_recorder(failures):
     return record
 
 
+def _service_name(m):
+    service = m.get('service')
+    if not valid_service_name(service):
+        raise ValueError(f'invalid manifest service name: {service!r}')
+    return service
+
+
 def cmd_list(c, args):
     now = local_now()
-    for m in manifests(c):
-        due, reason, _ = due_status(c, m, now)
-        schedule = m['schedule']
-        schedule_text = f"cron {schedule['cron']}"
-        print(f"{m['service']}: {schedule_text}; {'DUE' if due else reason}; {m['_path']}")
+    failures = FailureSummary()
+    for m in manifests(c, on_error=_manifest_error_recorder(failures)):
+        service = m.get('service', '<unnamed>')
+        try:
+            service = _service_name(m)
+            due, reason, _ = due_status(c, m, now)
+            schedule = m['schedule']
+            schedule_text = f"cron {schedule['cron']}"
+            print(f"{service}: {schedule_text}; {'DUE' if due else reason}; {m['_path']}")
+        except Exception as err:
+            failures.record_exception(
+                service, err,
+                message=f'ERROR: list failed for {service}: {{error}}',
+                summary_error=f'listing failed: {err}',
+            )
+            if os.environ.get('BACKUPCTL_DEBUG') == '1':
+                raise
+    failures.raise_if_any('LIST FAILURES')
 
 
 def cmd_status(c, args):
     now = local_now()
-    for m in manifests(c):
-        due, reason, _ = due_status(c, m, now)
-        state = load_state(c, m['service'])
+    failures = FailureSummary()
+    for m in manifests(c, on_error=_manifest_error_recorder(failures)):
+        service = m.get('service', '<unnamed>')
+        try:
+            service = _service_name(m)
+            due, reason, _ = due_status(c, m, now)
+        except Exception as err:
+            failures.record_exception(
+                service, err,
+                message=f'ERROR: status schedule failed for {service}: {{error}}',
+                summary_error=f'schedule status failed: {err}',
+            )
+            if os.environ.get('BACKUPCTL_DEBUG') == '1':
+                raise
+            continue
+        try:
+            state = load_state(c, service)
+        except Exception as err:
+            failures.record_exception(
+                service, err,
+                message=f'ERROR: state loading failed for {service}: {{error}}',
+                summary_error=f'state loading failed: {err}',
+            )
+            if os.environ.get('BACKUPCTL_DEBUG') == '1':
+                raise
+            continue
         print(json.dumps({
-            'service': m['service'], 'due': due, 'schedule_status': reason,
+            'service': service, 'due': due, 'schedule_status': reason,
             'last_result': state.get('last_result'),
             'last_success_at': state.get('last_success_at'),
             'last_duration_seconds': state.get('last_duration_seconds'),
             'last_error': state.get('last_error'),
             'last_retention_error': state.get('last_retention_error'),
         }, ensure_ascii=False))
+    failures.raise_if_any('STATUS FAILURES')
 
 
 def cmd_run_due(c, args):
@@ -80,6 +99,7 @@ def cmd_run_due(c, args):
         for m in manifests(c, on_error=_manifest_error_recorder(failures)):
             service = m.get('service', '<unnamed>')
             try:
+                service = _service_name(m)
                 is_due, reason, _ = due_status(c, m, now)
             except Exception as err:
                 failures.record_exception(
@@ -126,6 +146,17 @@ def cmd_maintenance(c, args):
             service = m.get('service', '<unnamed>')
             print(f"\n== Retention: {service} ==")
             try:
+                service = _service_name(m)
+            except Exception as err:
+                failures.record_exception(
+                    service, err,
+                    command_context=f'Retention failed for {service}',
+                    message=f'ERROR: retention failed for {service}: {{error}}',
+                )
+                if os.environ.get('BACKUPCTL_DEBUG') == '1':
+                    raise
+                continue
+            try:
                 run(retention_cmd(c, m, dry_run=args.dry_run), env=restic_env(c))
             except Exception as err:
                 failures.record_exception(
@@ -135,6 +166,24 @@ def cmd_maintenance(c, args):
                 )
                 if os.environ.get('BACKUPCTL_DEBUG') == '1':
                     raise
+                continue
+            if not args.dry_run:
+                try:
+                    state = load_state(c, service)
+                    if state.get('last_retention_error') is not None:
+                        state['last_retention_error'] = None
+                        save_state(c, service, state)
+                except Exception as err:
+                    failures.record_exception(
+                        service, err,
+                        message=(
+                            'ERROR: retention state update failed for '
+                            f'{service}: {{error}}'
+                        ),
+                        summary_error=f'retention state update failed: {err}',
+                    )
+                    if os.environ.get('BACKUPCTL_DEBUG') == '1':
+                        raise
         if not args.dry_run:
             try:
                 run(['restic', 'prune'], env=restic_env(c))

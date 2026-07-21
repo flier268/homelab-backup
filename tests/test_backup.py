@@ -1,7 +1,9 @@
+import io
 import json
 import os
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from unittest import mock
 
@@ -297,6 +299,23 @@ class StagingLifecycleTests(unittest.TestCase):
 
         self.assertEqual(calls, ['before', 'after'])
 
+    def test_after_hook_failure_does_not_hide_staging_failure(self):
+        value = manifest(self.root, consistency={'mode': 'hooks'})
+        error = io.StringIO()
+
+        def fail_after(_manifest, name):
+            if name == 'after':
+                raise RuntimeError('after failed')
+
+        with mock.patch.object(backup, 'hooks', side_effect=fail_after), \
+                mock.patch.object(
+                    backup, 'sync_paths', side_effect=RuntimeError('sync failed'),
+                ), redirect_stderr(error):
+            with self.assertRaisesRegex(RuntimeError, 'sync failed'):
+                backup.stage_service(self.config, value)
+
+        self.assertIn('after hook cleanup also failed', error.getvalue())
+
     def test_after_hook_runs_when_before_hook_fails(self):
         calls = []
         value = manifest(self.root, consistency={'mode': 'hooks'})
@@ -328,6 +347,27 @@ class StagingLifecycleTests(unittest.TestCase):
             with self.assertRaises(common.CommandError):
                 backup.stage_service(self.config, value)
 
+    def test_restart_failure_does_not_hide_staging_failure(self):
+        value = manifest(self.root, consistency={'mode': 'stop'})
+        error = io.StringIO()
+
+        def fake_run(cmd, **_kwargs):
+            if 'start' in cmd:
+                raise common.CommandError(cmd, 1, stderr='restart failed')
+            return mock.Mock(stdout='')
+
+        with mock.patch.object(
+            backup, 'sync_paths', side_effect=RuntimeError('sync failed'),
+        ), mock.patch.object(
+            backup, 'running_services', return_value=['app'],
+        ), mock.patch.object(
+            backup, 'run', side_effect=fake_run,
+        ), redirect_stderr(error):
+            with self.assertRaisesRegex(RuntimeError, 'sync failed'):
+                backup.stage_service(self.config, value)
+
+        self.assertIn('service restart cleanup also failed', error.getvalue())
+
     def test_stop_mode_restarts_only_existing_target_containers(self):
         value = manifest(self.root, consistency={'mode': 'stop'})
 
@@ -341,6 +381,49 @@ class StagingLifecycleTests(unittest.TestCase):
         self.assertIn('start', restart_command)
         self.assertNotIn('up', restart_command)
         self.assertEqual(restart_command[-1], 'app')
+
+
+class BackupCommandTests(unittest.TestCase):
+
+    def test_unknown_service_does_not_skip_later_explicit_service(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = {'lock_file': str(Path(tmp) / 'backupctl.lock')}
+            args = mock.Mock(services=['missing', 'two'])
+            with mock.patch.object(
+                backup, 'manifest',
+                side_effect=[ValueError('unknown service'), {'service': 'two'}],
+            ), mock.patch.object(backup, 'backup_one') as backup_mock:
+                with self.assertRaises(SystemExit):
+                    backup.cmd_backup(config, args)
+
+        self.assertEqual(backup_mock.call_args.args[1]['service'], 'two')
+
+    def test_one_service_failure_does_not_skip_later_services(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = {'lock_file': str(Path(tmp) / 'backupctl.lock')}
+            args = mock.Mock(services=['one', 'two'])
+            services = {
+                'one': {'service': 'one'},
+                'two': {'service': 'two'},
+            }
+
+            def fail_first(_config, service):
+                if service['service'] == 'one':
+                    raise RuntimeError('first failed')
+
+            with mock.patch.object(
+                backup, 'manifest', side_effect=lambda _config, name: services[name],
+            ), mock.patch.object(
+                backup, 'backup_one', side_effect=fail_first,
+            ) as backup_mock:
+                with self.assertRaises(SystemExit):
+                    backup.cmd_backup(config, args)
+
+        self.assertEqual(
+            [call.args[1]['service'] for call in backup_mock.call_args_list],
+            ['one', 'two'],
+        )
+
 
 if __name__ == '__main__':
     unittest.main()

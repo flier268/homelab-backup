@@ -8,6 +8,11 @@ Docker Compose 服務的 Restic + OneDrive 備份工具。
 - `backup.yaml` 會自動保存到每份 snapshot 的 `_meta/backup.yaml`，不必列入 `sources.paths`。
 - 單一 systemd timer 每 5 分鐘掃描到期服務。
 - 還原時可使用互動式選單，所有 repository 服務預設全選。
+- 批次備份與還原會隔離各服務錯誤；單一服務失敗不會跳過後續服務，最後
+  統一列出失敗摘要並回傳非零狀態。
+- 備份以單份 manifest 為交易邊界；所有來源 staging 完成後才提交 Restic
+  snapshot。任一來源失敗會跳過整份 manifest、清除半成品 staging，不產生
+  該服務的部分備份。
 - 支援本機部署交叉驗證後覆寫，以及所有 target 均不存在的全新重建；混合
   狀態一律拒絕。
 
@@ -19,6 +24,9 @@ git clone https://github.com/flier268/homelab-backup.git
 cd homelab-backup
 sudo ./install.sh
 ```
+
+安裝期間不要關機；若因斷電中止，重新執行同一個 `install.sh` 讓完整 release
+重新發布。安裝器不維護跨斷電 transaction journal。
 
 接著：
 
@@ -111,7 +119,33 @@ sudo backupctl restore --all \
   --restore-manifest --apply --start --yes
 ```
 
+指定歷史 snapshot ID 時只允許單一服務；程式會先確認該 ID 屬於目前
+host 與指定的 service tag，再開始下載：
+
+```bash
+sudo backupctl restore minecraft --snapshot 01234567 --apply
+```
+
 安全政策：只要 stdin 不是 TTY，所有 `restore`（包含只下載、不加
 `--apply`）都必須明確指定 `--yes`。
+
+`restore --apply` 成功後會自動刪除該次下載的暫存副本；套用失敗或單純下載
+則保留，方便檢查或稍後手動套用。手動刪除指定副本或批量刪除全部副本：
+
+```bash
+sudo backupctl cleanup-restores minecraft/20260717-120000-000000001 --yes
+sudo backupctl cleanup-restores \
+  minecraft/20260717-120000-000000001 \
+  ghost/20260717-120500-000000002 --yes
+sudo backupctl cleanup-restores --all --yes
+```
+
+全新重建若在發布 Compose／manifest 前失敗，會嘗試移除本次新建的
+path 與 Docker volume，讓相同還原可安全重跑；任何 rollback 失敗會保留
+原始錯誤並另外列出 cleanup 錯誤。
+
+安裝、設定還原與資料還原期間均不要關機。一般錯誤會在目前程序內回滾；
+斷電不在原子性保證內。重新開機後可重新執行相同命令；全新重建若留下
+partial target，先依錯誤訊息確認並移除該 path／volume，再重跑。
 
 完整說明請開啟 `GUIDE.html`。

@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 from .common import die, load_yaml
@@ -115,7 +116,21 @@ def cfg() -> GlobalConfig:
         die(f'missing {CFG}')
     c = load_yaml(CFG)
     _validate_config_header(c)
+    release_helper_image = os.environ.get(
+        'HOMELAB_BACKUP_RELEASE_VOLUME_HELPER_IMAGE',
+    )
+    if release_helper_image:
+        c['volume_helper_image'] = release_helper_image
     trusted_roots = _normalize_trusted_roots(c)
     _validate_optional_sections(c)
     _validate_root_separation(c, trusted_roots)
     return c
+
+
+def config_lock_file():
+    """Read only enough config to select the lock guarding a full reload."""
+    if not CFG.exists():
+        die(f'missing {CFG}')
+    candidate = load_yaml(CFG)
+    _validate_config_header(candidate)
+    return candidate['lock_file']

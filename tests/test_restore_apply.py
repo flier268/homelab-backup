@@ -351,7 +351,8 @@ class RestoreApplyLifecycleTests(unittest.TestCase):
             side_effect=lambda _config, _plan: events.append('preflight'),
         ), mock.patch.object(
             restore_apply, '_restore_data',
-            side_effect=lambda _config, _plan, _changed: events.append('data'),
+            side_effect=lambda _config, _plan, _changed, _operation:
+            events.append('data'),
         ), mock.patch.object(
             restore_apply, '_publish_controls',
             side_effect=lambda _config, _manifest, _plan, _changed:
@@ -371,6 +372,8 @@ class RestoreApplyLifecycleTests(unittest.TestCase):
             root = Path(tmp)
             service_dir = root / 'trusted' / 'demo'
             service_dir.mkdir(parents=True)
+            (root / 'trusted').chmod(0o755)
+            service_dir.chmod(0o755)
             (root / 'trusted').chmod(0o755)
             service_dir.chmod(0o755)
             target = service_dir / 'optional'
@@ -454,6 +457,56 @@ class RestoreApplyLifecycleTests(unittest.TestCase):
             self.assertTrue(any('stop' in command for command in commands))
             self.assertTrue(any('up' in command for command in commands))
 
+    def test_preflight_error_is_not_replaced_by_restart_error(self):
+        root = Path('/restore')
+        value = {'_dir': '/service', 'service': 'demo'}
+        plan = restore_plan.RestorePlan(
+            root, {'paths': []}, value, 'existing', (), (), ('app',), (), 'demo',
+        )
+        primary = RuntimeError('preflight conflict')
+
+        def fake_run(command, **_kwargs):
+            if 'up' in command:
+                raise common.CommandError(command, 1)
+            return mock.Mock(stdout='')
+
+        with mock.patch.object(
+            restore_apply, 'prepare_restore_plan', return_value=plan,
+        ), mock.patch.object(
+            restore_apply, '_dynamic_preflight', side_effect=primary,
+        ), mock.patch.object(
+            restore_apply, 'run', side_effect=fake_run,
+        ), self.assertRaises(RuntimeError) as caught:
+            restore_apply.apply_one({}, value, root)
+
+        self.assertIs(caught.exception, primary)
+
+    def test_partial_stop_failure_attempts_to_restore_original_services(self):
+        root = Path('/restore')
+        value = {'_dir': '/service', 'service': 'demo'}
+        plan = restore_plan.RestorePlan(
+            root, {'paths': []}, value, 'existing', (), (), ('one', 'two'), (),
+            'demo',
+        )
+        stop_error = common.CommandError(['docker', 'compose', 'stop'], 1)
+        commands = []
+
+        def fake_run(command, **_kwargs):
+            commands.append(command)
+            if 'stop' in command:
+                raise stop_error
+            return mock.Mock(stdout='')
+
+        with mock.patch.object(
+            restore_apply, 'prepare_restore_plan', return_value=plan,
+        ), mock.patch.object(
+            restore_apply, 'run', side_effect=fake_run,
+        ), self.assertRaises(common.CommandError) as caught:
+            restore_apply.apply_one({}, value, root)
+
+        self.assertIs(caught.exception, stop_error)
+        self.assertTrue(any('up' in command for command in commands))
+
     def test_apply_failure_does_not_restart_services(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -473,6 +526,105 @@ class RestoreApplyLifecycleTests(unittest.TestCase):
             commands = [call.args[0] for call in run_mock.call_args_list]
             self.assertTrue(any('stop' in command for command in commands))
             self.assertFalse(any('up' in command for command in commands))
+
+    def test_failed_rebuild_rolls_back_created_path_and_volume(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service_dir = root / 'trusted' / 'demo'
+            service_dir.mkdir(parents=True)
+            (root / 'trusted').chmod(0o755)
+            service_dir.chmod(0o755)
+            target = service_dir / 'data'
+            source = {'id': 'data', 'path': 'data'}
+            volume_source = {'id': 'db', 'name': 'demo_db'}
+            value = {
+                '_dir': str(service_dir),
+                '_path': str(service_dir / 'backup.yaml'),
+                'service': 'demo',
+                'sources': {
+                    'paths': [source],
+                    'volumes': [volume_source],
+                },
+            }
+            plan = restore_plan.RestorePlan(
+                root,
+                {'paths': [{**source, 'present': True, 'type': 'directory'}]},
+                value, 'rebuild', ((volume_source, 'demo_db'),),
+                ('demo_db',), (), (), 'demo',
+            )
+
+            def fail_after_creating_target(*_args, **_kwargs):
+                (target / 'partial').write_text('partial', encoding='utf-8')
+                raise RuntimeError('restore failed')
+
+            def create_volume(name, *, on_created, **_kwargs):
+                on_created(name)
+
+            with mock.patch.object(
+                restore_apply, 'prepare_restore_plan', return_value=plan,
+            ), mock.patch.object(
+                restore_apply, '_dynamic_preflight',
+            ), mock.patch.object(
+                restore_apply, 'create_restore_volume',
+                side_effect=create_volume,
+            ), mock.patch.object(
+                restore_apply, 'restore_path_source',
+                side_effect=fail_after_creating_target,
+            ), mock.patch.object(
+                restore_apply, 'volume_owned_by_operation', return_value=True,
+            ), mock.patch.object(restore_apply, 'run') as run_mock:
+                with self.assertRaisesRegex(RuntimeError, 'restore failed'):
+                    restore_apply.apply_one(
+                        {'trusted_data_roots': [str(root / 'trusted')]},
+                        value, root,
+                    )
+
+            self.assertFalse(target.exists())
+            self.assertIn(
+                ['docker', 'volume', 'rm', 'demo_db'],
+                [call.args[0] for call in run_mock.call_args_list],
+            )
+
+    def test_rebuild_rollback_removes_partial_file_created_by_this_restore(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service_dir = root / 'trusted' / 'demo'
+            service_dir.mkdir(parents=True)
+            (root / 'trusted').chmod(0o755)
+            service_dir.chmod(0o755)
+            target = service_dir / 'data'
+            source = {'id': 'data', 'path': 'data'}
+            value = {
+                '_dir': str(service_dir),
+                '_path': str(service_dir / 'backup.yaml'),
+                'service': 'demo',
+                'sources': {'paths': [source], 'volumes': []},
+            }
+            plan = restore_plan.RestorePlan(
+                root,
+                {'paths': [{**source, 'present': True, 'type': 'file'}]},
+                value, 'rebuild', (), (), (), (), 'demo',
+            )
+
+            def partial_restore(*_args, **_kwargs):
+                target.unlink(missing_ok=True)
+                target.write_text('partial restore output', encoding='utf-8')
+                raise RuntimeError('restore failed')
+
+            with mock.patch.object(
+                restore_apply, 'prepare_restore_plan', return_value=plan,
+            ), mock.patch.object(
+                restore_apply, '_dynamic_preflight',
+            ), mock.patch.object(
+                restore_apply, 'restore_path_source',
+                side_effect=partial_restore,
+            ), self.assertRaisesRegex(RuntimeError, 'restore failed'):
+                restore_apply.apply_one(
+                    {'trusted_data_roots': [str(root / 'trusted')]},
+                    value, root,
+                )
+
+            self.assertFalse(target.exists())
 
 if __name__ == '__main__':
     unittest.main()

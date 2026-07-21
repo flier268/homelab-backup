@@ -5,7 +5,7 @@ import os
 import tempfile
 from pathlib import Path
 
-from .common import CommandError, die, run
+from .common import CommandError, run, run_cleanup
 from .manifest import (
     actual_volume_name, compose_cmd, compose_model, source_path,
     validate_docker_volume_name,
@@ -28,6 +28,14 @@ def docker_volume_exists(name):
 
 
 def validate_docker_environment():
+    overrides = [
+        name for name in ('DOCKER_HOST', 'DOCKER_CONTEXT')
+        if os.environ.get(name)
+    ]
+    if overrides:
+        raise RuntimeError(
+            'Docker endpoint overrides are not supported: ' + ', '.join(overrides)
+        )
     endpoint = run(
         ['docker', 'context', 'inspect', '--format', '{{json .Endpoints.docker.Host}}'],
         capture=True,
@@ -63,7 +71,7 @@ def validate_docker_bind_probe(c):
         if result.stdout.strip() != token:
             raise RuntimeError('Docker daemon bind probe saw different host data')
     finally:
-        clear_control_leaf(probe)
+        run_cleanup(lambda: clear_control_leaf(probe), 'Docker bind probe')
 
 
 def docker_volume_details(name):
@@ -84,13 +92,20 @@ def validate_volume_identity(name, *, project_name=None, logical_name=None):
     return details
 
 
-def create_restore_volume(name, *, service, source, project_name=None):
+def create_restore_volume(
+        name, *, service, source, project_name=None, operation_id=None,
+        on_created=None,
+):
     name = validate_docker_volume_name(name)
     command = [
         'docker', 'volume', 'create',
         '--label', f'io.homelab-backup.service={service}',
         '--label', f'io.homelab-backup.source={source["id"]}',
     ]
+    if operation_id:
+        command += [
+            '--label', f'io.homelab-backup.operation={operation_id}',
+        ]
     if source.get('compose_volume'):
         command += [
             '--label', f'com.docker.compose.project={project_name}',
@@ -98,8 +113,27 @@ def create_restore_volume(name, *, service, source, project_name=None):
         ]
     command.append(name)
     result = run(command, capture=True)
+    if on_created is not None:
+        on_created(name)
     if result.stdout.strip() != name:
-        raise RuntimeError(f'Docker created an unexpected volume: {result.stdout.strip()}')
+        if not operation_id or volume_owned_by_operation(name, operation_id):
+            run_cleanup(
+                lambda: run(['docker', 'volume', 'rm', name]),
+                f'remove unexpected restore volume {name}',
+            )
+        raise RuntimeError(
+            f'Docker created an unexpected volume: {result.stdout.strip()}'
+        )
+    if operation_id and not volume_owned_by_operation(name, operation_id):
+        raise RuntimeError(
+            f'Docker volume is not owned by this restore operation: {name}'
+        )
+
+
+def volume_owned_by_operation(name, operation_id):
+    details = docker_volume_details(name)
+    labels = details.get('Labels') or {}
+    return labels.get('io.homelab-backup.operation') == operation_id
 
 
 def docker_mount_conflicts(
@@ -240,7 +274,7 @@ def sync_paths(c, m=None, stage=None):
         dst = stage / 'paths' / source['id']
         if not (src.exists() or src.is_symlink()):
             if source.get('required', True):
-                die(f'missing source {src}')
+                raise ValueError(f'missing source {src}')
             dst.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
             clear_control_leaf(dst)
             inventory.append(_missing_path_inventory(source))
@@ -252,7 +286,7 @@ def sync_paths(c, m=None, stage=None):
             source_type = _copy_path_source(src, dst, source.get('exclude'))
         except FileNotFoundError:
             if source.get('required', True):
-                die(f'missing source {src}')
+                raise ValueError(f'missing source {src}')
             clear_control_leaf(dst)
             inventory.append(_missing_path_inventory(source))
             continue

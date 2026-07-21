@@ -10,6 +10,68 @@ from tests.helpers import manifest
 
 
 class RuntimeValidationTests(unittest.TestCase):
+    def test_restore_volume_is_journaled_before_ownership_inspection(self):
+        journal = []
+        with mock.patch.object(
+            storage, 'run', return_value=SimpleNamespace(stdout='demo_db\n'),
+        ), mock.patch.object(
+            storage, 'docker_volume_details', side_effect=RuntimeError('inspect failed'),
+        ), self.assertRaisesRegex(RuntimeError, 'inspect failed'):
+            storage.create_restore_volume(
+                'demo_db', service='demo', source={'id': 'db'},
+                operation_id='operation', on_created=journal.append,
+            )
+
+        self.assertEqual(journal, ['demo_db'])
+
+    def test_restore_volume_must_carry_this_operations_label(self):
+        details = {
+            'Labels': {
+                'io.homelab-backup.service': 'demo',
+                'io.homelab-backup.source': 'db',
+                'io.homelab-backup.operation': 'another-operation',
+            },
+        }
+        with mock.patch.object(
+            storage, 'run', return_value=SimpleNamespace(stdout='demo_db\n'),
+        ) as run_mock, mock.patch.object(
+            storage, 'docker_volume_details', return_value=details,
+        ), self.assertRaisesRegex(RuntimeError, 'operation'):
+            storage.create_restore_volume(
+                'demo_db', service='demo', source={'id': 'db'},
+                operation_id='this-operation',
+            )
+
+        self.assertFalse(any(
+            call.args[0][:3] == ['docker', 'volume', 'rm']
+            for call in run_mock.call_args_list
+        ))
+
+    def test_unexpected_volume_create_result_removes_the_new_volume(self):
+        with mock.patch.object(
+            storage, 'run',
+            side_effect=[SimpleNamespace(stdout='unexpected\n'), SimpleNamespace()],
+        ) as run_mock:
+            with self.assertRaisesRegex(RuntimeError, 'unexpected volume'):
+                storage.create_restore_volume(
+                    'demo_db', service='demo', source={'id': 'db'},
+                )
+
+        self.assertEqual(
+            run_mock.call_args_list[1].args[0],
+            ['docker', 'volume', 'rm', 'demo_db'],
+        )
+
+    def test_docker_environment_rejects_endpoint_overrides(self):
+        for variable in ('DOCKER_HOST', 'DOCKER_CONTEXT'):
+            with self.subTest(variable=variable), mock.patch.dict(
+                os.environ, {variable: 'attacker-controlled'}, clear=False,
+            ), mock.patch.object(storage, 'run') as run_mock:
+                with self.assertRaisesRegex(RuntimeError, variable):
+                    storage.validate_docker_environment()
+
+            run_mock.assert_not_called()
+
     def test_docker_environment_requires_local_rootful_unix_socket(self):
         cases = [
             ('"tcp://host:2375"', '[]', 'local rootful'),
@@ -205,6 +267,20 @@ class RuntimeValidationTests(unittest.TestCase):
 
 
 class PathSyncTests(unittest.TestCase):
+    def test_required_source_disappearing_during_sync_is_a_regular_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payload = root / 'demo' / 'data'
+            payload.mkdir(parents=True)
+            value = manifest(root, sources={
+                'paths': [{'id': 'data', 'path': 'data'}], 'volumes': [],
+            })
+
+            with mock.patch.object(
+                storage, '_copy_path_source', side_effect=FileNotFoundError,
+            ), self.assertRaisesRegex(ValueError, 'missing source'):
+                storage.sync_paths(value, root / 'stage')
+
     def test_fifo_payload_is_rejected_before_rsync(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -1,9 +1,11 @@
 import json
+import errno
 import os
 import secrets
 import stat
 import subprocess
 import shutil
+import io
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -116,6 +118,46 @@ def validate_control_directory(path, *, allow_missing=False, owner_uid=None):
             ):
                 raise ValueError(f'control directory is group/world writable: {component}')
     return path
+
+
+def read_control_text(path, *, encoding='utf-8', require_protected=True):
+    """Read a protected regular file without following its leaf symlink."""
+    path = lexical_absolute(path)
+    if require_protected:
+        validate_control_directory(path.parent)
+    parent_fd = os.open(
+        path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+    fd = -1
+    try:
+        try:
+            fd = os.open(
+                path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                dir_fd=parent_fd,
+            )
+        except FileNotFoundError:
+            raise
+        except OSError as err:
+            if err.errno == errno.ELOOP:
+                raise ValueError(f'control file must be a regular file: {path}') from err
+            raise ValueError(f'control file could not be opened: {path}: {err}') from err
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError(f'control file must be a regular file: {path}')
+        if require_protected:
+            allowed_owners = {0}
+            if os.geteuid() != 0:
+                allowed_owners.add(os.geteuid())
+            if metadata.st_uid not in allowed_owners:
+                raise ValueError(f'control file is not owned by root: {path}')
+            if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                raise ValueError(f'control file is group/world writable: {path}')
+        with io.TextIOWrapper(os.fdopen(fd, 'rb', closefd=False), encoding=encoding) as source:
+            return source.read()
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        os.close(parent_fd)
 
 
 def containing_mount(path, records=None):
@@ -379,7 +421,10 @@ def ensure_control_parent(path, trusted_roots):
     return path
 
 
-def atomic_copy_file(source, target, *, mode=0o600, require_absent=False):
+def atomic_copy_file(
+        source, target, *, mode=0o600, require_absent=False,
+        on_publish=None,
+):
     source = Path(source)
     target = lexical_absolute(target)
     source_metadata = os.lstat(source)
@@ -389,14 +434,8 @@ def atomic_copy_file(source, target, *, mode=0o600, require_absent=False):
     parent_fd = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     tmp_name = f'.{target.name}.{secrets.token_hex(8)}.tmp'
     fd = None
+    published_identity = None
     try:
-        if require_absent:
-            try:
-                os.stat(target.name, dir_fd=parent_fd, follow_symlinks=False)
-            except FileNotFoundError:
-                pass
-            else:
-                raise FileExistsError(f'control target already exists: {target}')
         fd = os.open(
             tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
             mode, dir_fd=parent_fd,
@@ -405,10 +444,28 @@ def atomic_copy_file(source, target, *, mode=0o600, require_absent=False):
             shutil.copyfileobj(input_handle, output)
             output.flush()
             os.fsync(output.fileno())
+            metadata = os.fstat(output.fileno())
+            published_identity = (metadata.st_dev, metadata.st_ino)
         os.close(fd)
         fd = None
-        os.replace(tmp_name, target.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        if require_absent:
+            os.link(
+                tmp_name, target.name,
+                src_dir_fd=parent_fd, dst_dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+            if on_publish is not None:
+                on_publish(published_identity)
+            os.unlink(tmp_name, dir_fd=parent_fd)
+        else:
+            os.replace(
+                tmp_name, target.name,
+                src_dir_fd=parent_fd, dst_dir_fd=parent_fd,
+            )
+            if on_publish is not None:
+                on_publish(published_identity)
         os.fsync(parent_fd)
+        return published_identity
     finally:
         if fd is not None:
             os.close(fd)

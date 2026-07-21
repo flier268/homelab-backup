@@ -137,10 +137,12 @@ docker compose version</code></pre>
 <h2>4. 建立 Compose 服務目錄</h2>
 <p>Compose 專案統一放在：</p>
 <pre><code>/srv/stacks/&lt;service&gt;</code></pre>
-<p>建立並交給目前使用者：</p>
+<p>建立 root 控制目錄。manifest、Compose files 與其父目錄不可由一般使用者寫入；需要修改時使用 <code>sudoedit</code>：</p>
 <pre><code>sudo mkdir -p /srv/stacks
-sudo chown -R "$USER":"$USER" /srv/stacks
-sudo chmod 755 /srv /srv/stacks</code></pre>
+sudo chown -R root:root /srv/stacks
+sudo chmod 755 /srv /srv/stacks
+sudoedit /srv/stacks/&lt;service&gt;/backup.yaml</code></pre>
+<div class="box warn"><code>backup.yaml</code> 可宣告由 root 執行的 consistency hooks，因此服務目錄不能交給一般帳號或設成 group/world writable。容器資料請放在另外列入 <code>trusted_data_roots</code> 的 managed leaf，例如 <code>/srv/data/&lt;service&gt;</code>。</div>
 <p>建議結構：</p>
 <pre><code>/srv/stacks/
 ├── minecraft/
@@ -183,12 +185,13 @@ sudo ./install.sh</code></pre>
 <p>安裝器會：</p>
 <ul>
 <li>安裝 Python 3.10 以上版本、Python venv、rsync、Restic、rclone、age、OpenSSL。</li>
-<li>建立 <code>/usr/local/lib/homelab-backup/venv</code> 虛擬環境，並將鎖定的 Python 依賴安裝在其中。</li>
-<li>安裝 <code>/usr/local/sbin/backupctl</code> 與 <code>/usr/local/lib/homelab-backup/app/homelab_backup</code> package。</li>
+<li>在 <code>/usr/local/lib/homelab-backup/releases/</code> 建立包含 venv 與 application package 的完整 release。</li>
+<li>安裝 <code>/usr/local/sbin/backupctl</code>，並以原子 symlink 切換目前 release；失敗升級不會混用新舊 Python 檔案。</li>
 <li>建立全域設定、密碼、staging、restore、state 與 cache 路徑。</li>
-<li>建立 named-volume rsync helper image。</li>
+<li>為每個 release 建立並 smoke-test 專屬 named-volume rsync helper image，與 Python release 一起切換。</li>
 <li>安裝 systemd service 與 timer，但不立即啟用。</li>
 </ul>
+<div class="box warn">安裝期間不要關機。本專案不維護跨斷電安裝 journal；若安裝因斷電中止，重新執行 <code>sudo ./install.sh</code>，讓完整 release 重新發布。</div>
 <p>確認：</p>
 <pre><code>command -v backupctl
 backupctl --help
@@ -248,6 +251,7 @@ rclone:
 
 check:
   read_data_subset: 5%</code></pre>
+<p><code>volume_helper_image</code> 是原始碼執行與舊版相容的預設值；正式安裝後，launcher 會使用目前 release 綁定且已 smoke-test 的 helper image，升級失敗不會覆寫舊 release 使用的 image。</p>
 <p>全域設定只接受文件列出的欄位；<code>rclone</code> 與 <code>check</code> 必須是 mapping。錯誤型別會在載入時停止，不會延後到備份或 repository check 才崩潰。</p>
 <h3>第二台主機</h3>
 <p>只需改成：</p>
@@ -279,6 +283,7 @@ sudo ./restore-configs.sh</code></pre>
 /etc/homelab-backup/rclone/rclone.conf
 /etc/homelab-backup/config.yaml</code></pre>
 <p>還原前會確認 ZIP 恰好含三個預期檔案。三個設定會先完整準備，安裝失敗時全部回滾，不留下新舊版本混合狀態。</p>
+<div class="box warn">設定還原期間不要關機。一般錯誤會在同一程序內回滾；斷電不在原子性保證內，重新開機後請再次執行相同的 <code>restore-configs.sh</code>。</div>
 <h3>換 SSH KEY</h3>
 <pre><code>sudo ./backup-configs.sh --rotate configs/homelab-backup-configs.zip.age</code></pre>
 <p>先貼入舊私鑰並按 Ctrl-D，再貼入新公鑰。archive 必須由執行 <code>sudo</code> 的非 root 使用者擁有；原檔讀取與最後替換都以該使用者權限執行。腳本只在完整解密、內容驗證及重新加密成功後原子替換舊檔。</p>
@@ -580,6 +585,7 @@ sources:
 sudo backupctl backup palworld</code></pre>
 <p>一次備份所有 enabled 服務：</p>
 <pre><code>sudo backupctl backup</code></pre>
+<p>批次備份會逐 manifest 隔離錯誤；某一服務失敗時會跳過整份 manifest、清除其半成品 staging，且只有全部來源 staging 完成後才提交 Restic snapshot，因此不會產生該服務的部分備份。其餘 manifest 仍會繼續，最後統一列出失敗摘要並回傳非零狀態。</p>
 <p>查看排程狀態：</p>
 <pre><code>sudo backupctl status</code></pre>
 </section>
@@ -604,16 +610,27 @@ sudo backupctl backup palworld</code></pre>
 <pre><code>sudo backupctl restore --all --apply --start --yes</code></pre>
 <p>也可只指定部分服務：</p>
 <pre><code>sudo backupctl restore minecraft ghost --apply</code></pre>
+<p>批次還原同樣逐服務隔離錯誤；某一服務下載或套用失敗時，不會跳過後續服務，最後會列出成功結果與失敗摘要。</p>
+<p>指定歷史 snapshot ID 時只允許單一服務。程式會先用目前 host 與
+<code>service:&lt;name&gt;</code> tag 解析並驗證完整 ID，再開始下載：</p>
+<pre><code>sudo backupctl restore minecraft --snapshot 01234567 --apply</code></pre>
 <h3><code>backup.yaml</code> 的還原規則</h3>
 <ul>
 <li>現有部署：本機 manifest 與所有 Compose files 都存在；snapshot inventory 必須與本機 project name、path/source declarations、volume mapping、volume 名稱及 labels 相符後才可覆寫。Compose service 清單只供診斷，新增或移除 service 不會單獨阻止舊 snapshot 還原。</li>
-<li>全新重建：manifest、Compose files、所有 present path與 named volume 都必須不存在，且 snapshot 中必須包含所有 required Compose file path source；資料完成後才發布 Compose files與 manifest。</li>
+<li>全新重建：manifest、Compose files、所有 present path與 named volume 都必須不存在，且 snapshot 中必須包含所有 required Compose file path source；資料完成後才發布 Compose files與 manifest。若發布完成前失敗，會嘗試移除本次新建的 path 與 volume，使同一還原可以重跑；rollback 自身失敗時會保留原始錯誤並另外回報 cleanup 錯誤。</li>
 <li>只有部分設定或 target 存在、project identity 不明、或有其他 container 引用 target時，一律拒絕，不猜測身份也不覆寫。</li>
 <li><code>--restore-manifest</code> 只允許更新與本機安全投影一致的 snapshot manifest。</li>
 <li>可用 <code>--keep-manifest</code> 強制保留本機 manifest。</li>
 </ul>
+<div class="box warn">資料還原期間不要關機。一般錯誤會在目前程序內嘗試 rollback；斷電不在交易保證內。重新開機後可再次執行還原；全新重建若留下 partial target，先依錯誤列出的 path／volume 確認並移除，再重跑。</div>
 <p>單純下載 snapshot 時，資料放在：</p>
 <pre><code>/var/lib/homelab-backup/restores/&lt;service&gt;/&lt;timestamp&gt;</code></pre>
+<p><code>restore --apply</code> 成功後會自動刪除該次下載副本；套用失敗或只下載時會保留。可手動刪除一個、多個，或批量刪除全部保留副本：</p>
+<pre><code>sudo backupctl cleanup-restores minecraft/20260717-120000-000000001 --yes
+sudo backupctl cleanup-restores \
+  minecraft/20260717-120000-000000001 \
+  ghost/20260717-120500-000000002 --yes
+sudo backupctl cleanup-restores --all --yes</code></pre>
 <div class="box warn">第一次上線前至少實際執行一次 <code>restore --apply</code> 測試。成功上傳不等於能成功還原。</div>
 <div class="box">套用前會先驗證所有 required path、volume 與 Compose 檔案均存在於還原資料中，並停止該 Compose project 目前所有運行中的 services；任何必要來源缺失都會中止，不會以空目錄覆寫正式 volume。設定的 exclude 也會在還原時保留。</div>
 <div class="box warn">操作期間不存在未受控 writer 是 operator obligation。程式會檢查已知 Docker containers，但無法證明主機上沒有共用 UID 程序、排程或其他 privileged process。</div>

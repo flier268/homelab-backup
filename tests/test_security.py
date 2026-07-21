@@ -111,6 +111,53 @@ class ManagedLeafTests(unittest.TestCase):
 
 
 class AtomicPublicationTests(unittest.TestCase):
+    def test_publish_callback_runs_before_parent_fsync_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / 'source'
+            target = root / 'target'
+            source.write_text('snapshot', encoding='utf-8')
+            events = []
+            real_fsync = security.os.fsync
+            calls = 0
+
+            def fsync(fd):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise OSError('late fsync failure')
+                return real_fsync(fd)
+
+            with mock.patch.object(security.os, 'fsync', side_effect=fsync), \
+                    self.assertRaisesRegex(OSError, 'late fsync'):
+                security.atomic_copy_file(
+                    source, target, require_absent=True,
+                    on_publish=lambda identity: events.append(identity),
+                )
+
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0], (
+                target.stat().st_dev, target.stat().st_ino,
+            ))
+
+    def test_require_absent_publish_does_not_overwrite_racing_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / 'source'
+            target = root / 'target'
+            source.write_text('snapshot', encoding='utf-8')
+            real_link = security.os.link
+
+            def race(*args, **kwargs):
+                target.write_text('concurrent', encoding='utf-8')
+                return real_link(*args, **kwargs)
+
+            with mock.patch.object(security.os, 'link', side_effect=race), \
+                    self.assertRaises(FileExistsError):
+                security.atomic_copy_file(source, target, require_absent=True)
+
+            self.assertEqual(target.read_text(encoding='utf-8'), 'concurrent')
+
     def test_json_fsyncs_file_before_replace_and_parent_after(self):
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp) / 'state.json'

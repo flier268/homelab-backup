@@ -11,6 +11,7 @@ PUBLISH_DIR=""
 PUBLISH_FILE=""
 TTY_STATE=""
 RECIPIENT=""
+CONFIG_BACKUP_LOCK_FD=""
 
 usage() {
   printf 'Usage:\n'
@@ -124,13 +125,15 @@ copy_rotation_archive_as_user() {
 }
 
 publish_ciphertext_for_user() {
-  local source=$1 user=$2 uid=$3 gid=$4 archive=$5 mode=$6 status=0
+  local source=$1 user=$2 uid=$3 gid=$4 archive=$5 mode=$6
+  local fail_after_publish=${7:-0} status=0
   local runner=()
   if ((EUID != uid)); then
     runner=(runuser --user "$user" --)
   fi
   prepare_ciphertext_for_user "$source" "$uid" "$gid" || return
-  "${runner[@]}" python3 - "$PUBLISH_FILE" "$archive" "$mode" <<'PY' || status=$?
+  "${runner[@]}" python3 - "$PUBLISH_FILE" "$archive" "$mode" \
+    "$fail_after_publish" <<'PY' || status=$?
 import os
 from pathlib import Path
 import secrets
@@ -141,11 +144,14 @@ import sys
 source = Path(sys.argv[1])
 archive = Path(sys.argv[2])
 mode = sys.argv[3]
+fail_after_publish = int(sys.argv[4])
 directory = archive.parent
 name = archive.name
 directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
 token = secrets.token_hex(8)
 temporary = f'.{name}.next.{token}'
+rollback = f'.{name}.rollback.{token}'
+published = False
 
 def existing_metadata():
     fd = os.open(
@@ -193,6 +199,11 @@ try:
 
     copy_into_temporary()
     if mode == 'replace':
+        os.link(
+            name, rollback,
+            src_dir_fd=directory_fd, dst_dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
         os.replace(
             temporary, name,
             src_dir_fd=directory_fd, dst_dir_fd=directory_fd,
@@ -204,16 +215,254 @@ try:
             follow_symlinks=False,
         )
         os.unlink(temporary, dir_fd=directory_fd)
-    os.fsync(directory_fd)
-finally:
+    published = True
     try:
-        os.unlink(temporary, dir_fd=directory_fd)
-    except FileNotFoundError:
-        pass
+        if fail_after_publish:
+            raise OSError('injected late publication failure')
+        os.fsync(directory_fd)
+    except OSError as publication_error:
+        try:
+            if mode == 'replace':
+                os.replace(
+                    rollback, name,
+                    src_dir_fd=directory_fd, dst_dir_fd=directory_fd,
+                )
+            else:
+                os.unlink(name, dir_fd=directory_fd)
+            published = False
+            os.fsync(directory_fd)
+        except OSError as rollback_error:
+            print(
+                f'ERROR: archive publication state is uncertain: '
+                f'{rollback_error}',
+                file=sys.stderr,
+            )
+            raise SystemExit(75) from rollback_error
+        raise publication_error
+finally:
+    for candidate in (temporary, rollback):
+        try:
+            os.unlink(candidate, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
     os.close(directory_fd)
 PY
   cleanup_publish_dir
   return "$status"
+}
+
+remove_archive_as_user() {
+  local archive=$1 user=$2 uid=$3 status=0
+  local runner=()
+  if ((EUID != uid)); then
+    runner=(runuser --user "$user" --)
+  fi
+  "${runner[@]}" python3 - "$archive" <<'PY' || status=$?
+import os
+from pathlib import Path
+import stat
+import sys
+
+archive = Path(sys.argv[1])
+directory_fd = os.open(archive.parent, os.O_RDONLY | os.O_DIRECTORY)
+try:
+    try:
+        metadata = os.stat(
+            archive.name, dir_fd=directory_fd, follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        pass
+    else:
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid():
+            raise SystemExit(
+                f'ERROR: encrypted archive is not an owned regular file: {archive}'
+            )
+        os.unlink(archive.name, dir_fd=directory_fd)
+        os.fsync(directory_fd)
+finally:
+    os.close(directory_fd)
+PY
+  return "$status"
+}
+
+rollback_git_archive_transaction() {
+  local archive=$1 user=$2 uid=$3 gid=$4 prior_present=$5
+  local prior_index=$6 relative=$7 rollback_failed=0
+  if [[ "$prior_present" == true ]]; then
+    publish_ciphertext_for_user \
+      "$WORK_DIR/git-archive.before" "$user" "$uid" "$gid" \
+      "$archive" replace || rollback_failed=1
+  else
+    remove_archive_as_user "$archive" "$user" "$uid" || rollback_failed=1
+  fi
+
+  if [[ -n "$prior_index" ]]; then
+    if [[ "$prior_index" =~ ^([0-7]{6})\ ([0-9a-f]{40,64})\ 0$'\t'(.*)$ &&
+          "${BASH_REMATCH[3]}" == "$relative" ]]; then
+      "${git_cmd[@]}" update-index --add --cacheinfo \
+        "${BASH_REMATCH[1]},${BASH_REMATCH[2]},$relative" || rollback_failed=1
+    else
+      printf 'ERROR: cannot restore unsupported prior Git index entry\n' >&2
+      rollback_failed=1
+    fi
+  else
+    "${git_cmd[@]}" rm --cached -q --ignore-unmatch -- "$relative" || \
+      rollback_failed=1
+  fi
+  return "$rollback_failed"
+}
+
+commit_git_archive_transaction() {
+  local source=$1 user=$2 uid=$3 gid=$4
+  local relative=configs/homelab-backup-configs.zip.age
+  local prior_index prior_present=false failure_status=0 publication_mode
+  local path
+  local staged_file="$WORK_DIR/git-staged.before"
+  local index_file="$WORK_DIR/git-index.before"
+  local unrelated_staged=()
+
+  if ! "${git_cmd[@]}" diff --cached --name-only -z -- > "$staged_file"; then
+    return 1
+  fi
+  while IFS= read -r -d '' path; do
+    case "$path" in
+      "$relative") ;;
+      *) unrelated_staged+=("$path") ;;
+    esac
+  done < "$staged_file"
+  if ((${#unrelated_staged[@]})); then
+    printf 'ERROR: refusing to include unrelated staged changes in the config backup commit:\n' >&2
+    printf '  - %s\n' "${unrelated_staged[@]}" >&2
+    return 1
+  fi
+
+  if ! "${git_cmd[@]}" ls-files --stage -- "$relative" > "$index_file"; then
+    return 1
+  fi
+  prior_index="$(<"$index_file")"
+  if [[ -n "$prior_index" ]] && ! [[
+        "$prior_index" =~ ^[0-7]{6}\ [0-9a-f]{40,64}\ 0$'\t'"$relative"$ ]]; then
+    printf 'ERROR: encrypted archive has an unsupported conflicted Git index entry\n' >&2
+    return 1
+  fi
+
+  if [[ -e "$GIT_ARCHIVE" || -L "$GIT_ARCHIVE" ]]; then
+    [[ -f "$GIT_ARCHIVE" && ! -L "$GIT_ARCHIVE" ]] || {
+      printf 'ERROR: existing Git archive must be a real file\n' >&2
+      return 1
+    }
+    prior_present=true
+    if ! copy_rotation_archive_as_user \
+      "$GIT_ARCHIVE" "$user" "$uid" "$WORK_DIR/git-archive.before"; then
+      return 1
+    fi
+    publication_mode=replace
+  else
+    publication_mode=create
+  fi
+
+  if ! publish_ciphertext_for_user \
+    "$source" "$user" "$uid" "$gid" "$GIT_ARCHIVE" "$publication_mode"; then
+    return 1
+  fi
+  "${git_cmd[@]}" add -f -- "$relative" || failure_status=$?
+  if ((failure_status != 0)); then
+    :
+  elif "${git_cmd[@]}" diff --cached --quiet -- "$relative"; then
+    printf 'No encrypted configuration changes to commit.\n'
+    if ! rollback_git_archive_transaction \
+      "$GIT_ARCHIVE" "$user" "$uid" "$gid" "$prior_present" \
+      "$prior_index" "$relative"; then
+      printf 'ERROR: failed to restore the prior archive transaction state\n' >&2
+      return 1
+    fi
+    return 0
+  else
+    "${git_cmd[@]}" commit --only -m \
+      "Backup encrypted recovery configs $TIMESTAMP" -- "$relative" || \
+      failure_status=$?
+    if ((failure_status == 0)); then
+      return 0
+    fi
+  fi
+
+  rollback_git_archive_transaction \
+    "$GIT_ARCHIVE" "$user" "$uid" "$gid" "$prior_present" \
+    "$prior_index" "$relative" || \
+    printf 'ERROR: failed to restore the prior archive transaction state\n' >&2
+  ((failure_status != 0)) || failure_status=1
+  return "$failure_status"
+}
+
+config_validator_python() {
+  if [[ -x /usr/local/lib/homelab-backup/current/venv/bin/python ]]; then
+    printf '%s\n' /usr/local/lib/homelab-backup/current/venv/bin/python
+  elif [[ -x "$ROOT_DIR/.venv/bin/python" ]]; then
+    printf '%s\n' "$ROOT_DIR/.venv/bin/python"
+  else
+    printf '%s\n' python3
+  fi
+}
+
+configured_lock_file() {
+  "$(config_validator_python)" - /etc/homelab-backup/config.yaml <<'PY'
+from pathlib import Path
+import sys
+import yaml
+
+with Path(sys.argv[1]).open(encoding='utf-8') as source:
+    config = yaml.safe_load(source) or {}
+lock_file = config.get('lock_file')
+if not isinstance(lock_file, str) or not lock_file.startswith('/'):
+    raise SystemExit('ERROR: config lock_file must be an absolute path')
+print(lock_file)
+PY
+}
+
+acquire_global_operation_lock() {
+  local lock_file=$1 old_umask
+  python3 - "$lock_file" <<'PY'
+import os
+from pathlib import Path
+import stat
+import sys
+
+path = Path(sys.argv[1])
+parent = path.parent
+metadata = os.lstat(parent)
+if not stat.S_ISDIR(metadata.st_mode):
+    raise SystemExit(f'ERROR: lock parent is not a real directory: {parent}')
+if metadata.st_uid != os.geteuid() or metadata.st_mode & 0o022:
+    raise SystemExit(f'ERROR: lock parent is not private and root-controlled: {parent}')
+try:
+    metadata = os.lstat(path)
+except FileNotFoundError:
+    pass
+else:
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid():
+        raise SystemExit(f'ERROR: lock file is not a root-owned regular file: {path}')
+PY
+  old_umask="$(umask)"
+  umask 077
+  exec {CONFIG_BACKUP_LOCK_FD}<>"$lock_file"
+  umask "$old_umask"
+  chmod 0600 "$lock_file"
+  flock -x "$CONFIG_BACKUP_LOCK_FD"
+}
+
+acquire_consistent_global_operation_lock() {
+  local selected_lock confirmed_lock
+  while true; do
+    selected_lock="$(configured_lock_file)"
+    acquire_global_operation_lock "$selected_lock"
+    confirmed_lock="$(configured_lock_file)"
+    if [[ "$confirmed_lock" == "$selected_lock" ]]; then
+      return 0
+    fi
+    exec {CONFIG_BACKUP_LOCK_FD}>&-
+    CONFIG_BACKUP_LOCK_FD=""
+    continue
+  done
 }
 
 read_recipient() {
@@ -321,7 +570,7 @@ rotate_key() {
   publish_ciphertext_for_user \
     "$WORK_DIR/replacement.zip.age" \
     "$rotation_user" "$rotation_uid" "$rotation_gid" "$archive" replace || \
-    die 're-encryption succeeded, but the archive could not be atomically replaced; the old archive was not changed.'
+    die 're-encryption succeeded, but publication failed; keep the matching new private key and inspect or retry the archive.'
   printf 'Re-encrypted with the new key: %s\n' "$archive"
 }
 
@@ -346,6 +595,9 @@ if (($#)); then
   usage >&2
   exit 2
 fi
+
+command -v flock >/dev/null 2>&1 || die 'flock is required.'
+acquire_consistent_global_operation_lock
 
 for source in \
   /etc/homelab-backup/restic-password \
@@ -392,36 +644,8 @@ case "$choice" in
     # Root reads the system secrets, but never writes into the user-controlled
     # repository. Only the ciphertext is handed to the invoking user.
     runuser --user "$git_user" -- install -d -m 0755 "$CONFIGS_DIR"
-    if [[ -e "$GIT_ARCHIVE" || -L "$GIT_ARCHIVE" ]]; then
-      [[ -f "$GIT_ARCHIVE" && ! -L "$GIT_ARCHIVE" ]] || \
-        die 'existing Git archive must be a real file'
-      publication_mode=replace
-    else
-      publication_mode=create
-    fi
-    publish_ciphertext_for_user \
-      "$WORK_DIR/configs.zip.age" "$git_user" "$git_uid" "$git_gid" \
-      "$GIT_ARCHIVE" "$publication_mode"
-
-    unrelated_staged=()
-    while IFS= read -r -d '' path; do
-      case "$path" in
-        configs/homelab-backup-configs.zip.age) ;;
-        *) unrelated_staged+=("$path") ;;
-      esac
-    done < <("${git_cmd[@]}" diff --cached --name-only -z --)
-    if ((${#unrelated_staged[@]})); then
-      printf 'ERROR: refusing to include unrelated staged changes in the config backup commit:\n' >&2
-      printf '  - %s\n' "${unrelated_staged[@]}" >&2
-      exit 1
-    fi
-    "${git_cmd[@]}" add -f -- configs/homelab-backup-configs.zip.age
-    if "${git_cmd[@]}" diff --cached --quiet -- \
-      configs/homelab-backup-configs.zip.age; then
-      printf 'No encrypted configuration changes to commit.\n'
-    else
-      "${git_cmd[@]}" commit -m "Backup encrypted recovery configs $TIMESTAMP"
-    fi
+    commit_git_archive_transaction \
+      "$WORK_DIR/configs.zip.age" "$git_user" "$git_uid" "$git_gid"
     read -r -p 'Push the current branch to its configured remote? [y/N]: ' do_push
     [[ "$do_push" =~ ^[Yy]$ ]] && "${git_cmd[@]}" push
     ;;

@@ -42,6 +42,54 @@ def _print_command_failure(err, *, context=None):
             print(f'    {line}', file=sys.stderr)
 
 
+class FailureSummary:
+    def __init__(self):
+        self.items = []
+
+    def append(self, operation, error):
+        self.items.append((operation, error))
+
+    def record_exception(
+            self, operation, error, *, message, command_context=None,
+            summary_error=None,
+    ):
+        if command_context is not None and isinstance(error, CommandError):
+            _print_command_failure(error, context=command_context)
+        else:
+            print(message.format(error=error), file=sys.stderr)
+        self.append(operation, summary_error or str(error))
+
+    def raise_if_any(self, title):
+        if not self.items:
+            return
+        print(f'\n{title}', file=sys.stderr)
+        for operation, error in self.items:
+            print(f'  - {operation}: {error}', file=sys.stderr)
+        raise SystemExit(1)
+
+
+def run_cleanup(action, context):
+    """Run cleanup without replacing an exception already in flight."""
+    primary_error = sys.exc_info()[1]
+    try:
+        action()
+    except Exception as cleanup_error:
+        if primary_error is None:
+            raise
+        message = f'{context} cleanup also failed'
+        if isinstance(cleanup_error, CommandError):
+            _print_command_failure(cleanup_error, context=message)
+        else:
+            print(
+                f'ERROR: {message}: {type(cleanup_error).__name__}: {cleanup_error}',
+                file=sys.stderr,
+            )
+        if hasattr(primary_error, 'add_note'):
+            primary_error.add_note(
+                f'{message}: {type(cleanup_error).__name__}: {cleanup_error}'
+            )
+
+
 def run(cmd, *, cwd=None, env=None, check=True, capture=False, pass_fds=()):
     printable = ' '.join(shlex.quote(str(x)) for x in cmd)
     print('+', printable)
@@ -80,14 +128,23 @@ def restic_env(c):
 
 
 class GlobalLock:
+    _held = {}
+
     def __init__(self, path, nonblocking=False):
         self.path = Path(path)
         self.nonblocking = nonblocking
         self.handle = None
+        self._key = (os.getpid(), os.path.abspath(self.path))
+        self._nested = False
 
     def __enter__(self):
         from .security import ensure_control_directory
 
+        held = self._held.get(self._key)
+        if held is not None:
+            held['depth'] += 1
+            self._nested = True
+            return True
         ensure_control_directory(self.path.parent)
         parent_fd = os.open(
             self.path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
@@ -114,9 +171,17 @@ class GlobalLock:
         self.handle.truncate()
         self.handle.write(f'pid={os.getpid()} started={dt.datetime.now().astimezone().isoformat()}\n')
         self.handle.flush()
+        self._held[self._key] = {'depth': 1, 'handle': self.handle}
         return True
 
     def __exit__(self, exc_type, exc, tb):
-        if self.handle:
-            fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
-            self.handle.close()
+        held = self._held.get(self._key)
+        if held is None:
+            return
+        held['depth'] -= 1
+        if held['depth']:
+            return
+        self._held.pop(self._key, None)
+        handle = held['handle']
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
