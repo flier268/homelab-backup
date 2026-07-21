@@ -138,11 +138,10 @@ docker compose version</code></pre>
 <p>Compose 專案統一放在：</p>
 <pre><code>/srv/stacks/&lt;service&gt;</code></pre>
 <p>建立 root 控制目錄。manifest、Compose files 與其父目錄不可由一般使用者寫入；需要修改時使用 <code>sudoedit</code>：</p>
-<pre><code>sudo mkdir -p /srv/stacks
-sudo chown -R root:root /srv/stacks
+<pre><code>sudo install -d -o root -g root -m 755 /srv/stacks /srv/stacks/&lt;service&gt;
 sudo chmod 755 /srv /srv/stacks
 sudoedit /srv/stacks/&lt;service&gt;/backup.yaml</code></pre>
-<div class="box warn"><code>backup.yaml</code> 可宣告由 root 執行的 consistency hooks，因此服務目錄不能交給一般帳號或設成 group/world writable。容器資料請放在另外列入 <code>trusted_data_roots</code> 的 managed leaf，例如 <code>/srv/data/&lt;service&gt;</code>。</div>
+<div class="box warn"><code>backup.yaml</code> 可宣告由 root 執行的 consistency hooks，因此服務目錄與控制檔不能交給一般帳號或設成 group/world writable。服務目錄下的資料子樹則可由容器 UID/GID 擁有；不要對混有容器資料的目錄使用遞迴 <code>chown</code>。</div>
 <p>建議結構：</p>
 <pre><code>/srv/stacks/
 ├── minecraft/
@@ -397,7 +396,8 @@ sources:
         - crash-reports/**</code></pre>
 <h3>路徑來源的安全邊界</h3>
 <ul>
-<li>每個 path 必須是完整 managed leaf，且必須嚴格位於 trusted root 之下，不能等於 trusted root。從系統 root 到 leaf parent 的目錄都必須由 root 擁有、不可 group/world write 且不是 symlink；leaf 目錄內可由容器 UID/GID 擁有。容器可寫資料樹中的深層檔案不能再作為獨立 target。</li>
+<li>每個 path 必須嚴格位於唯一的 trusted root 之下，不能等於 trusted root。trusted root 與其控制路徑必須由 root 擁有、不可 group/world write 且不是 symlink；其下的資料樹可完全由容器 UID/GID 擁有，也可選取其中任意深層路徑。程式從 trusted root 的固定 descriptor 逐層開啟來源與還原目標，中間 symlink 會被拒絕，可寫祖先被換名也不會把 root 寫入導向外部。</li>
+<li>備份會自動在 snapshot inventory 記錄所選路徑祖先的數字 UID/GID 與 mode。全新 rebuild 缺少資料祖先時會依原值重建，不會猜成 <code>root:root</code> 或 <code>1000:1000</code>，manifest 不需增加欄位。沒有這項 metadata 的舊快照仍可還原到祖先已存在的部署，但不會在全新 rebuild 時猜測權限。</li>
 <li><code>sources.paths</code> 指到 symlink 時，只保存 link 物件與其目標字串；目標是檔案、目錄或不存在（dangling）都不會被跟隨。</li>
 <li>真實目錄內的 symlink 同樣由 rsync 以 link 保存。還原時會替換目標位置的 leaf 物件，不會沿著現場 symlink 寫入其 referent。</li>
 <li>只支援 ext4、xfs 與 Btrfs。trusted root 可為核准 filesystem mount 或已掛載 Btrfs subvolume，但其下不允許其他 mount、bind mount或 nested Btrfs subvolume。</li>
@@ -644,7 +644,7 @@ filesystem 至少保留 1 GiB。空間不足時預設中止；只有人工操作
 <h3><code>backup.yaml</code> 的還原規則</h3>
 <ul>
 <li>現有部署：本機 manifest 與所有 Compose files 都存在；snapshot inventory 必須與本機 project name、path/source declarations、volume mapping、volume 名稱及 labels 相符後才可覆寫。Compose service 清單只供診斷，新增或移除 service 不會單獨阻止舊 snapshot 還原。</li>
-<li>全新重建：manifest、Compose files、所有 present path與 named volume 都必須不存在，且 snapshot 中必須包含所有 required Compose file path source；資料完成後才發布 Compose files與 manifest。若發布完成前失敗，會嘗試移除本次新建的 path 與 volume，使同一還原可以重跑；rollback 自身失敗時會保留原始錯誤並另外回報 cleanup 錯誤。</li>
+<li>全新重建：manifest、Compose files、所有 present path與 named volume 都必須不存在，且 snapshot 中必須包含所有 required Compose file path source；資料完成後才發布 Compose files與 manifest。目錄 path 會先在私有暫存目錄完整準備再原子發布。若發布完成前失敗，會嘗試移除本次新建的 path 與 volume，使同一還原可以重跑；rollback 自身失敗時會保留原始錯誤並另外回報 cleanup 錯誤。若 path 在發布後被其他程序修改，或新建祖先已出現其他內容，則保留該路徑並警告，避免刪除外部寫入。</li>
 <li>只有部分設定或 target 存在、project identity 不明、或有其他 container 引用 target時，一律拒絕，不猜測身份也不覆寫。</li>
 <li><code>--restore-manifest</code> 只允許更新與本機安全投影一致的 snapshot manifest。</li>
 <li>可用 <code>--keep-manifest</code> 強制保留本機 manifest。</li>

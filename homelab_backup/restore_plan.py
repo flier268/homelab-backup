@@ -8,7 +8,7 @@ from .restore_inventory import (
     load_restore_inventory, restored_path_details, validate_restore_inventory,
     validate_restore_path_separation, validate_restore_sources,
 )
-from .security import lexical_absolute, validate_managed_leaf
+from .security import lexical_absolute, validate_data_parent, validate_data_path
 from .storage import (
     compose_identity, docker_mount_conflicts, docker_project_containers,
     docker_volume_exists, resolved_volume_sources, running_services,
@@ -133,7 +133,10 @@ def _validate_path_targets(c, m, inventory, mode):
         entry = next(item for item in inventory['paths'] if item['id'] == source['id'])
         target = source_path(m, source)
         trusted_roots = c.get('trusted_data_roots') or [str(Path(target).parent)]
-        validate_managed_leaf(target, trusted_roots, allow_missing=mode == 'rebuild')
+        if mode == 'rebuild':
+            validate_data_parent(target, trusted_roots, allow_missing=True)
+        else:
+            validate_data_path(target, trusted_roots)
         exists = target.exists() or target.is_symlink()
         if not entry['present']:
             if mode == 'rebuild' and exists:

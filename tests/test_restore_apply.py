@@ -1,4 +1,6 @@
 import json
+import os
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,6 +13,169 @@ from tests.helpers import manifest, path_inventory, write_restore_inventory
 
 
 class RestoreSourceTests(unittest.TestCase):
+    def test_existing_nested_target_may_be_inside_container_owned_data_tree(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            restored = base / 'restore'
+            staged = restored / 'paths' / 'saved'
+            staged.mkdir(parents=True)
+            (staged / 'world.sav').write_text('snapshot', encoding='utf-8')
+            data_root = base / 'palworld'
+            target = data_root / 'Pal' / 'Saved'
+            target.mkdir(parents=True)
+            (target / 'world.sav').write_text('old', encoding='utf-8')
+            data_root.chmod(0o777)
+            (data_root / 'Pal').chmod(0o777)
+            source = {'id': 'saved', 'path': str(target)}
+            try:
+                restore_apply.restore_path_source(
+                    {'_dir': str(base)}, restored, source,
+                    {'paths': [{
+                        'id': 'saved', 'path': str(target),
+                        'type': 'directory', 'present': True,
+                    }]},
+                    c={'trusted_data_roots': [str(base)]},
+                )
+            finally:
+                (data_root / 'Pal').chmod(0o755)
+                data_root.chmod(0o755)
+
+            self.assertEqual(
+                (target / 'world.sav').read_text(encoding='utf-8'), 'snapshot',
+            )
+
+    def test_restore_keeps_writing_to_pinned_target_after_parent_swap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            restored = base / 'restore'
+            staged = restored / 'paths' / 'saved'
+            staged.mkdir(parents=True)
+            (staged / 'world.sav').write_text('snapshot', encoding='utf-8')
+            parent = base / 'palworld' / 'Pal'
+            target = parent / 'Saved'
+            target.mkdir(parents=True)
+            victim = base / 'victim'
+            (victim / 'Saved').mkdir(parents=True)
+            (victim / 'Saved' / 'world.sav').write_text('victim', encoding='utf-8')
+            source = {'id': 'saved', 'path': str(target)}
+            real_run = common.run
+            swapped = False
+
+            def swap_then_run(command, **kwargs):
+                nonlocal swapped
+                if not swapped:
+                    moved = parent.with_name('Pal-moved')
+                    parent.rename(moved)
+                    parent.symlink_to(victim, target_is_directory=True)
+                    swapped = True
+                return real_run(command, **kwargs)
+
+            with mock.patch.object(
+                restore_apply, 'run', side_effect=swap_then_run,
+            ):
+                restore_apply.restore_path_source(
+                    {'_dir': str(base)}, restored, source,
+                    {'paths': [{
+                        'id': 'saved', 'path': str(target),
+                        'type': 'directory', 'present': True,
+                    }]},
+                    c={'trusted_data_roots': [str(base)]},
+                )
+
+            self.assertEqual(
+                (base / 'palworld' / 'Pal-moved' / 'Saved' / 'world.sav').read_text(
+                    encoding='utf-8',
+                ),
+                'snapshot',
+            )
+            self.assertEqual(
+                (victim / 'Saved' / 'world.sav').read_text(encoding='utf-8'),
+                'victim',
+            )
+
+    def test_rebuild_recreates_missing_data_ancestors_with_snapshot_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            restored = base / 'restore'
+            staged = restored / 'paths' / 'saved'
+            staged.mkdir(parents=True)
+            (staged / 'world.sav').write_text('snapshot', encoding='utf-8')
+            target = base / 'palworld' / 'Pal' / 'Saved'
+            source = {'id': 'saved', 'path': str(target)}
+            ids = {'uid': os.geteuid(), 'gid': os.getegid()}
+            inventory = {'paths': [{
+                'id': 'saved', 'path': str(target),
+                'type': 'directory', 'present': True,
+                'ancestors': [
+                    {'path': 'palworld', 'mode': 0o750, **ids},
+                    {'path': 'palworld/Pal', 'mode': 0o770, **ids},
+                ],
+            }]}
+
+            restore_apply.restore_path_source(
+                {'_dir': str(base)}, restored, source, inventory,
+                c={'trusted_data_roots': [str(base)]}, rebuild=True,
+            )
+
+            self.assertEqual(
+                stat.S_IMODE((base / 'palworld').stat().st_mode), 0o750,
+            )
+            self.assertEqual(
+                stat.S_IMODE((base / 'palworld' / 'Pal').stat().st_mode), 0o770,
+            )
+            self.assertEqual(target.joinpath('world.sav').read_text(), 'snapshot')
+
+    def test_rebuild_old_snapshot_refuses_to_guess_missing_ancestor_owner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            restored = base / 'restore'
+            staged = restored / 'paths' / 'saved'
+            staged.mkdir(parents=True)
+            target = base / 'palworld' / 'Pal' / 'Saved'
+            source = {'id': 'saved', 'path': str(target)}
+
+            with self.assertRaisesRegex(RuntimeError, 'lacks metadata'):
+                restore_apply.restore_path_source(
+                    {'_dir': str(base)}, restored, source,
+                    {'paths': [{
+                        'id': 'saved', 'path': str(target),
+                        'type': 'directory', 'present': True,
+                    }]},
+                    c={'trusted_data_roots': [str(base)]}, rebuild=True,
+                )
+
+    def test_rebuild_directory_is_not_published_until_rsync_succeeds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            restored = base / 'restore'
+            staged = restored / 'paths' / 'saved'
+            staged.mkdir(parents=True)
+            (staged / 'world.sav').write_text('snapshot', encoding='utf-8')
+            target = base / 'palworld' / 'Saved'
+            target.mkdir(parents=True)
+            source = {'id': 'saved', 'path': str(target)}
+
+            def write_partial_then_fail(command, *, pass_fds=(), **_kwargs):
+                destination_fd = pass_fds[0]
+                Path(f'/proc/self/fd/{destination_fd}/partial').write_text(
+                    'partial', encoding='utf-8',
+                )
+                raise RuntimeError('rsync failed')
+
+            with mock.patch.object(
+                restore_apply, 'run', side_effect=write_partial_then_fail,
+            ), self.assertRaisesRegex(RuntimeError, 'rsync failed'):
+                restore_apply.restore_path_source(
+                    {'_dir': str(base)}, restored, source,
+                    {'paths': [{
+                        'id': 'saved', 'path': str(target),
+                        'type': 'directory', 'present': True,
+                    }]},
+                    c={'trusted_data_roots': [str(base)]}, rebuild=True,
+                )
+
+            self.assertEqual(list(target.iterdir()), [])
+
     def test_missing_required_path_aborts(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / 'restore'
@@ -120,11 +285,14 @@ class RestoreSourceTests(unittest.TestCase):
                 'id': 'data', 'path': str(Path(tmp) / 'target'),
                 'exclude': ['logs/**'],
             }
-            with mock.patch.object(restore_apply, 'rsync') as rsync_mock:
+            target = Path(tmp) / 'target'
+            target.mkdir()
+            with mock.patch.object(restore_apply, 'run') as run_mock:
                 restore_apply.restore_path_source(
                     {'_dir': tmp}, root, source, path_inventory(source),
                 )
-            self.assertEqual(rsync_mock.call_args.args[2], ['logs/**'])
+            self.assertIn('--exclude', run_mock.call_args.args[0])
+            self.assertIn('logs/**', run_mock.call_args.args[0])
 
     def test_volume_restore_preserves_excluded_targets(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -155,7 +323,9 @@ class RestoreSourceTests(unittest.TestCase):
             inventory = {'paths': [{
                 'id': 'env', 'path': 'old.env', 'type': 'file',
             }]}
-            with mock.patch.object(restore_apply, 'run') as run_mock:
+            with mock.patch.object(
+                restore_apply, 'run', wraps=common.run,
+            ) as run_mock:
                 restore_apply.restore_path_source(
                     {'_dir': tmp}, root, source, inventory,
                 )
@@ -554,7 +724,6 @@ class RestoreApplyLifecycleTests(unittest.TestCase):
             )
 
             def fail_after_creating_target(*_args, **_kwargs):
-                (target / 'partial').write_text('partial', encoding='utf-8')
                 raise RuntimeError('restore failed')
 
             def create_volume(name, *, on_created, **_kwargs):
@@ -585,6 +754,95 @@ class RestoreApplyLifecycleTests(unittest.TestCase):
                 [call.args[0] for call in run_mock.call_args_list],
             )
 
+    def test_rebuild_rollback_preserves_concurrent_target_content(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service_dir = root / 'trusted' / 'demo'
+            service_dir.mkdir(parents=True)
+            target = service_dir / 'data'
+            source = {'id': 'data', 'path': 'data'}
+            value = {
+                '_dir': str(service_dir),
+                '_path': str(service_dir / 'backup.yaml'),
+                'service': 'demo',
+                'sources': {'paths': [source], 'volumes': []},
+            }
+            plan = restore_plan.RestorePlan(
+                root,
+                {'paths': [{**source, 'present': True, 'type': 'directory'}]},
+                value, 'rebuild', (), (), (), (), 'demo',
+            )
+
+            def publish_then_receive_external_write(*_args, **kwargs):
+                (target / 'restored').write_text('snapshot', encoding='utf-8')
+                metadata = target.stat()
+                kwargs['on_publish']((metadata.st_dev, metadata.st_ino))
+                (target / 'foreign').write_text('keep', encoding='utf-8')
+                raise RuntimeError('later restore failed')
+
+            with mock.patch.object(
+                restore_apply, 'prepare_restore_plan', return_value=plan,
+            ), mock.patch.object(
+                restore_apply, '_dynamic_preflight',
+            ), mock.patch.object(
+                restore_apply, 'restore_path_source',
+                side_effect=publish_then_receive_external_write,
+            ), self.assertRaisesRegex(RuntimeError, 'later restore failed'):
+                restore_apply.apply_one(
+                    {'trusted_data_roots': [str(root / 'trusted')]},
+                    value, root,
+                )
+
+            self.assertEqual(
+                (target / 'foreign').read_text(encoding='utf-8'), 'keep',
+            )
+
+    def test_rebuild_rollback_removes_created_ancestors_only_when_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            trusted = root / 'trusted'
+            trusted.mkdir()
+            service_dir = trusted / 'demo'
+            target = service_dir / 'data'
+            source = {'id': 'data', 'path': 'data'}
+            value = {
+                '_dir': str(service_dir),
+                '_path': str(service_dir / 'backup.yaml'),
+                'service': 'demo',
+                'sources': {'paths': [source], 'volumes': []},
+            }
+            ids = {'uid': os.geteuid(), 'gid': os.getegid()}
+            plan = restore_plan.RestorePlan(
+                root,
+                {'paths': [{
+                    **source, 'present': True, 'type': 'directory',
+                    'ancestors': [{
+                        'path': 'demo', 'mode': 0o777, **ids,
+                    }],
+                }]},
+                value, 'rebuild', (), (), (), (), 'demo',
+            )
+
+            def receive_external_write(*_args, **_kwargs):
+                (service_dir / 'foreign').write_text('keep', encoding='utf-8')
+                raise RuntimeError('restore failed')
+
+            with mock.patch.object(
+                restore_apply, 'prepare_restore_plan', return_value=plan,
+            ), mock.patch.object(
+                restore_apply, '_dynamic_preflight',
+            ), mock.patch.object(
+                restore_apply, 'restore_path_source',
+                side_effect=receive_external_write,
+            ), self.assertRaisesRegex(RuntimeError, 'restore failed'):
+                restore_apply.apply_one(
+                    {'trusted_data_roots': [str(trusted)]}, value, root,
+                )
+
+            self.assertEqual(
+                (service_dir / 'foreign').read_text(encoding='utf-8'), 'keep',
+            )
+
     def test_rebuild_rollback_removes_partial_file_created_by_this_restore(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -606,9 +864,11 @@ class RestoreApplyLifecycleTests(unittest.TestCase):
                 value, 'rebuild', (), (), (), (), 'demo',
             )
 
-            def partial_restore(*_args, **_kwargs):
+            def partial_restore(*_args, **kwargs):
                 target.unlink(missing_ok=True)
                 target.write_text('partial restore output', encoding='utf-8')
+                metadata = target.stat()
+                kwargs['on_publish']((metadata.st_dev, metadata.st_ino))
                 raise RuntimeError('restore failed')
 
             with mock.patch.object(

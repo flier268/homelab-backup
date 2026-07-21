@@ -1,5 +1,7 @@
+import errno
 import os
 import secrets
+import stat
 import sys
 from pathlib import Path
 
@@ -20,12 +22,13 @@ from .restore_plan import (
     validate_restore_sources,
 )
 from .security import (
-    atomic_copy_file, clear_control_leaf, ensure_control_parent,
-    validate_control_directory, validate_managed_leaf, validate_payload,
+    atomic_copy_file, clear_control_leaf, data_object_metadata_state,
+    data_object_state, ensure_control_parent, open_data_parent, open_data_path,
+    remove_data_entry, validate_data_parent, validate_data_path, validate_payload,
 )
 from .storage import (
     create_restore_volume, docker_mount_conflicts, docker_project_containers,
-    docker_volume_exists, rsync, sync_volumes, validate_volume_identity,
+    docker_volume_exists, sync_volumes, validate_volume_identity,
     volume_owned_by_operation,
 )
 from .types import GlobalConfig, ServiceManifest
@@ -38,22 +41,154 @@ def compose_files_exist(m):
     )
 
 
-def normalize_restore_target(target, source_type):
-    target = Path(target)
-    if target.is_symlink():
-        clear_control_leaf(target)
+def normalize_restore_target(parent_fd, name, source_type):
+    try:
+        metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
         return
-    if not target.exists():
-        return
-    if source_type in ('file', 'symlink') and target.is_dir():
-        clear_control_leaf(target)
-    elif source_type == 'directory' and target.is_file():
-        clear_control_leaf(target)
-    elif not (target.is_file() or target.is_dir()):
-        raise RuntimeError(f'unsupported live target type: {target}')
+    compatible = (
+        source_type == 'directory' and stat.S_ISDIR(metadata.st_mode)
+        or source_type == 'file' and stat.S_ISREG(metadata.st_mode)
+        or source_type == 'symlink' and stat.S_ISLNK(metadata.st_mode)
+    )
+    if not compatible:
+        remove_data_entry(parent_fd, name)
 
 
-def restore_path_source(m, root, source, inventory, *, c=None, rebuild=False):
+def _restore_non_directory(restored, parent_fd, name, *, on_publish=None):
+    temporary = None
+    temporary_fd = -1
+    temporary_identity = None
+    try:
+        for _attempt in range(16):
+            candidate = f'.backupctl-restore-{secrets.token_hex(8)}'
+            try:
+                os.mkdir(candidate, 0o700, dir_fd=parent_fd)
+            except FileExistsError:
+                continue
+            initial = os.stat(
+                candidate, dir_fd=parent_fd, follow_symlinks=False,
+            )
+            temporary_fd = os.open(
+                candidate,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=parent_fd,
+            )
+            opened = os.fstat(temporary_fd)
+            if (initial.st_dev, initial.st_ino) != (opened.st_dev, opened.st_ino):
+                raise RuntimeError(
+                    'restore publication directory changed while being opened'
+                )
+            temporary = candidate
+            temporary_identity = (opened.st_dev, opened.st_ino)
+            break
+        if temporary_fd < 0:
+            raise RuntimeError('cannot reserve a restore publication directory')
+        run([
+            'rsync', '-aHAX', '--numeric-ids', str(restored),
+            f'/proc/self/fd/{temporary_fd}/payload',
+        ], pass_fds=(temporary_fd,))
+        payload_fd = os.open(
+            'payload', os.O_PATH | os.O_NOFOLLOW, dir_fd=temporary_fd,
+        )
+        published = os.fstat(payload_fd)
+        os.replace(
+            'payload', name,
+            src_dir_fd=temporary_fd, dst_dir_fd=parent_fd,
+        )
+        identity = (published.st_dev, published.st_ino)
+        try:
+            if on_publish is not None:
+                on_publish(identity, data_object_state(payload_fd))
+        finally:
+            os.close(payload_fd)
+        os.fsync(parent_fd)
+        return identity
+    finally:
+        if temporary_fd >= 0:
+            try:
+                remove_data_entry(temporary_fd, 'payload')
+            finally:
+                os.close(temporary_fd)
+        if temporary is not None:
+            try:
+                metadata = os.stat(
+                    temporary, dir_fd=parent_fd, follow_symlinks=False,
+                )
+                if stat.S_ISDIR(metadata.st_mode) and \
+                        (metadata.st_dev, metadata.st_ino) == temporary_identity:
+                    os.rmdir(temporary, dir_fd=parent_fd)
+            except (FileNotFoundError, OSError):
+                pass
+
+
+def _restore_rebuild_directory(
+        restored, parent_fd, name, excludes, *, on_publish=None,
+):
+    temporary = None
+    temporary_fd = -1
+    temporary_identity = None
+    try:
+        for _attempt in range(16):
+            candidate = f'.backupctl-restore-{secrets.token_hex(8)}'
+            try:
+                os.mkdir(candidate, 0o700, dir_fd=parent_fd)
+            except FileExistsError:
+                continue
+            initial = os.stat(
+                candidate, dir_fd=parent_fd, follow_symlinks=False,
+            )
+            temporary_fd = os.open(
+                candidate,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=parent_fd,
+            )
+            opened = os.fstat(temporary_fd)
+            if (initial.st_dev, initial.st_ino) != (opened.st_dev, opened.st_ino):
+                raise RuntimeError(
+                    'restore publication directory changed while being opened'
+                )
+            temporary = candidate
+            temporary_identity = (opened.st_dev, opened.st_ino)
+            break
+        if temporary_fd < 0:
+            raise RuntimeError('cannot reserve a restore publication directory')
+        command = ['rsync', '-aHAX', '--numeric-ids', '--delete']
+        for item in excludes or []:
+            command += ['--exclude', item]
+        command += [f'{restored}/', f'/proc/self/fd/{temporary_fd}/']
+        run(command, pass_fds=(temporary_fd,))
+        prepared_state = data_object_state(temporary_fd)
+        os.replace(
+            temporary, name,
+            src_dir_fd=parent_fd, dst_dir_fd=parent_fd,
+        )
+        temporary = None
+        published_state = (
+            data_object_metadata_state(temporary_fd), prepared_state[1],
+        )
+        if on_publish is not None:
+            on_publish(temporary_identity, published_state)
+        os.fsync(parent_fd)
+        return temporary_identity
+    finally:
+        if temporary_fd >= 0:
+            os.close(temporary_fd)
+        if temporary is not None:
+            try:
+                metadata = os.stat(
+                    temporary, dir_fd=parent_fd, follow_symlinks=False,
+                )
+                if stat.S_ISDIR(metadata.st_mode) and \
+                        (metadata.st_dev, metadata.st_ino) == temporary_identity:
+                    remove_data_entry(parent_fd, temporary)
+            except (FileNotFoundError, OSError):
+                pass
+
+
+def restore_path_source(
+        m, root, source, inventory, *, c=None, rebuild=False, on_publish=None,
+):
     source_type, restored, target = restored_path_details(m, root, source, inventory)
     if source_type == 'missing':
         if source.get('required', True):
@@ -67,29 +202,55 @@ def restore_path_source(m, root, source, inventory, *, c=None, rebuild=False):
         raise RuntimeError(f'restored directory artifact is missing: {restored}')
     direct_library_call = c is None
     c = c or {'trusted_data_roots': [str(Path(target).parent)]}
-    validate_managed_leaf(
-        target, c['trusted_data_roots'],
-        allow_missing=rebuild or direct_library_call,
-    )
-    validate_payload(restored)
-    if rebuild:
-        ensure_control_parent(target.parent, c['trusted_data_roots'])
-        validate_control_directory(target.parent)
-    if source_type == 'file':
-        normalize_restore_target(target, source_type)
-        run(['rsync', '-aHAX', '--numeric-ids', str(restored), str(target)])
-        return
-
-    if source_type == 'symlink':
-        normalize_restore_target(target, source_type)
-        run(['rsync', '-aHAX', '--numeric-ids', str(restored), str(target)])
-        return
-
-    if restored.is_dir() and not restored.is_symlink():
-        normalize_restore_target(target, source_type)
-        rsync(restored, target, source.get('exclude'))
+    if direct_library_call:
+        try:
+            validate_data_path(target, c['trusted_data_roots'])
+        except FileNotFoundError:
+            pass
+    elif rebuild:
+        validate_data_parent(target, c['trusted_data_roots'], allow_missing=True)
     else:
-        raise RuntimeError(f'restored directory artifact is missing: {restored}')
+        validate_data_path(target, c['trusted_data_roots'])
+    validate_payload(restored)
+    entry = next(item for item in inventory['paths'] if item['id'] == source['id'])
+    parent_fd, name = open_data_parent(
+        target, c['trusted_data_roots'],
+        create_metadata=entry.get('ancestors') if rebuild else None,
+    )
+    try:
+        normalize_restore_target(parent_fd, name, source_type)
+        if source_type in ('file', 'symlink'):
+            return _restore_non_directory(
+                restored, parent_fd, name, on_publish=on_publish,
+            )
+        if rebuild:
+            return _restore_rebuild_directory(
+                restored, parent_fd, name, source.get('exclude'),
+                on_publish=on_publish,
+            )
+        try:
+            os.mkdir(name, 0o700, dir_fd=parent_fd)
+        except FileExistsError:
+            pass
+        target_fd = os.open(
+            name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+        try:
+            command = ['rsync', '-aHAX', '--numeric-ids', '--delete']
+            for item in source.get('exclude', []):
+                command += ['--exclude', item]
+            command += [f'{restored}/', f'/proc/self/fd/{target_fd}/']
+            run(command, pass_fds=(target_fd,))
+            metadata = os.fstat(target_fd)
+            identity = (metadata.st_dev, metadata.st_ino)
+            if on_publish is not None:
+                on_publish(identity, data_object_state(target_fd))
+            return identity
+        finally:
+            os.close(target_fd)
+    finally:
+        os.close(parent_fd)
 
 
 def _stop_running_services(plan):
@@ -129,10 +290,11 @@ def _dynamic_preflight(c, plan):
         )
     for source in (plan.manifest.get('sources') or {}).get('paths', []):
         target = source_path(plan.manifest, source)
-        validate_managed_leaf(
-            target, c.get('trusted_data_roots') or [str(Path(target).parent)],
-            allow_missing=plan.mode == 'rebuild',
-        )
+        trusted_roots = c.get('trusted_data_roots') or [str(Path(target).parent)]
+        if plan.mode == 'rebuild':
+            validate_data_parent(target, trusted_roots, allow_missing=True)
+        else:
+            validate_data_path(target, trusted_roots)
         entry = next(
             item for item in plan.inventory['paths'] if item['id'] == source['id']
         )
@@ -169,24 +331,43 @@ def _path_identity(path):
     return metadata.st_dev, metadata.st_ino
 
 
-def _claim_rebuild_path(c, target, source_type, claim):
-    ensure_control_parent(target.parent, c['trusted_data_roots'])
-    validate_control_directory(target.parent)
-    if source_type == 'directory':
-        os.mkdir(target, 0o700)
-        claim['owned'] = True
-    else:
-        descriptor = os.open(
-            target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-            0o600,
-        )
-        claim['owned'] = True
-        claim['identity'] = (
-            os.fstat(descriptor).st_dev, os.fstat(descriptor).st_ino,
-        )
-        os.close(descriptor)
-    if claim['identity'] is None:
-        claim['identity'] = _path_identity(target)
+def _claim_rebuild_path(
+        c, target, source_type, ancestors, claim, changed_targets,
+):
+    def ancestor_created(path, identity):
+        changed_targets.append({
+            'kind': 'data_ancestor', 'path': str(path),
+            'identity': identity, 'owned': True,
+            'trusted_roots': tuple(c['trusted_data_roots']),
+        })
+
+    parent_fd, name = open_data_parent(
+        target, c['trusted_data_roots'], create_metadata=ancestors,
+        on_create=ancestor_created,
+    )
+    try:
+        if source_type == 'directory':
+            os.mkdir(name, 0o700, dir_fd=parent_fd)
+            descriptor = os.open(
+                name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=parent_fd,
+            )
+        else:
+            descriptor = os.open(
+                name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600, dir_fd=parent_fd,
+            )
+        try:
+            metadata = os.fstat(descriptor)
+            claim.update(
+                owned=True, identity=(metadata.st_dev, metadata.st_ino),
+                state=data_object_state(descriptor),
+            )
+        finally:
+            os.close(descriptor)
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
 
 
 def _restore_data(c, plan, changed_targets, operation_id):
@@ -207,30 +388,50 @@ def _restore_data(c, plan, changed_targets, operation_id):
     for source in (plan.manifest.get('sources') or {}).get('paths', []):
         if source['id'] not in plan.deferred_sources:
             claim = None
+            target = source_path(plan.manifest, source)
             if plan.mode == 'rebuild':
                 source_type, _restored, target = restored_path_details(
                     plan.manifest, plan.root, source, plan.inventory,
                 )
                 if source_type != 'missing':
                     claim = {
-                        'kind': 'path', 'path': str(target),
-                        'identity': None, 'owned': False,
+                        'kind': 'data_path', 'path': str(target),
+                        'identity': None, 'state': None,
+                        'owned': False,
+                        'trusted_roots': tuple(c['trusted_data_roots']),
                     }
+                    entry = next(
+                        item for item in plan.inventory['paths']
+                        if item['id'] == source['id']
+                    )
+                    _claim_rebuild_path(
+                        c, target, source_type, entry.get('ancestors'),
+                        claim, changed_targets,
+                    )
                     changed_targets.append(claim)
-                    _claim_rebuild_path(c, target, source_type, claim)
             else:
                 changed_targets.append(str(source_path(plan.manifest, source)))
-            try:
-                restore_path_source(
-                    plan.manifest, plan.root, source, plan.inventory,
-                    c=c, rebuild=plan.mode == 'rebuild',
-                )
-            finally:
-                if claim is not None and claim['owned']:
+
+            def path_published(identity, state=None, *, claim=claim, target=target):
+                if claim is None:
+                    return
+                if state is None:
+                    descriptor, _metadata = open_data_path(
+                        target, claim['trusted_roots'],
+                    )
                     try:
-                        claim['identity'] = _path_identity(Path(claim['path']))
-                    except FileNotFoundError:
-                        claim['owned'] = False
+                        state = data_object_state(descriptor)
+                    finally:
+                        os.close(descriptor)
+                claim.update(
+                    identity=identity, state=state,
+                )
+
+            restore_path_source(
+                plan.manifest, plan.root, source, plan.inventory,
+                c=c, rebuild=plan.mode == 'rebuild',
+                on_publish=path_published if claim is not None else None,
+            )
     if plan.mode != 'rebuild':
         changed_targets.extend(f'volume:{name}' for _source, name in plan.volumes)
     sync_volumes(c, plan.manifest, plan.root, restore=True, resolved=plan.volumes)
@@ -253,6 +454,77 @@ def _rollback_rebuild(changed_targets):
         path = Path(target['path'])
         if not target['owned']:
             return
+        if target['kind'] == 'data_ancestor':
+            try:
+                parent_fd, name = open_data_parent(
+                    path, target['trusted_roots'],
+                )
+            except FileNotFoundError:
+                return
+            try:
+                try:
+                    metadata = os.stat(
+                        name, dir_fd=parent_fd, follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    return
+                if (metadata.st_dev, metadata.st_ino) != target['identity']:
+                    print(
+                        f'WARNING: preserving rebuild ancestor whose ownership '
+                        f'changed: {path}', file=sys.stderr,
+                    )
+                    return
+                try:
+                    os.rmdir(name, dir_fd=parent_fd)
+                    os.fsync(parent_fd)
+                except OSError as err:
+                    if err.errno not in (errno.ENOTEMPTY, errno.EEXIST):
+                        raise
+                    print(
+                        f'WARNING: preserving non-empty rebuild ancestor: {path}',
+                        file=sys.stderr,
+                    )
+                return
+            finally:
+                os.close(parent_fd)
+        if target['kind'] == 'data_path':
+            try:
+                parent_fd, name = open_data_parent(
+                    path, target['trusted_roots'],
+                )
+            except FileNotFoundError:
+                return
+            try:
+                try:
+                    metadata = os.stat(
+                        name, dir_fd=parent_fd, follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    return
+                current_identity = (metadata.st_dev, metadata.st_ino)
+                if current_identity != target['identity']:
+                    print(
+                        f'WARNING: preserving rebuild target whose ownership '
+                        f'changed: {path}', file=sys.stderr,
+                    )
+                    return
+                descriptor, _metadata = open_data_path(
+                    path, target['trusted_roots'],
+                )
+                try:
+                    current_state = data_object_state(descriptor)
+                finally:
+                    os.close(descriptor)
+                if current_state != target['state']:
+                    print(
+                        f'WARNING: preserving rebuild target modified after '
+                        f'publication: {path}', file=sys.stderr,
+                    )
+                    return
+                remove_data_entry(parent_fd, name)
+                return
+            finally:
+                os.close(parent_fd)
         try:
             current_identity = _path_identity(path)
         except FileNotFoundError:

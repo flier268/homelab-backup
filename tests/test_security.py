@@ -108,35 +108,38 @@ class RuntimeCredentialTests(unittest.TestCase):
                 common.restic_env(config)
 
 
-class ManagedLeafTests(unittest.TestCase):
-    def test_trusted_root_itself_is_not_a_managed_leaf(self):
+class DataPathTests(unittest.TestCase):
+    def test_container_owned_ancestors_are_allowed_below_trusted_root(self):
         with tempfile.TemporaryDirectory() as tmp:
             trusted = Path(tmp) / 'data'
+            saved = trusted / 'palworld' / 'Pal' / 'Saved'
+            saved.mkdir(parents=True)
+            (saved / 'world.sav').write_text('world', encoding='utf-8')
+            (trusted / 'palworld').chmod(0o777)
+            (trusted / 'palworld' / 'Pal').chmod(0o777)
+            try:
+                fd, metadata = security.open_data_path(saved, [trusted])
+                try:
+                    self.assertTrue(security.stat.S_ISDIR(metadata.st_mode))
+                finally:
+                    security.os.close(fd)
+            finally:
+                (trusted / 'palworld' / 'Pal').chmod(0o755)
+                (trusted / 'palworld').chmod(0o755)
+
+    def test_intermediate_symlink_cannot_escape_trusted_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            trusted = root / 'data'
+            outside = root / 'outside'
             trusted.mkdir()
-            records = [security.MountRecord(
-                1, 0, '8:1', Path('/'), Path('/'), 'ext4', '/dev/test',
-            )]
-            with self.assertRaisesRegex(ValueError, 'strictly below'):
-                security.validate_managed_leaf(trusted, [trusted], records=records)
+            (outside / 'Saved').mkdir(parents=True)
+            (trusted / 'palworld').symlink_to(outside, target_is_directory=True)
 
-    def test_payload_descendants_may_be_untrusted_but_not_control_parents(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            trusted = Path(tmp) / 'data'
-            leaf = trusted / 'immich'
-            writable = leaf / 'database'
-            writable.mkdir(parents=True)
-            trusted.chmod(0o755)
-            leaf.chmod(0o755)
-            writable.chmod(0o777)
-            nested = writable / 'file'
-            nested.write_text('data', encoding='utf-8')
-            records = [security.MountRecord(
-                1, 0, '8:1', Path('/'), Path('/'), 'ext4', '/dev/test',
-            )]
-
-            security.validate_managed_leaf(leaf, [trusted], records=records)
-            with self.assertRaisesRegex(ValueError, 'group/world writable'):
-                security.validate_managed_leaf(nested, [trusted], records=records)
+            with self.assertRaisesRegex(ValueError, 'real directory'):
+                security.open_data_path(
+                    trusted / 'palworld' / 'Saved', [trusted],
+                )
 
 
 class AtomicPublicationTests(unittest.TestCase):
@@ -221,6 +224,41 @@ class AtomicPublicationTests(unittest.TestCase):
 
 
 class DockerWriterTests(unittest.TestCase):
+    def test_writable_parent_bind_is_a_writer_for_nested_target(self):
+        responses = iter([
+            SimpleNamespace(returncode=0, stdout='container\n'),
+            SimpleNamespace(returncode=0, stdout='''[{
+              "Id": "container",
+              "Mounts": [
+                {"Type": "bind", "Source": "/srv/stacks/Palworld/palworld", "RW": true}
+              ]
+            }]'''),
+        ])
+        self.assertEqual(
+            security.docker_mount_users(
+                ['/srv/stacks/Palworld/palworld/Pal/Saved'], [],
+                run=lambda *_a, **_k: next(responses),
+            ),
+            ('container',),
+        )
+
+    def test_writable_child_bind_is_a_writer_for_parent_target(self):
+        responses = iter([
+            SimpleNamespace(returncode=0, stdout='container\n'),
+            SimpleNamespace(returncode=0, stdout='''[{
+              "Id": "container",
+              "Mounts": [
+                {"Type": "bind", "Source": "/srv/data/app/cache", "RW": true}
+              ]
+            }]'''),
+        ])
+        self.assertEqual(
+            security.docker_mount_users(
+                ['/srv/data/app'], [], run=lambda *_a, **_k: next(responses),
+            ),
+            ('container',),
+        )
+
     def test_readonly_bind_and_volume_mounts_are_not_writers(self):
         responses = iter([
             SimpleNamespace(returncode=0, stdout='container\n'),

@@ -267,6 +267,109 @@ class RuntimeValidationTests(unittest.TestCase):
 
 
 class PathSyncTests(unittest.TestCase):
+    def test_ancestor_metadata_comes_from_the_pinned_source_walk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            value = manifest(root, sources={
+                'paths': [{'id': 'data', 'path': 'parent/data'}],
+                'volumes': [],
+            })
+            parent = Path(value['_dir']) / 'parent'
+            payload = parent / 'data'
+            payload.mkdir(parents=True)
+            (payload / 'value').write_text('snapshot', encoding='utf-8')
+            parent.chmod(0o750)
+            original_copy = storage._copy_path_source
+
+            def copy_then_replace_parent(*args, **kwargs):
+                result = original_copy(*args, **kwargs)
+                parent.rename(parent.with_name('parent-original'))
+                parent.mkdir(mode=0o777)
+                return result
+
+            with mock.patch.object(
+                storage, '_copy_path_source', side_effect=copy_then_replace_parent,
+            ):
+                entry = storage.sync_paths(
+                    {'trusted_data_roots': [str(root)]},
+                    value,
+                    root / 'stage',
+                )[0]
+
+            metadata = {
+                item['path']: item for item in entry['ancestors']
+            }
+            self.assertEqual(metadata['demo/parent']['mode'], 0o750)
+
+    def test_nested_source_may_be_selected_inside_container_owned_data_tree(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            value = manifest(root, sources={
+                'paths': [{
+                    'id': 'saved',
+                    'path': 'palworld/Pal/Saved',
+                }],
+                'volumes': [],
+            })
+            data_root = Path(value['_dir']) / 'palworld'
+            saved = data_root / 'Pal' / 'Saved'
+            saved.mkdir(parents=True)
+            (saved / 'world.sav').write_text('world', encoding='utf-8')
+            data_root.chmod(0o777)
+            (data_root / 'Pal').chmod(0o777)
+            try:
+                storage.validate_runtime_sources(
+                    {'trusted_data_roots': [str(root)]}, value, {},
+                )
+                storage.sync_paths(
+                    {'trusted_data_roots': [str(root)]},
+                    value,
+                    root / 'stage',
+                )
+            finally:
+                (data_root / 'Pal').chmod(0o755)
+                data_root.chmod(0o755)
+
+            self.assertEqual(
+                (root / 'stage' / 'paths' / 'saved' / 'world.sav').read_text(
+                    encoding='utf-8',
+                ),
+                'world',
+            )
+            entry = storage.sync_paths(
+                {'trusted_data_roots': [str(root)]},
+                value,
+                root / 'stage-2',
+            )[0]
+            self.assertEqual(
+                [item['path'] for item in entry['ancestors']],
+                ['demo', 'demo/palworld', 'demo/palworld/Pal'],
+            )
+            self.assertEqual(entry['ancestors'][-1]['mode'], 0o755)
+
+    def test_nested_source_rejects_symlinked_intermediate_component(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            value = manifest(root, sources={
+                'paths': [{
+                    'id': 'saved',
+                    'path': 'palworld/Pal/Saved',
+                }],
+                'volumes': [],
+            })
+            data_root = Path(value['_dir']) / 'palworld'
+            outside = root / 'outside'
+            (outside / 'Saved').mkdir(parents=True)
+            data_root.mkdir()
+            (data_root / 'Pal').symlink_to(outside, target_is_directory=True)
+
+            with self.assertRaisesRegex(ValueError, 'real directory'):
+                storage.sync_paths(
+                    {'trusted_data_roots': [str(root)]},
+                    value,
+                    root / 'stage',
+                )
+
     def test_source_replacement_uses_pinned_fd_and_fails_snapshot(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

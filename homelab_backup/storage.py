@@ -12,8 +12,8 @@ from .manifest import (
 )
 from .security import (
     clear_control_leaf, containing_mount, docker_mount_users,
-    ensure_private_directory,
-    validate_managed_leaf, validate_payload, validate_payload_fd,
+    ensure_private_directory, open_data_path, open_data_path_with_parent_metadata,
+    validate_data_path, validate_payload, validate_payload_fd,
 )
 
 def docker_volume_exists(name):
@@ -190,14 +190,19 @@ def resolved_volume_sources(m, model=None):
     return resolved
 
 
+def _source_trusted_roots(c, m):
+    return c.get('trusted_data_roots') or [m['_dir']]
+
+
 def validate_runtime_sources(c, m, model, *, allow_missing_paths=False):
+    trusted_roots = _source_trusted_roots(c, m)
     for source in (m.get('sources') or {}).get('paths', []):
         path = source_path(m, source)
-        if source.get('required', True) and not allow_missing_paths \
-                and not (path.exists() or path.is_symlink()):
-            raise ValueError(f'missing required source: {path}')
-        if path.exists() or path.is_symlink():
-            validate_managed_leaf(path, c['trusted_data_roots'])
+        try:
+            validate_data_path(path, trusted_roots)
+        except FileNotFoundError:
+            if source.get('required', True) and not allow_missing_paths:
+                raise ValueError(f'missing required source: {path}')
     for source, name in resolved_volume_sources(m, model=model):
         if not docker_volume_exists(name) and source.get('required', True):
             raise RuntimeError(f'Docker volume does not exist or is inaccessible: {name}')
@@ -233,8 +238,10 @@ def _same_object(left, right):
     )
 
 
-def _open_path_source(src):
+def _open_path_source(src, *, trusted_roots=None):
     src = Path(src)
+    if trusted_roots is not None:
+        return open_data_path(src, trusted_roots)
     initial = src.lstat()
     if stat.S_ISLNK(initial.st_mode):
         flags = os.O_PATH | os.O_NOFOLLOW
@@ -252,7 +259,18 @@ def _open_path_source(src):
     return fd, metadata
 
 
-def _verify_path_source(src, metadata):
+def _verify_path_source(src, metadata, *, trusted_roots=None):
+    if trusted_roots is not None:
+        try:
+            fd, current = open_data_path(src, trusted_roots)
+        except FileNotFoundError as err:
+            raise RuntimeError(f'path source changed during backup: {src}') from err
+        try:
+            if not _same_object(metadata, current):
+                raise RuntimeError(f'path source changed during backup: {src}')
+        finally:
+            os.close(fd)
+        return
     try:
         current = Path(src).lstat()
     except FileNotFoundError as err:
@@ -301,17 +319,22 @@ def _estimate_open_source(fd, metadata, display_path):
 
 def estimate_path_source(c, m, source):
     src = source_path(m, source)
-    if not (src.exists() or src.is_symlink()):
+    trusted_roots = _source_trusted_roots(c, m)
+    try:
+        fd, metadata = _open_path_source(
+            src, trusted_roots=trusted_roots,
+        )
+    except FileNotFoundError:
         if source.get('required', True):
             raise ValueError(f'missing source {src}')
         return 0
-    validate_managed_leaf(src, c['trusted_data_roots'])
     filesystem = containing_mount(src).filesystem_type
-    fd, metadata = _open_path_source(src)
     try:
         validate_payload_fd(fd, src, filesystem_type=filesystem)
         size = _estimate_open_source(fd, metadata, src)
-        _verify_path_source(src, metadata)
+        _verify_path_source(
+            src, metadata, trusted_roots=trusted_roots,
+        )
         return size
     finally:
         os.close(fd)
@@ -359,11 +382,13 @@ def estimate_backup_size(c, m, resolved=None):
     return total
 
 
-def _copy_path_source(src, dst, excludes, *, fd=None, metadata=None):
+def _copy_path_source(
+        src, dst, excludes, *, fd=None, metadata=None, trusted_roots=None,
+):
     src = Path(src)
     own_fd = fd is None
     if own_fd:
-        fd, metadata = _open_path_source(src)
+        fd, metadata = _open_path_source(src, trusted_roots=trusted_roots)
     dst.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
     clear_control_leaf(dst)
     dst.mkdir(parents=True, mode=0o700)
@@ -406,7 +431,7 @@ def _copy_path_source(src, dst, excludes, *, fd=None, metadata=None):
             source_type = 'file'
         else:
             raise RuntimeError(f'unsupported path source type: {src}')
-        _verify_path_source(src, metadata)
+        _verify_path_source(src, metadata, trusted_roots=trusted_roots)
         return source_type
     finally:
         if own_fd:
@@ -414,16 +439,20 @@ def _copy_path_source(src, dst, excludes, *, fd=None, metadata=None):
 
 
 def validate_path_payloads(c, m, *, allow_missing=False):
+    trusted_roots = _source_trusted_roots(c, m)
     for source in (m.get('sources') or {}).get('paths', []):
         src = source_path(m, source)
-        present = src.exists() or src.is_symlink()
-        if not present:
+        try:
+            fd, _metadata = open_data_path(src, trusted_roots)
+        except FileNotFoundError:
             if source.get('required', True) and not allow_missing:
                 raise ValueError(f'missing required source: {src}')
             continue
-        validate_managed_leaf(src, c['trusted_data_roots'])
-        filesystem = containing_mount(src).filesystem_type
-        validate_payload(src, filesystem_type=filesystem)
+        try:
+            filesystem = containing_mount(src).filesystem_type
+            validate_payload_fd(fd, src, filesystem_type=filesystem)
+        finally:
+            os.close(fd)
 
 
 def sync_paths(c, m=None, stage=None, *, before_copy=None):
@@ -437,44 +466,44 @@ def sync_paths(c, m=None, stage=None, *, before_copy=None):
             for source in (m.get('sources') or {}).get('paths', [])
         )) or [m['_dir']]
         c = {'trusted_data_roots': roots}
+    trusted_roots = _source_trusted_roots(c, m)
     inventory = []
     for source in (m.get('sources') or {}).get('paths', []):
         src = source_path(m, source)
         dst = stage / 'paths' / source['id']
-        if not (src.exists() or src.is_symlink()):
-            if source.get('required', True):
-                raise ValueError(f'missing source {src}')
-            dst.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
-            clear_control_leaf(dst)
-            inventory.append(_missing_path_inventory(source))
-            continue
         try:
             if before_copy is not None:
                 before_copy(source)
-            validate_managed_leaf(src, c['trusted_data_roots'])
             filesystem = containing_mount(src).filesystem_type
-            fd, metadata = _open_path_source(src)
+            fd, metadata, ancestors = open_data_path_with_parent_metadata(
+                src, trusted_roots,
+            )
             try:
                 validate_payload_fd(
                     fd, src, filesystem_type=filesystem,
                 )
                 source_type = _copy_path_source(
                     src, dst, source.get('exclude'), fd=fd, metadata=metadata,
+                    trusted_roots=trusted_roots,
                 )
             finally:
                 os.close(fd)
         except FileNotFoundError:
             if source.get('required', True):
                 raise ValueError(f'missing source {src}')
+            dst.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
             clear_control_leaf(dst)
             inventory.append(_missing_path_inventory(source))
             continue
-        inventory.append({
+        entry = {
             'id': source['id'],
             'path': source['path'],
             'type': source_type,
             'present': True,
-        })
+        }
+        if ancestors:
+            entry['ancestors'] = ancestors
+        inventory.append(entry)
     return inventory
 
 

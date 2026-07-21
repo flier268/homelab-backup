@@ -65,6 +65,32 @@ def validate_restore_inventory(
             raise RuntimeError(f'absent restore inventory path has a type: {source_id!r}')
         if source.get('required', True) and not entry['present']:
             raise RuntimeError(f'required path is marked absent: {source_id!r}')
+        ancestors = entry.get('ancestors', [])
+        if not isinstance(ancestors, list):
+            raise RuntimeError(f'restore inventory ancestors are invalid: {source_id!r}')
+        previous = None
+        for ancestor in ancestors:
+            if not isinstance(ancestor, dict):
+                raise RuntimeError(f'restore inventory ancestor is invalid: {source_id!r}')
+            relative = ancestor.get('path')
+            candidate = Path(relative) if isinstance(relative, str) else Path('.')
+            valid_path = (
+                isinstance(relative, str) and relative
+                and not candidate.is_absolute()
+                and candidate.parts
+                and all(part not in ('', '.', '..') for part in candidate.parts)
+            )
+            valid_numbers = (
+                type(ancestor.get('uid')) is int and ancestor['uid'] >= 0
+                and type(ancestor.get('gid')) is int and ancestor['gid'] >= 0
+                and type(ancestor.get('mode')) is int
+                and 0 <= ancestor['mode'] <= 0o7777
+            )
+            if not valid_path or not valid_numbers:
+                raise RuntimeError(f'restore inventory ancestor is invalid: {source_id!r}')
+            if previous is not None and candidate.parent.as_posix() != previous:
+                raise RuntimeError(f'restore inventory ancestor chain is invalid: {source_id!r}')
+            previous = candidate.as_posix()
     identity_volumes = identity.get('volumes')
     if not isinstance(identity_volumes, list):
         raise RuntimeError('restore inventory Compose volume mapping must be a list')

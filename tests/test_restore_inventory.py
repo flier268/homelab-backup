@@ -8,6 +8,33 @@ from tests.helpers import manifest, write_restore_inventory
 
 
 class RestoreInventoryTests(unittest.TestCase):
+    def test_ancestor_metadata_rejects_parent_traversal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            value = manifest(root, sources={'paths': [{
+                'id': 'saved', 'path': 'palworld/Pal/Saved',
+            }], 'volumes': []})
+            inventory = {
+                'version': 1,
+                'service': 'demo',
+                'paths': [{
+                    'id': 'saved', 'path': 'palworld/Pal/Saved',
+                    'type': 'directory', 'present': True,
+                    'ancestors': [{
+                        'path': '../outside', 'uid': 0, 'gid': 0,
+                        'mode': 0o755,
+                    }],
+                }],
+                'volumes': [],
+                'compose': {
+                    'project_name': 'demo', 'services': [],
+                    'compose_files': ['compose.yaml'], 'volumes': [],
+                },
+            }
+
+            with self.assertRaisesRegex(RuntimeError, 'ancestor is invalid'):
+                restore_inventory.validate_restore_inventory(value, inventory)
+
     def test_inventory_symlink_is_rejected_without_reading_referent(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -101,6 +101,14 @@ class InventoryPath(TypedDict, total=False):
     path: str
     type: Optional[str]
     present: bool
+    ancestors: list['InventoryAncestor']
+
+
+class InventoryAncestor(TypedDict):
+    path: str
+    uid: int
+    gid: int
+    mode: int
 
 
 class InventoryVolume(TypedDict, total=False):

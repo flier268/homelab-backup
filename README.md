@@ -3,8 +3,8 @@
 Docker Compose 服務的 Restic + OneDrive 備份工具。
 
 - 每個 `/srv/stacks/<service>/backup.yaml` 自行宣告 Cron、retention、來源與一致性策略。
-- 支援 root-owned control parent 下的完整 managed leaf，以及本機 rootful
-  Docker named volume；路徑中的 symlink 只備份 link 本身。
+- 支援 trusted root 下由容器 UID/GID 擁有的任意深層路徑，以及本機 rootful
+  Docker named volume；中間 symlink 不會被跟隨，leaf symlink 只備份 link 本身。
 - `backup.yaml` 會自動保存到每份 snapshot 的 `_meta/backup.yaml`，不必列入 `sources.paths`。
 - 單一 systemd timer 每 5 分鐘掃描到期服務。
 - 還原時可使用互動式選單，所有 repository 服務預設全選。
@@ -100,10 +100,15 @@ timestamped 密文。
 - 僅支援 Linux、root 執行、本機 `ext4`／`xfs`／`btrfs` 與本機 rootful
   Docker。trusted root 本身可以是核准 mount 或 Btrfs subvolume，其下不允許
   其他 mount、bind mount或 nested Btrfs subvolume。
-- `sources.paths[].path` 必須是完整 managed leaf。從 `/` 到 leaf parent 都必須
-  是 root-owned、不可 group/world write 的真實目錄；leaf 目錄內可由容器 UID/GID
-  擁有。leaf 必須嚴格位於 trusted root 之下，不能等於 trusted root；不要把
-  容器可寫資料樹中的深層檔案另列為 target。
+- `sources.paths[].path` 必須嚴格位於唯一的 trusted root 之下，不能等於 trusted
+  root。trusted root 與其控制路徑必須是 root-owned、不可 group/world write 的
+  真實目錄；其下的完整資料樹可由容器 UID/GID 擁有，並可選取其中任意深層路徑。
+  程式從 trusted root 的固定 descriptor 逐層開啟來源，中間 symlink 會被拒絕；
+  還原也透過固定 descriptor 寫入，不會因可寫祖先被換名或換成 symlink 而越界。
+- 備份會自動在 snapshot inventory 記錄所選路徑祖先的數字 UID/GID 與 mode。
+  全新 rebuild 缺少資料祖先時會依此重建，因此不會把容器資料目錄猜成
+  `root:root` 或 `1000:1000`；manifest 不需增加任何欄位。沒有這項 metadata 的
+  舊快照仍可還原到祖先已存在的部署，但不會在全新 rebuild 時猜測權限。
 - payload 支援普通檔案、目錄、symlink、ACL、xattr 與 payload 內 hardlink；
   FIFO、socket、device node會被拒絕。不保存 Btrfs subvolume identity、snapshot
   關係、reflink、compression或 CoW 屬性。
@@ -123,7 +128,7 @@ timestamped 密文。
   Docker named volumes 必須在靜態 preflight 前已存在，不支援由 hook 動態建立。
 - Snapshot 中的 Compose service 清單僅供診斷；現有部署的授權比對使用 project
   name、path/source declarations 與 logical-to-actual volume mapping。
-- 不支援 remote/rootless Docker、任意深層 restore target、跨 mount、ZFS、
+- 不支援 remote/rootless Docker、跨 mount、ZFS、
   ext2/3、FUSE、NFS、autofs，或未經本機 manifest 授權就覆寫既有 volume。
 
 從預設加密檔放回系統，依提示貼入 SSH 私鑰並解密：
@@ -205,7 +210,9 @@ sudo backupctl cleanup-restores --all --yes
 
 全新重建若在發布 Compose／manifest 前失敗，會嘗試移除本次新建的
 path 與 Docker volume，讓相同還原可安全重跑；任何 rollback 失敗會保留
-原始錯誤並另外列出 cleanup 錯誤。
+原始錯誤並另外列出 cleanup 錯誤。若 path 在發布後被其他程序修改，或本次
+建立的祖先目錄已出現其他內容，rollback 會保留該路徑並警告，不會把外部
+寫入視為本次還原所擁有的資料。
 
 安裝、設定還原與資料還原期間均不要關機。一般錯誤會在目前程序內回滾；
 斷電不在原子性保證內。重新開機後可重新執行相同命令；全新重建若留下
