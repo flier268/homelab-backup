@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 .venv/
+.vm-test/
 
 state/
 homelab-backup-configs-*.zip

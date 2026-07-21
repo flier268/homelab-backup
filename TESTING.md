@@ -54,3 +54,38 @@ sudo HOMELAB_BACKUP_INTEGRATION=1 \
 
 未設定時會安全跳過；Docker 測試使用本機 helper image，Btrfs 測試只在明確指定
 的 Btrfs root 下建立並刪除測試 subvolume。
+
+## 一次性 QEMU VM
+
+若 host 已安裝 `qemu-system-x86_64`、`qemu-img`、`genisoimage`、`curl`、
+`ssh` 與 `rsync`，可建立隔離的 Ubuntu 24.04 VM 並執行完整測試：
+
+```bash
+./vm-test.sh all
+```
+
+腳本會下載官方 cloud image 並以官方 `SHA256SUMS` 驗證，建立 32 GiB sparse
+qcow2 root overlay，以及一顆只供測試格式化的 8 GiB Btrfs 虛擬磁碟。Guest
+內會安裝 rootful Docker、建立 helper image，然後以 root 執行全部單元測試及
+Docker/Btrfs opt-in integration tests。Host 專案透過 SSH 複製；不會掛載 host
+Docker socket 或 host filesystem。
+
+常用操作：
+
+```bash
+./vm-test.sh test
+./vm-test.sh start
+./vm-test.sh ssh
+./vm-test.sh stop
+./vm-test.sh reset
+```
+
+`test`（以及預設的 `all`）每次都會先停止現有 VM，刪除並重建 root overlay、
+Btrfs 測試磁碟與 cloud-init seed，再執行測試，最後關機。因此前一次執行留下的
+檔案、Docker container/volume/image、Btrfs subvolume、套件或 Python venv 不會
+影響下一次測試。已驗證且設為唯讀的 Ubuntu base image 與專用 SSH key 會保留，
+它們不包含測試執行時產生的狀態。
+
+若 `/dev/kvm` 可讀寫會自動使用 KVM，否則退回較慢的 TCG。VM 狀態保存在
+git ignored 的 `.vm-test/`；`reset` 只移除 writable disks 與產生的 seed，保留
+已驗證的 base image 和專用 SSH key。

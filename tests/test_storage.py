@@ -455,7 +455,7 @@ class PathSyncTests(unittest.TestCase):
                 (slot / 'data').read_text(encoding='utf-8'), 'final-file',
             )
 
-    def test_directory_resync_replaces_private_slot(self):
+    def test_directory_resync_removes_stale_slot_content(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             source_path = root / 'demo' / 'data'
@@ -469,12 +469,12 @@ class PathSyncTests(unittest.TestCase):
             })
             storage.sync_paths(value, stage)
             slot = stage / 'paths' / 'data'
-            slot_inode = slot.stat().st_ino
+            (slot / 'stale.txt').write_text('stale', encoding='utf-8')
             payload.write_text('second', encoding='utf-8')
 
             storage.sync_paths(value, stage)
 
-            self.assertNotEqual(slot.stat().st_ino, slot_inode)
+            self.assertFalse((slot / 'stale.txt').exists())
             self.assertEqual(
                 (slot / 'payload.txt').read_text(encoding='utf-8'), 'second',
             )
@@ -492,7 +492,6 @@ class PathSyncTests(unittest.TestCase):
             })
             storage.sync_paths(value, stage)
             slot = stage / 'paths' / 'data'
-            slot_inode = slot.stat().st_ino
             source_path.unlink()
             source_path.mkdir()
             (source_path / 'final.txt').write_text('final', encoding='utf-8')
@@ -500,7 +499,7 @@ class PathSyncTests(unittest.TestCase):
             inventory = storage.sync_paths(value, stage)
 
             self.assertEqual(inventory[0]['type'], 'directory')
-            self.assertNotEqual(slot.stat().st_ino, slot_inode)
+            self.assertFalse((slot / 'data').exists())
             self.assertEqual(
                 sorted(path.name for path in slot.iterdir()), ['final.txt'],
             )
