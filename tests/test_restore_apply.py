@@ -465,9 +465,9 @@ class RestoreApplyLifecycleTests(unittest.TestCase):
         )
         primary = RuntimeError('preflight conflict')
 
-        def fake_run(command, **_kwargs):
+        def fake_run(_manifest, command, **_kwargs):
             if 'up' in command:
-                raise common.CommandError(command, 1)
+                raise common.CommandError(['docker', 'compose', *command], 1)
             return mock.Mock(stdout='')
 
         with mock.patch.object(
@@ -475,7 +475,7 @@ class RestoreApplyLifecycleTests(unittest.TestCase):
         ), mock.patch.object(
             restore_apply, '_dynamic_preflight', side_effect=primary,
         ), mock.patch.object(
-            restore_apply, 'run', side_effect=fake_run,
+            restore_apply, 'compose_run', side_effect=fake_run,
         ), self.assertRaises(RuntimeError) as caught:
             restore_apply.apply_one({}, value, root)
 
@@ -491,7 +491,7 @@ class RestoreApplyLifecycleTests(unittest.TestCase):
         stop_error = common.CommandError(['docker', 'compose', 'stop'], 1)
         commands = []
 
-        def fake_run(command, **_kwargs):
+        def fake_run(_manifest, command, **_kwargs):
             commands.append(command)
             if 'stop' in command:
                 raise stop_error
@@ -500,7 +500,7 @@ class RestoreApplyLifecycleTests(unittest.TestCase):
         with mock.patch.object(
             restore_apply, 'prepare_restore_plan', return_value=plan,
         ), mock.patch.object(
-            restore_apply, 'run', side_effect=fake_run,
+            restore_apply, 'compose_run', side_effect=fake_run,
         ), self.assertRaises(common.CommandError) as caught:
             restore_apply.apply_one({}, value, root)
 

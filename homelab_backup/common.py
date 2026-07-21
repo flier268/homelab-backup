@@ -8,6 +8,18 @@ from pathlib import Path
 
 import yaml
 
+
+MIN_FREE_BYTES = 1024**3
+
+
+def format_bytes(value):
+    amount = float(value)
+    for unit in ('B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB'):
+        if amount < 1024 or unit == 'PiB':
+            return f'{amount:.2f} {unit}'
+        amount /= 1024
+
+
 def die(msg):
     print(f'ERROR: {msg}', file=sys.stderr)
     raise SystemExit(1)
@@ -118,12 +130,16 @@ def load_yaml(path, *, protected=False):
 
 
 def restic_env(c):
+    from .security import lexical_absolute, validate_control_file
+
+    password_file = validate_control_file(lexical_absolute(c['password_file']))
+    rclone_config = validate_control_file(lexical_absolute(c['rclone_config']))
     env = os.environ.copy()
     env.update({
         'RESTIC_REPOSITORY': c['repository'],
-        'RESTIC_PASSWORD_FILE': c['password_file'],
+        'RESTIC_PASSWORD_FILE': str(password_file),
         'RESTIC_CACHE_DIR': c['cache_root'],
-        'RCLONE_CONFIG': c['rclone_config'],
+        'RCLONE_CONFIG': str(rclone_config),
     })
     bwlimit = (c.get('rclone') or {}).get('bwlimit')
     if bwlimit:

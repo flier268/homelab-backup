@@ -8,7 +8,7 @@ import yaml
 from .common import CommandError, _print_command_failure, run
 from .security import (
     lexical_absolute, path_contains, paths_overlap, read_control_text,
-    validate_control_directory,
+    validate_control_directory, validate_control_file,
 )
 from .schedule import validate_schedule
 from .types import ServiceManifest
@@ -88,10 +88,45 @@ def manifest(c, name) -> ServiceManifest:
 
 
 def compose_cmd(m):
-    cmd = ['docker', 'compose']
-    for f in m.get('compose', {}).get('files', ['compose.yaml']):
-        cmd += ['-f', f]
+    service_dir = lexical_absolute(m['_dir'])
+    compose = m.get('compose') or {}
+    cmd = [
+        'docker', 'compose', '--project-directory', str(service_dir),
+    ]
+    env_file = compose.get('env_file')
+    if env_file:
+        env_path = Path(env_file)
+        env_path = env_path if env_path.is_absolute() else service_dir / env_path
+        env_path = validate_control_file(lexical_absolute(env_path))
+    else:
+        env_path = Path('/dev/null')
+    cmd += ['--env-file', str(env_path)]
+    for value in compose.get('files', ['compose.yaml']):
+        compose_path = Path(value)
+        compose_path = (
+            compose_path if compose_path.is_absolute()
+            else service_dir / compose_path
+        )
+        compose_path = validate_control_file(lexical_absolute(compose_path))
+        cmd += ['-f', str(compose_path)]
     return cmd
+
+
+def compose_env():
+    """Return a deterministic environment without Compose self-configuration."""
+    env = {
+        'HOME': '/root',
+        'LANG': 'C.UTF-8',
+        'LC_ALL': 'C.UTF-8',
+        'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+    }
+    return env
+
+
+def compose_run(m, args, *, runner=None, **kwargs):
+    kwargs.setdefault('cwd', m['_dir'])
+    kwargs['env'] = compose_env()
+    return (runner or run)(compose_cmd(m) + list(args), **kwargs)
 
 
 def valid_service_name(value):
@@ -182,7 +217,7 @@ def _validate_compose(m, path):
         compose = {}
     if not isinstance(compose, dict):
         raise ValueError(f'{path}: compose must be a mapping')
-    unknown_compose = sorted(set(compose) - {'files'})
+    unknown_compose = sorted(set(compose) - {'files', 'env_file'})
     if unknown_compose:
         raise ValueError(f'{path}: unsupported compose fields: {unknown_compose}')
     compose_files = compose.get('files', ['compose.yaml'])
@@ -190,6 +225,11 @@ def _validate_compose(m, path):
         isinstance(x, str) and x for x in compose_files
     ):
         raise ValueError(f'{path}: compose.files must be a non-empty list of strings')
+    env_file = compose.get('env_file')
+    if env_file is not None and (
+        not isinstance(env_file, str) or not env_file
+    ):
+        raise ValueError(f'{path}: compose.env_file must be a non-empty string')
 
 
 def _validate_source_common(path, kind, index, source, ids):
@@ -291,9 +331,8 @@ def validate_manifest(m: ServiceManifest):
 
 
 def compose_model(m):
-    cmd = compose_cmd(m) + ['config', '--format', 'json']
     try:
-        result = run(cmd, cwd=m['_dir'], capture=True)
+        result = compose_run(m, ['config', '--format', 'json'], capture=True)
     except CommandError as err:
         _print_command_failure(err, context=(
             f"Compose configuration validation failed for service "
@@ -301,7 +340,10 @@ def compose_model(m):
         ))
         print('  diagnostic hints:', file=sys.stderr)
         print('    - Check that every compose.files entry exists.', file=sys.stderr)
-        print('    - Check required variables in .env and ${VAR:?message} expressions.', file=sys.stderr)
+        print(
+            '    - Check compose.env_file and ${VAR:?message} expressions.',
+            file=sys.stderr,
+        )
         print('    - Run the printed docker compose command from the shown directory.', file=sys.stderr)
         raise
     try:

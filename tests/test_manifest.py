@@ -1,9 +1,78 @@
 import tempfile
 import unittest
+import os
 from pathlib import Path
 from unittest import mock
 
 from homelab_backup import manifest as manifest_module
+from tests.helpers import manifest
+
+
+class ComposeControlTests(unittest.TestCase):
+    def test_compose_run_uses_only_explicit_protected_controls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            value = manifest(root, compose={
+                'files': ['compose.yaml'], 'env_file': 'compose.env',
+            })
+            env_file = Path(value['_dir']) / 'compose.env'
+            env_file.write_text('IMAGE_TAG=stable\n', encoding='utf-8')
+            env_file.chmod(0o600)
+            captured = {}
+
+            def runner(command, **kwargs):
+                captured['command'] = command
+                captured['env'] = kwargs['env']
+                return mock.Mock(stdout='{}')
+
+            with mock.patch.dict(os.environ, {
+                'COMPOSE_FILE': '/tmp/evil.yaml',
+                'COMPOSE_ENV_FILES': '/tmp/evil.env',
+                'UNTRUSTED_VALUE': 'evil',
+            }):
+                manifest_module.compose_run(
+                    value, ['config'], runner=runner, capture=True,
+                )
+
+            command = captured['command']
+            self.assertIn(str(Path(value['_dir']) / 'compose.yaml'), command)
+            self.assertIn(str(env_file), command)
+            self.assertNotIn('/tmp/evil.yaml', command)
+            self.assertNotIn('/tmp/evil.env', command)
+            self.assertFalse(any(
+                key.startswith('COMPOSE_') for key in captured['env']
+            ))
+            self.assertNotIn('UNTRUSTED_VALUE', captured['env'])
+
+    def test_compose_run_rejects_writable_or_symlink_controls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            value = manifest(root)
+            compose = Path(value['_dir']) / 'compose.yaml'
+            compose.chmod(0o666)
+            with self.assertRaisesRegex(ValueError, 'group/world writable'):
+                manifest_module.compose_cmd(value)
+
+            compose.unlink()
+            outside = root / 'outside.yaml'
+            outside.write_text('services: {}\n', encoding='utf-8')
+            outside.chmod(0o600)
+            compose.symlink_to(outside)
+            with self.assertRaisesRegex(ValueError, 'regular file'):
+                manifest_module.compose_cmd(value)
+
+    def test_missing_env_file_is_rejected_and_implicit_dotenv_is_ignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            value = manifest(root)
+            dotenv = Path(value['_dir']) / '.env'
+            dotenv.write_text('COMPOSE_FILE=/tmp/evil.yaml\n', encoding='utf-8')
+            command = manifest_module.compose_cmd(value)
+            self.assertIn('/dev/null', command)
+
+            value['compose'] = {'env_file': 'missing.env'}
+            with self.assertRaises(FileNotFoundError):
+                manifest_module.compose_cmd(value)
 
 
 class ManifestSelectionTests(unittest.TestCase):

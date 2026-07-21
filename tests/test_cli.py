@@ -1,3 +1,4 @@
+import json
 import shutil
 import subprocess
 import sys
@@ -17,6 +18,13 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class LauncherTests(unittest.TestCase):
+    def test_backup_parser_accepts_explicit_low_space_override(self):
+        args = cli.build_parser().parse_args([
+            'backup', 'demo', '--allow-low-space',
+        ])
+
+        self.assertTrue(args.allow_low_space)
+
     def test_restore_parser_accepts_explicit_low_space_override(self):
         args = cli.build_parser().parse_args([
             'restore', 'demo', '--allow-low-space', '--yes',
@@ -141,8 +149,13 @@ class LauncherTests(unittest.TestCase):
                 target_is_directory=True,
             )
             (release_root / 'volume-helper-image').write_text(
-                'homelab/volume-rsync:release.test\n', encoding='utf-8',
+                json.dumps({
+                    'tag': 'homelab/volume-rsync:release.test',
+                    'image_id': 'sha256:' + 'a' * 64,
+                }) + '\n',
+                encoding='utf-8',
             )
+            (release_root / 'volume-helper-image').chmod(0o600)
             (release_root / '.lease').touch(mode=0o644)
             subprocess.run(
                 [sys.executable, '-m', 'venv', '--without-pip', str(venv_root)],

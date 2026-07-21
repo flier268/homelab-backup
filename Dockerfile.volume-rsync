@@ -1,3 +1,7 @@
-FROM alpine:3.22
-RUN apk add --no-cache rsync acl attr
+FROM alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce
+RUN apk add --no-cache \
+    acl=2.3.2-r1 \
+    attr=2.5.2-r2 \
+    coreutils=9.7-r1 \
+    rsync=3.4.3-r0
 ENTRYPOINT []

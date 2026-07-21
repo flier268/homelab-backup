@@ -4,7 +4,7 @@ import sys
 from pathlib import Path
 
 from .common import run, run_cleanup
-from .manifest import compose_cmd, source_path
+from .manifest import compose_run, source_path
 from .restore_plan import (
     RestorePlan,
     compose_authorization_projection,
@@ -95,9 +95,12 @@ def restore_path_source(m, root, source, inventory, *, c=None, rebuild=False):
 def _stop_running_services(plan):
     targets = list(plan.running_services)
     if targets:
-        run(
-            compose_cmd(plan.manifest) + ['stop', '-t', str((plan.manifest.get('consistency') or {}).get('timeout', 120))] + targets,
-            cwd=plan.manifest['_dir'],
+        compose_run(
+            plan.manifest,
+            ['stop', '-t', str(
+                (plan.manifest.get('consistency') or {}).get('timeout', 120)
+            )] + targets,
+            runner=run,
         )
     return targets
 
@@ -326,11 +329,10 @@ def _restart_services(plan, targets, start_services):
                 f"cannot start {plan.manifest['service']}: "
                 'Compose files were not restored'
             )
-        run(compose_cmd(plan.manifest) + ['up', '-d'], cwd=plan.manifest['_dir'])
+        compose_run(plan.manifest, ['up', '-d'], runner=run)
     elif targets:
-        run(
-            compose_cmd(plan.manifest) + ['up', '-d', '--no-deps'] + targets,
-            cwd=plan.manifest['_dir'],
+        compose_run(
+            plan.manifest, ['up', '-d', '--no-deps'] + targets, runner=run,
         )
 
 
@@ -344,10 +346,9 @@ def apply_one(
     except Exception:
         if targets:
             run_cleanup(
-                lambda: run(
-                    compose_cmd(plan.manifest)
-                    + ['up', '-d', '--no-deps'] + targets,
-                    cwd=plan.manifest['_dir'],
+                lambda: compose_run(
+                    plan.manifest, ['up', '-d', '--no-deps'] + targets,
+                    runner=run,
                 ),
                 'service recovery after failed Compose stop',
             )
@@ -363,10 +364,9 @@ def apply_one(
     except Exception:
         if not mutation_started and targets:
             run_cleanup(
-                lambda: run(
-                    compose_cmd(plan.manifest)
-                    + ['up', '-d', '--no-deps'] + targets,
-                    cwd=plan.manifest['_dir'],
+                lambda: compose_run(
+                    plan.manifest, ['up', '-d', '--no-deps'] + targets,
+                    runner=run,
                 ),
                 'service recovery after restore preflight',
             )

@@ -8,9 +8,11 @@ def manifest(tmp_path, **overrides):
     service_dir.chmod(0o755)
     manifest_path = service_dir / 'backup.yaml'
     manifest_path.write_text('version: 1\nservice: demo\n', encoding='utf-8')
+    manifest_path.chmod(0o600)
     compose_path = service_dir / 'compose.yaml'
     if not compose_path.exists():
         compose_path.write_text('services: {}\n', encoding='utf-8')
+    compose_path.chmod(0o600)
     value = {
         '_path': str(manifest_path),
         '_dir': str(service_dir),

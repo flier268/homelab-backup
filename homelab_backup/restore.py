@@ -9,7 +9,10 @@ from pathlib import Path
 import yaml
 
 from . import restore_apply
-from .common import FailureSummary, GlobalLock, die, restic_env, run
+from .common import (
+    MIN_FREE_BYTES, FailureSummary, GlobalLock, die, format_bytes, restic_env,
+    run,
+)
 from .manifest import manifest, valid_service_name, validate_manifest
 from .security import (
     clear_control_leaf, ensure_private_directory, lexical_absolute,
@@ -20,7 +23,7 @@ from .storage import (
 )
 
 
-MIN_RESTORE_FREE_BYTES = 1024**3
+MIN_RESTORE_FREE_BYTES = MIN_FREE_BYTES
 
 
 def _repository_snapshots(c, *filters):
@@ -91,14 +94,6 @@ def estimate_restore_size(c, service, snapshot):
     return size
 
 
-def _format_bytes(value):
-    amount = float(value)
-    for unit in ('B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB'):
-        if amount < 1024 or unit == 'PiB':
-            return f'{amount:.2f} {unit}'
-        amount /= 1024
-
-
 def check_restore_space(c, service, snapshot, *, allow_low_space=False):
     """Require enough free restore space to retain a 1 GiB safety margin."""
     restore_root = ensure_private_directory(c['restore_root'])
@@ -111,9 +106,9 @@ def check_restore_space(c, service, snapshot, *, allow_low_space=False):
     shortfall = required - free
     print(
         f'WARNING: restore for {service} is estimated at '
-        f'{_format_bytes(restore_size)}, but only {_format_bytes(free)} is free '
+        f'{format_bytes(restore_size)}, but only {format_bytes(free)} is free '
         f'on {restore_root}; the required 1.00 GiB reserve would be short by '
-        f'{_format_bytes(shortfall)}.',
+        f'{format_bytes(shortfall)}.',
         file=sys.stderr,
     )
     if allow_low_space:

@@ -58,6 +58,7 @@ class ConsistencyConfig(TypedDict, total=False):
 
 class ComposeConfig(TypedDict, total=False):
     files: list[str]
+    env_file: str
 
 
 class PathSource(TypedDict, total=False):

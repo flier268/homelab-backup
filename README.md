@@ -75,6 +75,15 @@ timestamped 密文。
 - 操作期間不得存在未受控 writer。程式會停止及檢查已知 Compose/Docker writer，
   唯讀 Docker mount 不視為 writer；共用 UID 程序、排程與其他 privileged process
   仍是 operator obligation。
+- 所有 Compose YAML、`compose.env_file`、Restic 密碼與 rclone 設定必須是
+  root-owned、不可 group/world write 的普通檔案，且不可為 symlink。Compose
+  不載入隱含 `.env` 或外部 `COMPOSE_*` 設定；需要插值時必須在 manifest 明確設定：
+
+  ```yaml
+  compose:
+    files: [compose.yaml]
+    env_file: compose.env
+  ```
 - `hooks.before` 可以建立或更新 `sources.paths` 的 payload artifact；所有 required
   Docker named volumes 必須在靜態 preflight 前已存在，不支援由 hook 動態建立。
 - Snapshot 中的 Compose service 清單僅供診斷；現有部署的授權比對使用 project
@@ -103,6 +112,20 @@ sudo ./backup-configs.sh --rotate configs/homelab-backup-configs.zip.age
 
 腳本會先以舊私鑰解密並驗證 archive 內容，再以新 age KEY 加密並原子替換。
 私鑰只直接傳給 `age`，不放入參數、環境變數或一般磁碟。
+
+## 手動備份與空間保護
+
+```bash
+sudo backupctl backup minecraft
+```
+
+備份會在來源靜止後保守估算 path 與 Docker volume 的 staging 大小，並要求
+staging filesystem 至少保留 1 GiB。空間不足時預設中止；只有人工操作可明確
+放行，排程 `run-due` 不會自動略過保護：
+
+```bash
+sudo backupctl backup minecraft --allow-low-space
+```
 
 ## 還原全部服務
 

@@ -385,6 +385,27 @@ class StagingLifecycleTests(unittest.TestCase):
 
 class BackupCommandTests(unittest.TestCase):
 
+    def test_backup_space_requires_reserve_unless_explicitly_overridden(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            value = {'service': 'demo'}
+            disk = mock.Mock(free=common.MIN_FREE_BYTES + 99)
+            with mock.patch.object(backup.shutil, 'disk_usage', return_value=disk), \
+                    self.assertRaisesRegex(RuntimeError, 'insufficient backup'):
+                backup._check_backup_space({}, value, root, 100)
+
+            with mock.patch.object(backup.shutil, 'disk_usage', return_value=disk):
+                backup._check_backup_space(
+                    {}, value, root, 100, allow_low_space=True,
+                )
+
+    def test_backup_space_accepts_exact_one_gib_reserve(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            disk = mock.Mock(free=common.MIN_FREE_BYTES + 100)
+            with mock.patch.object(backup.shutil, 'disk_usage', return_value=disk):
+                backup._check_backup_space({}, {'service': 'demo'}, root, 100)
+
     def test_unknown_service_does_not_skip_later_explicit_service(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = {'lock_file': str(Path(tmp) / 'backupctl.lock')}

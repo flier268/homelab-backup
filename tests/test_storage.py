@@ -267,6 +267,38 @@ class RuntimeValidationTests(unittest.TestCase):
 
 
 class PathSyncTests(unittest.TestCase):
+    def test_source_replacement_uses_pinned_fd_and_fails_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payload = root / 'demo' / 'data'
+            payload.mkdir(parents=True)
+            (payload / 'safe').write_text('safe', encoding='utf-8')
+            outside = root / 'outside'
+            outside.mkdir()
+            (outside / 'secret').write_text('secret', encoding='utf-8')
+            value = manifest(root, sources={
+                'paths': [{'id': 'data', 'path': 'data'}], 'volumes': [],
+            })
+            observed = {}
+
+            def swap_source(command, **kwargs):
+                observed['command'] = command
+                observed['pass_fds'] = kwargs.get('pass_fds')
+                payload.rename(payload.with_name('original'))
+                payload.symlink_to(outside, target_is_directory=True)
+                return mock.Mock(stdout='')
+
+            with mock.patch.object(storage, 'run', side_effect=swap_source), \
+                    self.assertRaisesRegex(RuntimeError, 'changed during backup'):
+                storage.sync_paths(value, root / 'stage')
+
+            self.assertTrue(any(
+                str(item).startswith('/proc/self/fd/')
+                for item in observed['command']
+            ))
+            self.assertNotIn(str(payload), observed['command'])
+            self.assertTrue(observed['pass_fds'])
+
     def test_required_source_disappearing_during_sync_is_a_regular_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

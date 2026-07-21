@@ -163,6 +163,11 @@ sudoedit /srv/stacks/&lt;service&gt;/backup.yaml</code></pre>
 <p>一般權限：</p>
 <pre><code>chmod 644 compose.yaml backup.yaml
 chmod 600 .env</code></pre>
+<div class="box">Compose 不會自動載入隱含 <code>.env</code>，也不接受外部
+<code>COMPOSE_*</code> 覆寫。需要環境插值時，必須在 <code>backup.yaml</code>
+以 <code>compose.env_file</code> 明確指定；該檔案、所有 Compose YAML、Restic
+密碼與 rclone 設定都必須是 root-owned、不可 group/world write 的普通檔案，
+且不可為 symlink。</div>
 <p>資料目錄先讓 container 建立或使用預設權限；只有遇到 permission denied 時，才依 image 的 UID/GID 個別調整。</p>
 </section>
 
@@ -316,6 +321,7 @@ retention:
 compose:
   files:
     - compose.yaml
+  env_file: .env
 
 consistency:
   mode: stop
@@ -339,6 +345,8 @@ sources:
         - crash-reports/**
 
   volumes: []</code></pre>
+<div class="box warn">若服務原本依賴 Compose 自動尋找 <code>.env</code>，升級後
+必須加入 <code>compose.env_file</code>；未設定時會明確使用空環境檔。</div>
 </section>
 
 <section id="consistency">
@@ -495,6 +503,7 @@ retention:
 
 compose:
   files: [compose.yaml]
+  env_file: .env
 
 consistency:
   mode: stop
@@ -533,6 +542,7 @@ retention:
 
 compose:
   files: [compose.yaml]
+  env_file: .env
 
 consistency:
   mode: stop
@@ -586,6 +596,11 @@ sudo backupctl backup palworld</code></pre>
 <p>一次備份所有 enabled 服務：</p>
 <pre><code>sudo backupctl backup</code></pre>
 <p>批次備份會逐 manifest 隔離錯誤；某一服務失敗時會跳過整份 manifest、清除其半成品 staging，且只有全部來源 staging 完成後才提交 Restic snapshot，因此不會產生該服務的部分備份。其餘 manifest 仍會繼續，最後統一列出失敗摘要並回傳非零狀態。</p>
+<p>來源靜止後會保守估算 path 與 Docker volume 的 staging 大小，並要求所在
+filesystem 至少保留 1 GiB。空間不足時預設中止；只有人工操作可明確使用：</p>
+<pre><code>sudo backupctl backup minecraft --allow-low-space</code></pre>
+<div class="box warn"><code>run-due</code> 不會自動略過空間保護。即使人工放行，
+實際複製遇到 <code>ENOSPC</code> 仍會失敗並清除該服務的半成品 staging。</div>
 <p>查看排程狀態：</p>
 <pre><code>sudo backupctl status</code></pre>
 </section>
@@ -614,6 +629,9 @@ sudo backupctl backup palworld</code></pre>
 <p>指定歷史 snapshot ID 時只允許單一服務。程式會先用目前 host 與
 <code>service:&lt;name&gt;</code> tag 解析並驗證完整 ID，再開始下載：</p>
 <pre><code>sudo backupctl restore minecraft --snapshot 01234567 --apply</code></pre>
+<p>下載前會以 Restic <code>restore-size</code> 估算展開大小，並要求至少保留
+1 GiB。互動模式可再次確認；非互動模式必須另外指定
+<code>--allow-low-space</code>，而 <code>--yes</code> 本身不會略過空間保護。</p>
 <h3><code>backup.yaml</code> 的還原規則</h3>
 <ul>
 <li>現有部署：本機 manifest 與所有 Compose files 都存在；snapshot inventory 必須與本機 project name、path/source declarations、volume mapping、volume 名稱及 labels 相符後才可覆寫。Compose service 清單只供診斷，新增或移除 service 不會單獨阻止舊 snapshot 還原。</li>

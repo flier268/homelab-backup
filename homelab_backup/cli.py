@@ -60,6 +60,10 @@ def build_parser():
     sub.add_parser('init')
     command = sub.add_parser('backup')
     command.add_argument('services', nargs='*')
+    command.add_argument(
+        '--allow-low-space', action='store_true',
+        help='continue even if staging would leave less than 1 GiB free',
+    )
     sub.add_parser('run-due')
     command = sub.add_parser('snapshots')
     command.add_argument('service', nargs='?')

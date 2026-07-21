@@ -160,6 +160,47 @@ def read_control_text(path, *, encoding='utf-8', require_protected=True):
         os.close(parent_fd)
 
 
+def validate_control_file(path, *, require_protected=True):
+    """Validate a regular control file without following its leaf symlink."""
+    path = lexical_absolute(path)
+    if require_protected:
+        validate_control_directory(path.parent)
+    parent_fd = os.open(
+        path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+    fd = -1
+    try:
+        try:
+            fd = os.open(
+                path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                dir_fd=parent_fd,
+            )
+        except OSError as err:
+            if err.errno == errno.ELOOP:
+                raise ValueError(
+                    f'control file must be a regular file: {path}'
+                ) from err
+            raise
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError(f'control file must be a regular file: {path}')
+        if require_protected:
+            allowed_owners = {0}
+            if os.geteuid() != 0:
+                allowed_owners.add(os.geteuid())
+            if metadata.st_uid not in allowed_owners:
+                raise ValueError(f'control file is not owned by root: {path}')
+            if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                raise ValueError(
+                    f'control file is group/world writable: {path}'
+                )
+        return path
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        os.close(parent_fd)
+
+
 def containing_mount(path, records=None):
     path = lexical_absolute(path)
     matches = [
@@ -246,6 +287,55 @@ def _scan_payload_tree(path):
                 _scan_payload_tree(child)
                 continue
             raise ValueError(f'unsupported payload object: {child}')
+
+
+def _scan_payload_tree_fd(fd, display_path):
+    with os.scandir(fd) as entries:
+        for entry in entries:
+            metadata = entry.stat(follow_symlinks=False)
+            child = Path(display_path) / entry.name
+            if stat.S_ISLNK(metadata.st_mode) or stat.S_ISREG(metadata.st_mode):
+                continue
+            if stat.S_ISDIR(metadata.st_mode):
+                child_fd = os.open(
+                    entry.name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=fd,
+                )
+                try:
+                    _scan_payload_tree_fd(child_fd, child)
+                finally:
+                    os.close(child_fd)
+                continue
+            raise ValueError(f'unsupported payload object: {child}')
+
+
+def validate_payload_fd(fd, display_path, *, filesystem_type=None, run=None):
+    """Validate a payload through an already pinned, no-follow descriptor."""
+    metadata = os.fstat(fd)
+    display_path = Path(display_path)
+    if stat.S_ISDIR(metadata.st_mode):
+        if filesystem_type == 'btrfs' and os.geteuid() == 0:
+            runner = run or subprocess.run
+            kwargs = {
+                'text': True, 'capture_output': True, 'check': False,
+                'pass_fds': (fd,),
+            }
+            result = runner(
+                ['btrfs', 'subvolume', 'list', '-o', f'/proc/self/fd/{fd}'],
+                **kwargs,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f'cannot inspect Btrfs subvolumes below {display_path}'
+                )
+            if result.stdout.strip():
+                raise ValueError(
+                    f'nested Btrfs subvolume is not supported: {display_path}'
+                )
+        _scan_payload_tree_fd(fd, display_path)
+    elif not (stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)):
+        raise ValueError(f'unsupported payload object: {display_path}')
 
 
 def validate_payload(path, *, filesystem_type=None, run=None):

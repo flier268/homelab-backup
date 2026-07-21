@@ -6,20 +6,21 @@ from pathlib import Path
 from . import backup_state as _backup_state
 from .backup_state import load_state, save_state
 from .common import (
-    CommandError, FailureSummary, GlobalLock, _print_command_failure, die,
-    restic_env, run, run_cleanup,
+    MIN_FREE_BYTES, CommandError, FailureSummary, GlobalLock,
+    _print_command_failure, die, format_bytes, restic_env, run, run_cleanup,
 )
 from .manifest import (
-    RETENTION_FLAGS, compose_cmd, compose_model, manifest, manifests,
+    RETENTION_FLAGS, compose_model, compose_run, manifest, manifests,
     source_path, validate_manifest,
 )
 from .security import (
     atomic_copy_file, atomic_write_json, clear_control_leaf,
     ensure_private_directory, paths_overlap, validate_control_root,
-    validate_trusted_roots,
+    validate_control_file, validate_trusted_roots,
 )
 from .storage import (
-    compose_identity, hooks, resolved_volume_sources, running_services,
+    compose_identity, estimate_backup_size, hooks, resolved_volume_sources,
+    running_services,
     sync_paths, sync_volumes, validate_docker_bind_probe,
     validate_docker_environment,
     validate_no_docker_writers, validate_path_payloads, validate_runtime_sources,
@@ -27,7 +28,36 @@ from .storage import (
 from .types import GlobalConfig, ServiceManifest
 
 
-def stage_service(c: GlobalConfig, m: ServiceManifest):
+def _check_backup_space(
+        c, m, stage, estimated_size, *, allow_low_space=False,
+):
+    free = shutil.disk_usage(stage).free
+    required = estimated_size + MIN_FREE_BYTES
+    if free >= required:
+        return
+    shortfall = required - free
+    print(
+        f"WARNING: backup for {m['service']} is estimated at "
+        f'{format_bytes(estimated_size)}, but only {format_bytes(free)} is free '
+        f'on {stage}; the required 1.00 GiB reserve would be short by '
+        f'{format_bytes(shortfall)}.',
+        file=sys.stderr,
+    )
+    if allow_low_space:
+        print(
+            'WARNING: continuing because --allow-low-space was specified.',
+            file=sys.stderr,
+        )
+        return
+    raise RuntimeError(
+        'insufficient backup staging space; free additional space or explicitly '
+        'use --allow-low-space'
+    )
+
+
+def stage_service(
+        c: GlobalConfig, m: ServiceManifest, *, allow_low_space=False,
+):
     validate_manifest(m)
     validate_trusted_roots(c['trusted_data_roots'])
     staging_root = Path(c['staging_root'])
@@ -46,6 +76,31 @@ def stage_service(c: GlobalConfig, m: ServiceManifest):
     validate_runtime_sources(c, m, model, allow_missing_paths=mode == 'hooks')
     resolved_volumes = resolved_volume_sources(m, model=model)
     identity = compose_identity(m, model=model, resolved=resolved_volumes)
+
+    def sync_all():
+        estimated_size = estimate_backup_size(c, m, resolved=resolved_volumes)
+        _check_backup_space(
+            c, m, stage, estimated_size, allow_low_space=allow_low_space,
+        )
+
+        def before_copy(_source):
+            _check_backup_space(
+                c, m, stage, 0, allow_low_space=allow_low_space,
+            )
+
+        path_result = sync_paths(c, m, stage, before_copy=before_copy)
+        _check_backup_space(
+            c, m, stage, 0, allow_low_space=allow_low_space,
+        )
+        volume_result = list(sync_volumes(
+            c, m, stage, resolved=resolved_volumes,
+            before_copy=before_copy,
+        ) or [])
+        _check_backup_space(
+            c, m, stage, 0, allow_low_space=allow_low_space,
+        )
+        return path_result, volume_result
+
     if mode == 'hooks':
         try:
             hooks(m, 'before')
@@ -53,8 +108,7 @@ def stage_service(c: GlobalConfig, m: ServiceManifest):
                 m, identity, resolved_volumes, project_must_be_stopped=False,
             )
             validate_path_payloads(c, m)
-            path_inventory = sync_paths(c, m, stage)
-            volume_inventory = list(sync_volumes(c, m, stage, resolved=resolved_volumes) or [])
+            path_inventory, volume_inventory = sync_all()
         finally:
             run_cleanup(lambda: hooks(m, 'after'), 'after hook')
     elif mode == 'stop':
@@ -62,19 +116,22 @@ def stage_service(c: GlobalConfig, m: ServiceManifest):
         targets = running
         try:
             if targets:
-                run(compose_cmd(m) + ['stop', '-t', str((m.get('consistency') or {}).get('timeout', 120))] + targets, cwd=m['_dir'])
+                compose_run(
+                    m,
+                    ['stop', '-t', str(
+                        (m.get('consistency') or {}).get('timeout', 120)
+                    )] + targets,
+                    runner=run,
+                )
             validate_no_docker_writers(
                 m, identity, resolved_volumes, project_must_be_stopped=True,
             )
             validate_path_payloads(c, m)
-            path_inventory = sync_paths(c, m, stage)
-            volume_inventory = list(sync_volumes(c, m, stage, resolved=resolved_volumes) or [])
+            path_inventory, volume_inventory = sync_all()
         finally:
             if targets:
                 run_cleanup(
-                    lambda: run(
-                        compose_cmd(m) + ['start'] + targets, cwd=m['_dir'],
-                    ),
+                    lambda: compose_run(m, ['start'] + targets, runner=run),
                     'service restart',
                 )
     else:
@@ -82,8 +139,7 @@ def stage_service(c: GlobalConfig, m: ServiceManifest):
             m, identity, resolved_volumes, project_must_be_stopped=False,
         )
         validate_path_payloads(c, m)
-        path_inventory = sync_paths(c, m, stage)
-        volume_inventory = list(sync_volumes(c, m, stage, resolved=resolved_volumes) or [])
+        path_inventory, volume_inventory = sync_all()
     meta = stage / '_meta'
     ensure_private_directory(meta)
     # backup.yaml is always included as recovery metadata, even when it is not listed in sources.paths.
@@ -123,6 +179,7 @@ def retention_cmd(
 
 def backup_one(
         c: GlobalConfig, m: ServiceManifest, *, apply_retention=True,
+        allow_low_space=False,
 ):
     validate_manifest(m)
     partial_stage = (
@@ -140,7 +197,13 @@ def backup_one(
     state.setdefault('first_seen_at', started.isoformat())
     save_state(c, m['service'], state)
     try:
-        stage = stage_service(c, m)
+        stage_options = {}
+        if allow_low_space:
+            stage_options['allow_low_space'] = True
+        stage = stage_service(c, m, **stage_options)
+        _check_backup_space(
+            c, m, stage, 0, allow_low_space=allow_low_space,
+        )
         run([
             'restic', 'backup', '.', '--host', c['host_id'],
             '--tag', f"service:{m['service']}",
@@ -232,8 +295,10 @@ def cmd_validate(c, args):
         except CommandError:
             errors.append(f"missing Docker helper image: {c['volume_helper_image']}")
     for key in ('password_file', 'rclone_config'):
-        if not Path(c[key]).is_file():
-            errors.append(f'missing config file: {c[key]}')
+        try:
+            validate_control_file(c[key])
+        except (OSError, ValueError) as err:
+            errors.append(f'unsafe config file {c[key]}: {err}')
     def record_manifest_error(path, err):
         print(f'ERROR: {path}: {err}', file=sys.stderr)
         errors.append(f'{path}: {err}')
@@ -307,7 +372,10 @@ def cmd_backup(c, args):
         for m in ms:
             service = m.get('service', '<unnamed>')
             try:
-                backup_one(c, m)
+                options = {}
+                if getattr(args, 'allow_low_space', False) is True:
+                    options['allow_low_space'] = True
+                backup_one(c, m, **options)
             except Exception as err:
                 failures.record_exception(
                     service, err,

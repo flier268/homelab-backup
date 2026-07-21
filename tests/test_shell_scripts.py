@@ -1,3 +1,4 @@
+import json
 import os
 import shlex
 import shutil
@@ -573,7 +574,7 @@ class DeploymentScriptTests(unittest.TestCase):
         )
         self.assertNotIn('python3 -m venv --upgrade', script)
         self.assertIn(
-            'docker run --rm --network none "$HELPER_IMAGE" rsync --version',
+            'docker run --rm --network none "$HELPER_IMAGE_ID" rsync --version',
             script,
         )
 
@@ -583,7 +584,7 @@ class DeploymentScriptTests(unittest.TestCase):
             'install -m 0755 backupctl "$LAUNCHER_NEXT"',
         )
         helper_test = script.index(
-            'docker run --rm --network none "$HELPER_IMAGE" rsync --version',
+            'docker run --rm --network none "$HELPER_IMAGE_ID" rsync --version',
         )
         daemon_reload = script.index('systemctl daemon-reload')
         publish_release = script.index(
@@ -632,9 +633,13 @@ class DeploymentScriptTests(unittest.TestCase):
                     encoding='utf-8',
                 )
                 (release / 'volume-helper-image').write_text(
-                    f'homelab/volume-rsync:release.{label}\n',
+                    json.dumps({
+                        'tag': f'homelab/volume-rsync:release.{label}',
+                        'image_id': 'sha256:' + label.lower() * 64,
+                    }) + '\n',
                     encoding='utf-8',
                 )
+                (release / 'volume-helper-image').chmod(0o600)
                 (release / '.lease').touch(mode=0o644)
             subprocess.run(
                 [sys.executable, '-m', 'venv', str(release_a / 'venv')],
@@ -662,7 +667,7 @@ class DeploymentScriptTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(
                 result.stdout.strip(),
-                'release.A|homelab/volume-rsync:release.A',
+                f'release.A|sha256:{"a" * 64}',
             )
             self.assertEqual(
                 os.readlink(install_root / 'current'),
@@ -716,7 +721,7 @@ class DeploymentScriptTests(unittest.TestCase):
             'docker build -t "$HELPER_IMAGE" -f Dockerfile.volume-rsync .',
         )
         metadata = script.index(
-            'printf \'%s\\n\' "$HELPER_IMAGE" > '
+            '"$HELPER_IMAGE" "$HELPER_IMAGE_ID" > '
             '"$RELEASE_NEXT/volume-helper-image"',
         )
         publish = script.index('mv -Tf -- "$CURRENT_NEXT" "$CURRENT_ROOT"')
@@ -728,6 +733,15 @@ class DeploymentScriptTests(unittest.TestCase):
         self.assertLess(build, metadata)
         self.assertLess(metadata, publish)
         self.assertNotIn('docker build -t homelab/volume-rsync:1', script)
+        self.assertIn("docker image inspect --format '{{.Id}}'", script)
+
+    def test_volume_helper_dependencies_are_fully_pinned(self):
+        dockerfile = (ROOT / 'Dockerfile.volume-rsync').read_text(
+            encoding='utf-8',
+        )
+        self.assertRegex(dockerfile, r'FROM alpine:3\.22@sha256:[0-9a-f]{64}')
+        for package in ('acl', 'attr', 'coreutils', 'rsync'):
+            self.assertRegex(dockerfile, rf'\b{package}=[0-9][^\s\\]*')
 
     def test_installer_keeps_only_current_and_previous_releases(self):
         script = (ROOT / 'install.sh').read_text(encoding='utf-8')

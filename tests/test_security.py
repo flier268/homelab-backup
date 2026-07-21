@@ -4,7 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from homelab_backup import security
+from homelab_backup import common, security
 
 
 class MountPolicyTests(unittest.TestCase):
@@ -77,6 +77,35 @@ class PayloadPolicyTests(unittest.TestCase):
                     security.validate_payload(payload)
             finally:
                 handle.close()
+
+
+class RuntimeCredentialTests(unittest.TestCase):
+    def test_restic_environment_requires_protected_regular_credentials(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            password = root / 'password'
+            rclone = root / 'rclone.conf'
+            for path in (password, rclone):
+                path.write_text('secret', encoding='utf-8')
+                path.chmod(0o600)
+            config = {
+                'repository': 'rclone:test:repo',
+                'password_file': str(password),
+                'rclone_config': str(rclone),
+                'cache_root': str(root / 'cache'),
+            }
+
+            environment = common.restic_env(config)
+            self.assertEqual(environment['RESTIC_PASSWORD_FILE'], str(password))
+
+            password.chmod(0o666)
+            with self.assertRaisesRegex(ValueError, 'group/world writable'):
+                common.restic_env(config)
+
+            password.unlink()
+            password.symlink_to(rclone)
+            with self.assertRaisesRegex(ValueError, 'regular file'):
+                common.restic_env(config)
 
 
 class ManagedLeafTests(unittest.TestCase):

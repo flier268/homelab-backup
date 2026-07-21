@@ -6,7 +6,7 @@ import unittest
 import uuid
 from pathlib import Path
 
-from homelab_backup import security
+from homelab_backup import security, storage
 
 
 INTEGRATION = os.environ.get('HOMELAB_BACKUP_INTEGRATION') == '1'
@@ -17,6 +17,32 @@ INTEGRATION = os.environ.get('HOMELAB_BACKUP_INTEGRATION') == '1'
     'set HOMELAB_BACKUP_INTEGRATION=1 and run as root with Docker',
 )
 class DockerIntegrationTests(unittest.TestCase):
+    def test_volume_estimate_uses_apparent_size_for_sparse_files(self):
+        image = os.environ.get(
+            'HOMELAB_BACKUP_VOLUME_HELPER_IMAGE', 'homelab/volume-rsync:1',
+        )
+        volume = f'homelab-backup-test-{uuid.uuid4().hex}'
+        subprocess.run(
+            ['docker', 'volume', 'create', volume], check=True,
+            capture_output=True,
+        )
+        try:
+            subprocess.run([
+                'docker', 'run', '--rm', '--network', 'none',
+                '--mount', f'type=volume,src={volume},dst=/data',
+                image, 'truncate', '-s', '16M', '/data/sparse',
+            ], check=True, capture_output=True)
+            size = storage.estimate_volume_source(
+                {'volume_helper_image': image},
+                {'id': 'data', 'required': True}, volume,
+            )
+            self.assertGreaterEqual(size, 16 * 1024 * 1024)
+        finally:
+            subprocess.run(
+                ['docker', 'volume', 'rm', '-f', volume], check=False,
+                capture_output=True,
+            )
+
     def test_local_bind_and_named_volume_round_trip(self):
         image = os.environ.get(
             'HOMELAB_BACKUP_VOLUME_HELPER_IMAGE', 'homelab/volume-rsync:1',
@@ -62,6 +88,16 @@ class BtrfsIntegrationTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, 'nested Btrfs'):
                 security.validate_payload(payload, filesystem_type='btrfs')
+            fd = os.open(
+                payload, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            )
+            try:
+                with self.assertRaisesRegex(ValueError, 'nested Btrfs'):
+                    security.validate_payload_fd(
+                        fd, payload, filesystem_type='btrfs',
+                    )
+            finally:
+                os.close(fd)
         finally:
             subprocess.run(
                 ['btrfs', 'subvolume', 'delete', nested], check=False, capture_output=True,

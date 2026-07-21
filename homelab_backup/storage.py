@@ -7,13 +7,13 @@ from pathlib import Path
 
 from .common import CommandError, run, run_cleanup
 from .manifest import (
-    actual_volume_name, compose_cmd, compose_model, source_path,
+    actual_volume_name, compose_model, compose_run, source_path,
     validate_docker_volume_name,
 )
 from .security import (
     clear_control_leaf, containing_mount, docker_mount_users,
     ensure_private_directory,
-    validate_managed_leaf, validate_payload,
+    validate_managed_leaf, validate_payload, validate_payload_fd,
 )
 
 def docker_volume_exists(name):
@@ -225,23 +225,192 @@ def _missing_path_inventory(source):
     }
 
 
-def _copy_path_source(src, dst, excludes):
+def _same_object(left, right):
+    return (
+        left.st_dev == right.st_dev
+        and left.st_ino == right.st_ino
+        and stat.S_IFMT(left.st_mode) == stat.S_IFMT(right.st_mode)
+    )
+
+
+def _open_path_source(src):
     src = Path(src)
-    metadata = src.lstat()
+    initial = src.lstat()
+    if stat.S_ISLNK(initial.st_mode):
+        flags = os.O_PATH | os.O_NOFOLLOW
+    elif stat.S_ISDIR(initial.st_mode):
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    elif stat.S_ISREG(initial.st_mode):
+        flags = os.O_RDONLY | os.O_NOFOLLOW
+    else:
+        raise RuntimeError(f'unsupported path source type: {src}')
+    fd = os.open(src, flags)
+    metadata = os.fstat(fd)
+    if not _same_object(initial, metadata):
+        os.close(fd)
+        raise RuntimeError(f'path source changed while being opened: {src}')
+    return fd, metadata
+
+
+def _verify_path_source(src, metadata):
+    try:
+        current = Path(src).lstat()
+    except FileNotFoundError as err:
+        raise RuntimeError(f'path source changed during backup: {src}') from err
+    if not _same_object(metadata, current):
+        raise RuntimeError(f'path source changed during backup: {src}')
+
+
+def _estimate_open_source(fd, metadata, display_path):
+    allocated = metadata.st_blocks * 512
+    if stat.S_ISREG(metadata.st_mode):
+        return max(metadata.st_size, allocated)
+    if stat.S_ISLNK(metadata.st_mode):
+        return max(len(os.fsencode(os.readlink('', dir_fd=fd))), allocated)
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise ValueError(f'unsupported payload object: {display_path}')
+    total = max(4096, allocated)
+    with os.scandir(fd) as entries:
+        for entry in entries:
+            before = entry.stat(follow_symlinks=False)
+            if stat.S_ISDIR(before.st_mode):
+                flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            elif stat.S_ISREG(before.st_mode):
+                flags = os.O_RDONLY | os.O_NOFOLLOW
+            elif stat.S_ISLNK(before.st_mode):
+                flags = os.O_PATH | os.O_NOFOLLOW
+            else:
+                raise ValueError(
+                    f'unsupported payload object: {Path(display_path) / entry.name}'
+                )
+            child_fd = os.open(entry.name, flags, dir_fd=fd)
+            try:
+                current = os.fstat(child_fd)
+                if not _same_object(before, current):
+                    raise RuntimeError(
+                        f'path source changed during size estimation: '
+                        f'{Path(display_path) / entry.name}'
+                    )
+                total += _estimate_open_source(
+                    child_fd, current, Path(display_path) / entry.name,
+                )
+            finally:
+                os.close(child_fd)
+    return total
+
+
+def estimate_path_source(c, m, source):
+    src = source_path(m, source)
+    if not (src.exists() or src.is_symlink()):
+        if source.get('required', True):
+            raise ValueError(f'missing source {src}')
+        return 0
+    validate_managed_leaf(src, c['trusted_data_roots'])
+    filesystem = containing_mount(src).filesystem_type
+    fd, metadata = _open_path_source(src)
+    try:
+        validate_payload_fd(fd, src, filesystem_type=filesystem)
+        size = _estimate_open_source(fd, metadata, src)
+        _verify_path_source(src, metadata)
+        return size
+    finally:
+        os.close(fd)
+
+
+def _parse_du_size(result, name):
+    fields = result.stdout.split()
+    if not fields or not fields[0].isdigit():
+        raise RuntimeError(f'invalid size estimate for Docker volume: {name}')
+    return int(fields[0])
+
+
+def estimate_volume_source(c, source, name):
+    name = validate_docker_volume_name(name)
+    if not docker_volume_exists(name):
+        if source.get('required', True):
+            raise RuntimeError(
+                f'Docker volume does not exist or is inaccessible: {name}'
+            )
+        return 0
+    base = [
+        'docker', 'run', '--rm', '--network', 'none',
+        '--mount', f'type=volume,src={name},dst=/src,readonly',
+        c['volume_helper_image'], 'du', '-s', '-B1', '-x',
+    ]
+    allocated = _parse_du_size(run(base + ['/src'], capture=True), name)
+    apparent = _parse_du_size(
+        run(base + ['--apparent-size', '/src'], capture=True), name,
+    )
+    return max(allocated, apparent)
+
+
+def estimate_backup_size(c, m, resolved=None):
+    total = sum(
+        estimate_path_source(c, m, source)
+        for source in (m.get('sources') or {}).get('paths', [])
+    )
+    volume_sources = (
+        resolved_volume_sources(m) if resolved is None else resolved
+    )
+    total += sum(
+        estimate_volume_source(c, source, name)
+        for source, name in volume_sources
+    )
+    return total
+
+
+def _copy_path_source(src, dst, excludes, *, fd=None, metadata=None):
+    src = Path(src)
+    own_fd = fd is None
+    if own_fd:
+        fd, metadata = _open_path_source(src)
     dst.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
     clear_control_leaf(dst)
     dst.mkdir(parents=True, mode=0o700)
     archived = dst / src.name
-    if stat.S_ISLNK(metadata.st_mode):
-        run(['rsync', '-aHAX', '--numeric-ids', str(src), str(archived)])
-        return 'symlink'
-    if stat.S_ISDIR(metadata.st_mode):
-        rsync(src, dst, excludes)
-        return 'directory'
-    if stat.S_ISREG(metadata.st_mode):
-        run(['rsync', '-aHAX', '--numeric-ids', str(src), str(archived)])
-        return 'file'
-    raise RuntimeError(f'unsupported path source type: {src}')
+    try:
+        if stat.S_ISLNK(metadata.st_mode):
+            target = os.readlink('', dir_fd=fd)
+            os.symlink(target, archived)
+            try:
+                os.chown(
+                    archived, metadata.st_uid, metadata.st_gid,
+                    follow_symlinks=False,
+                )
+            except PermissionError:
+                if os.geteuid() == 0:
+                    raise
+            os.utime(
+                archived,
+                ns=(metadata.st_atime_ns, metadata.st_mtime_ns),
+                follow_symlinks=False,
+            )
+            for name in os.listxattr(src, follow_symlinks=False):
+                value = os.getxattr(src, name, follow_symlinks=False)
+                os.setxattr(
+                    archived, name, value, follow_symlinks=False,
+                )
+            source_type = 'symlink'
+        elif stat.S_ISDIR(metadata.st_mode):
+            cmd = ['rsync', '-aHAX', '--numeric-ids', '--delete']
+            for item in excludes or []:
+                cmd += ['--exclude', item]
+            cmd += [f'/proc/self/fd/{fd}/', f'{dst}/']
+            run(cmd, pass_fds=(fd,))
+            source_type = 'directory'
+        elif stat.S_ISREG(metadata.st_mode):
+            run([
+                'rsync', '-aHAX', '--numeric-ids', '--copy-unsafe-links',
+                f'/proc/self/fd/{fd}', str(archived),
+            ], pass_fds=(fd,))
+            source_type = 'file'
+        else:
+            raise RuntimeError(f'unsupported path source type: {src}')
+        _verify_path_source(src, metadata)
+        return source_type
+    finally:
+        if own_fd:
+            os.close(fd)
 
 
 def validate_path_payloads(c, m, *, allow_missing=False):
@@ -257,7 +426,7 @@ def validate_path_payloads(c, m, *, allow_missing=False):
         validate_payload(src, filesystem_type=filesystem)
 
 
-def sync_paths(c, m=None, stage=None):
+def sync_paths(c, m=None, stage=None, *, before_copy=None):
     if stage is None:
         # Backward-compatible library call used by focused unit tests. The
         # root-only CLI always supplies the explicit global policy.
@@ -280,10 +449,20 @@ def sync_paths(c, m=None, stage=None):
             inventory.append(_missing_path_inventory(source))
             continue
         try:
+            if before_copy is not None:
+                before_copy(source)
             validate_managed_leaf(src, c['trusted_data_roots'])
             filesystem = containing_mount(src).filesystem_type
-            validate_payload(src, filesystem_type=filesystem)
-            source_type = _copy_path_source(src, dst, source.get('exclude'))
+            fd, metadata = _open_path_source(src)
+            try:
+                validate_payload_fd(
+                    fd, src, filesystem_type=filesystem,
+                )
+                source_type = _copy_path_source(
+                    src, dst, source.get('exclude'), fd=fd, metadata=metadata,
+                )
+            finally:
+                os.close(fd)
         except FileNotFoundError:
             if source.get('required', True):
                 raise ValueError(f'missing source {src}')
@@ -299,7 +478,9 @@ def sync_paths(c, m=None, stage=None):
     return inventory
 
 
-def sync_volumes(c, m, stage, restore=False, resolved=None):
+def sync_volumes(
+        c, m, stage, restore=False, resolved=None, *, before_copy=None,
+):
     volume_sources = resolved_volume_sources(m) if resolved is None else resolved
     inventory = []
     for source, name in volume_sources:
@@ -326,6 +507,8 @@ def sync_volumes(c, m, stage, restore=False, resolved=None):
                     'actual_name': name, 'present': False,
                 })
                 continue
+            if before_copy is not None:
+                before_copy(source)
             dst.mkdir(parents=True, exist_ok=True)
             cmd = [
                 'docker', 'run', '--rm', '--network', 'none',
@@ -378,8 +561,8 @@ def hooks(m, key):
 
 
 def running_services(m):
-    result = run(
-        compose_cmd(m) + ['ps', '--services', '--filter', 'status=running'],
-        cwd=m['_dir'], capture=True,
+    result = compose_run(
+        m, ['ps', '--services', '--filter', 'status=running'], capture=True,
+        runner=run,
     )
     return [x for x in result.stdout.splitlines() if x.strip()]

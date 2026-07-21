@@ -181,9 +181,16 @@ if [[ ! -f /etc/homelab-backup/config.yaml ]]; then
   install -m 0600 config.yaml.example /etc/homelab-backup/config.yaml
 fi
 docker build -t "$HELPER_IMAGE" -f Dockerfile.volume-rsync .
-docker run --rm --network none "$HELPER_IMAGE" rsync --version >/dev/null
+HELPER_IMAGE_ID="$(docker image inspect --format '{{.Id}}' "$HELPER_IMAGE")"
+if [[ ! "$HELPER_IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+  echo "ERROR: Docker returned an invalid helper image ID: $HELPER_IMAGE_ID" >&2
+  exit 1
+fi
+docker run --rm --network none "$HELPER_IMAGE_ID" rsync --version >/dev/null
 install -m 0644 /dev/null "$RELEASE_NEXT/volume-helper-image"
-printf '%s\n' "$HELPER_IMAGE" > "$RELEASE_NEXT/volume-helper-image"
+python3 -c \
+  'import json,sys; print(json.dumps({"tag": sys.argv[1], "image_id": sys.argv[2]}, separators=(",", ":")))' \
+  "$HELPER_IMAGE" "$HELPER_IMAGE_ID" > "$RELEASE_NEXT/volume-helper-image"
 
 if [[ -e "$CURRENT_NEXT" || -L "$CURRENT_NEXT" ]]; then
   echo "ERROR: temporary release link already exists: $CURRENT_NEXT" >&2
@@ -261,7 +268,21 @@ for release in "$RELEASES_ROOT"/release.*; do
     fi
     obsolete_helper=
     if [[ -f "$release/volume-helper-image" ]]; then
-      obsolete_helper="$(sed -n '1p' "$release/volume-helper-image")"
+      obsolete_metadata="$(sed -n '1p' "$release/volume-helper-image")"
+      if [[ "$obsolete_metadata" == \{* ]]; then
+        if ! obsolete_helper="$(
+          python3 -c \
+            'import json,sys; value=json.load(open(sys.argv[1], encoding="utf-8")); print(value["tag"])' \
+            "$release/volume-helper-image"
+        )"; then
+          echo "WARNING: invalid obsolete helper image metadata; retaining release for inspection: $release" >&2
+          exec {release_lease_fd}<&-
+          continue
+        fi
+      else
+        # Releases installed before image-ID pinning stored only the tag.
+        obsolete_helper="$obsolete_metadata"
+      fi
     fi
     if [[ -n "$obsolete_helper" &&
           ! "$obsolete_helper" =~ ^homelab/volume-rsync:release\.[A-Za-z0-9]+$ ]]; then

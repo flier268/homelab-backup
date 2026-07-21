@@ -18,6 +18,7 @@ retention:
 
 compose:
   files: [compose.yaml]
+  env_file: .env
 
 consistency:
   mode: stop
