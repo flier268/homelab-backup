@@ -1,6 +1,8 @@
 import json
 import tempfile
 import unittest
+from contextlib import redirect_stderr
+from io import StringIO
 from pathlib import Path
 from unittest import mock
 
@@ -53,6 +55,33 @@ class RepositoryBoundaryTests(unittest.TestCase):
                 )
         run_mock.assert_not_called()
 
+    def test_restore_size_is_scoped_to_service_snapshot_and_host(self):
+        result = mock.Mock(stdout=json.dumps({
+            'total_size': 123456,
+            'total_file_count': 7,
+        }))
+        config_data = {'host_id': 'host'}
+        with mock.patch.object(backupctl, 'run', return_value=result) as run_mock, \
+                mock.patch.object(backupctl, 'restic_env', return_value={'RESTIC': 'env'}):
+            size = backupctl.estimate_restore_size(
+                config_data, 'demo', '01234567',
+            )
+
+        self.assertEqual(size, 123456)
+        run_mock.assert_called_once_with([
+            'restic', 'stats', '--json', '--mode', 'restore-size',
+            '--host', 'host', '--tag', 'service:demo', '01234567',
+        ], env={'RESTIC': 'env'}, capture=True)
+
+    def test_invalid_restore_size_output_is_rejected(self):
+        result = mock.Mock(stdout=json.dumps({'total_size': -1}))
+        with mock.patch.object(backupctl, 'run', return_value=result), \
+                mock.patch.object(backupctl, 'restic_env', return_value={}):
+            with self.assertRaisesRegex(RuntimeError, 'restore size'):
+                backupctl.estimate_restore_size(
+                    {'host_id': 'host'}, 'demo', 'latest',
+                )
+
 class RestoredManifestTests(unittest.TestCase):
 
     def test_snapshot_manifest_symlink_is_rejected(self):
@@ -97,6 +126,98 @@ class RestoredManifestTests(unittest.TestCase):
             self.assertEqual(target.read_text(encoding='utf-8'), original)
 
 class RestoreCommandTests(unittest.TestCase):
+
+    def test_low_space_restore_requires_explicit_override_without_tty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_data = {
+                'host_id': 'host',
+                'restore_root': str(Path(tmp) / 'restores'),
+            }
+            error = StringIO()
+            with mock.patch.object(
+                backupctl, 'estimate_restore_size', return_value=2 * 1024**3,
+            ), mock.patch.object(
+                backupctl, 'ensure_private_directory',
+                return_value=Path(config_data['restore_root']),
+            ), mock.patch.object(
+                backupctl.shutil, 'disk_usage',
+                return_value=mock.Mock(free=3 * 1024**3 - 1),
+            ), mock.patch.object(
+                backupctl.sys.stdin, 'isatty', return_value=False,
+            ), redirect_stderr(error), self.assertRaisesRegex(
+                RuntimeError, '--allow-low-space',
+            ):
+                backupctl.check_restore_space(
+                    config_data, 'demo', 'latest', allow_low_space=False,
+                )
+
+            self.assertIn('WARNING:', error.getvalue())
+
+    def test_low_space_restore_can_be_explicitly_allowed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_data = {
+                'host_id': 'host',
+                'restore_root': str(Path(tmp) / 'restores'),
+            }
+            error = StringIO()
+            with mock.patch.object(
+                backupctl, 'estimate_restore_size', return_value=2 * 1024**3,
+            ), mock.patch.object(
+                backupctl, 'ensure_private_directory',
+                return_value=Path(config_data['restore_root']),
+            ), mock.patch.object(
+                backupctl.shutil, 'disk_usage',
+                return_value=mock.Mock(free=2 * 1024**3),
+            ), redirect_stderr(error):
+                backupctl.check_restore_space(
+                    config_data, 'demo', 'latest', allow_low_space=True,
+                )
+
+            self.assertIn('WARNING:', error.getvalue())
+
+    def test_restore_with_exactly_one_gib_remaining_is_allowed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_data = {
+                'host_id': 'host',
+                'restore_root': str(Path(tmp) / 'restores'),
+            }
+            error = StringIO()
+            with mock.patch.object(
+                backupctl, 'estimate_restore_size', return_value=2 * 1024**3,
+            ), mock.patch.object(
+                backupctl, 'ensure_private_directory',
+                return_value=Path(config_data['restore_root']),
+            ), mock.patch.object(
+                backupctl.shutil, 'disk_usage',
+                return_value=mock.Mock(free=3 * 1024**3),
+            ), redirect_stderr(error):
+                backupctl.check_restore_space(
+                    config_data, 'demo', 'latest', allow_low_space=False,
+                )
+
+            self.assertEqual(error.getvalue(), '')
+
+    def test_low_space_override_is_forwarded_to_each_restore(self):
+        args = mock.Mock(
+            services=['demo'], all=False, yes=True, apply=False, start=False,
+            restore_manifest=False, keep_manifest=True, snapshot='latest',
+            allow_low_space=True,
+        )
+        restored = (mock.Mock(), Path('/restore/demo'))
+        with mock.patch.object(
+            backupctl, 'repository_services', return_value=['demo'],
+        ), mock.patch.object(
+            backupctl, 'GlobalLock',
+        ) as lock_mock, mock.patch.object(
+            backupctl, 'restore_one', return_value=restored,
+        ) as restore_mock:
+            lock_mock.return_value.__enter__.return_value = True
+            backupctl.cmd_restore({'lock_file': '/run/test.lock'}, args)
+
+        restore_mock.assert_called_once_with(
+            {'lock_file': '/run/test.lock'}, 'demo', 'latest', 'keep',
+            allow_low_space=True,
+        )
 
     def test_positional_services_cannot_be_combined_with_all(self):
         args = mock.Mock(

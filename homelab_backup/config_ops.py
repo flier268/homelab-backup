@@ -9,6 +9,8 @@ import stat
 import sys
 import tempfile
 
+import yaml
+
 from . import config as config_module
 from .common import load_yaml
 
@@ -21,7 +23,11 @@ CONFIG_MEMBERS = (
 
 
 def config_lock_path(config_path):
-    config = load_yaml(Path(config_path))
+    path = Path(config_path)
+    try:
+        config = load_yaml(path, protected=True)
+    except (FileNotFoundError, OSError, UnicodeError, ValueError, yaml.YAMLError) as err:
+        raise SystemExit(f'ERROR: cannot securely read {path}: {err}') from err
     lock_file = config.get('lock_file')
     if not isinstance(lock_file, str) or not Path(lock_file).is_absolute():
         raise SystemExit('ERROR: config lock_file must be an absolute path')

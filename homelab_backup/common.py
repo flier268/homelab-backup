@@ -108,7 +108,11 @@ def run(cmd, *, cwd=None, env=None, check=True, capture=False, pass_fds=()):
     return result
 
 
-def load_yaml(path):
+def load_yaml(path, *, protected=False):
+    if protected:
+        from .security import read_control_text
+        content = read_control_text(path)
+        return yaml.safe_load(content) or {}
     with open(path, encoding='utf-8') as f:
         return yaml.safe_load(f) or {}
 

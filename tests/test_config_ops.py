@@ -51,9 +51,23 @@ class ConfigOpsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             config = Path(tmp) / 'config.yaml'
             config.write_text('lock_file: /run/demo.lock\n', encoding='utf-8')
+            config.chmod(0o600)
             self.assertEqual(config_ops.config_lock_path(config), '/run/demo.lock')
             config.write_text('lock_file: relative.lock\n', encoding='utf-8')
             with self.assertRaisesRegex(SystemExit, 'absolute path'):
+                config_ops.config_lock_path(config)
+
+    def test_lock_path_rejects_symlinked_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / 'target.yaml'
+            target.write_text('lock_file: /run/demo.lock\n', encoding='utf-8')
+            config = root / 'config.yaml'
+            config.symlink_to(target)
+
+            with mock.patch(
+                'homelab_backup.security.validate_control_directory',
+            ), self.assertRaisesRegex(SystemExit, 'regular file'):
                 config_ops.config_lock_path(config)
 
     def test_lock_validation_rejects_a_symlink_leaf(self):

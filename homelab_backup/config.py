@@ -1,12 +1,22 @@
 import os
 from pathlib import Path
 
+import yaml
+
 from .common import die, load_yaml
 from .security import lexical_absolute, paths_overlap
 from .types import GlobalConfig
 
 CFG = Path('/etc/homelab-backup/config.yaml')
 
+
+def _load_config():
+    try:
+        return load_yaml(CFG, protected=True)
+    except FileNotFoundError:
+        die(f'missing {CFG}')
+    except (OSError, UnicodeError, ValueError, yaml.YAMLError) as err:
+        die(f'cannot securely read {CFG}: {err}')
 
 
 def _validate_config_header(c):
@@ -106,9 +116,7 @@ def _validate_root_separation(c, trusted_roots):
 
 
 def cfg() -> GlobalConfig:
-    if not CFG.exists():
-        die(f'missing {CFG}')
-    c = load_yaml(CFG)
+    c = _load_config()
     _validate_config_header(c)
     release_helper_image = os.environ.get(
         'HOMELAB_BACKUP_RELEASE_VOLUME_HELPER_IMAGE',
@@ -123,8 +131,6 @@ def cfg() -> GlobalConfig:
 
 def config_lock_file():
     """Read only enough config to select the lock guarding a full reload."""
-    if not CFG.exists():
-        die(f'missing {CFG}')
-    candidate = load_yaml(CFG)
+    candidate = _load_config()
     _validate_config_header(candidate)
     return candidate['lock_file']

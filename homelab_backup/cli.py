@@ -76,6 +76,10 @@ def build_parser():
         '--yes', action='store_true',
         help='confirm restore; required whenever stdin is not a TTY',
     )
+    command.add_argument(
+        '--allow-low-space', action='store_true',
+        help='continue even if the restore would leave less than 1 GiB free',
+    )
     manifest_group = command.add_mutually_exclusive_group()
     manifest_group.add_argument('--restore-manifest', action='store_true', help='replace local backup.yaml from snapshot')
     manifest_group.add_argument('--keep-manifest', action='store_true', help='keep an existing local backup.yaml')

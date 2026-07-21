@@ -1,6 +1,7 @@
 import curses
 import json
 import re
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -17,6 +18,9 @@ from .security import (
 from .storage import (
     validate_docker_bind_probe, validate_docker_environment,
 )
+
+
+MIN_RESTORE_FREE_BYTES = 1024**3
 
 
 def _repository_snapshots(c, *filters):
@@ -69,6 +73,63 @@ def resolve_explicit_snapshot(c, service, selector):
     if len(matches) > 1:
         die(f'snapshot prefix {selector!r} is ambiguous for service {service!r}')
     return matches[0]
+
+
+def estimate_restore_size(c, service, snapshot):
+    """Return Restic's estimated expanded size for one service snapshot."""
+    result = run([
+        'restic', 'stats', '--json', '--mode', 'restore-size',
+        '--host', c['host_id'], '--tag', f'service:{service}', snapshot,
+    ], env=restic_env(c), capture=True)
+    try:
+        stats = json.loads(result.stdout)
+    except json.JSONDecodeError as err:
+        raise RuntimeError(f'invalid JSON from restic restore size: {err}') from err
+    size = stats.get('total_size') if isinstance(stats, dict) else None
+    if type(size) is not int or size < 0:
+        raise RuntimeError('invalid restore size returned by restic stats')
+    return size
+
+
+def _format_bytes(value):
+    amount = float(value)
+    for unit in ('B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB'):
+        if amount < 1024 or unit == 'PiB':
+            return f'{amount:.2f} {unit}'
+        amount /= 1024
+
+
+def check_restore_space(c, service, snapshot, *, allow_low_space=False):
+    """Require enough free restore space to retain a 1 GiB safety margin."""
+    restore_root = ensure_private_directory(c['restore_root'])
+    restore_size = estimate_restore_size(c, service, snapshot)
+    free = shutil.disk_usage(restore_root).free
+    required = restore_size + MIN_RESTORE_FREE_BYTES
+    if free >= required:
+        return
+
+    shortfall = required - free
+    print(
+        f'WARNING: restore for {service} is estimated at '
+        f'{_format_bytes(restore_size)}, but only {_format_bytes(free)} is free '
+        f'on {restore_root}; the required 1.00 GiB reserve would be short by '
+        f'{_format_bytes(shortfall)}.',
+        file=sys.stderr,
+    )
+    if allow_low_space:
+        print(
+            'WARNING: continuing because --allow-low-space was specified.',
+            file=sys.stderr,
+        )
+        return
+    if sys.stdin.isatty() and prompt_yes_no(
+        'Continue despite insufficient restore space?', default=False,
+    ):
+        return
+    raise RuntimeError(
+        'insufficient restore space; free additional space or explicitly '
+        'use --allow-low-space'
+    )
 
 
 def _selector_screen(stdscr, title, items):
@@ -183,9 +244,14 @@ def prepare_restored_manifest(c, service, root, *, policy='ask'):
     return m
 
 
-def restore_one(c, service, snapshot, manifest_policy):
+def restore_one(
+        c, service, snapshot, manifest_policy, *, allow_low_space=False,
+):
     if not valid_service_name(service):
         raise ValueError(f'invalid service name from repository: {service!r}')
+    check_restore_space(
+        c, service, snapshot, allow_low_space=allow_low_space,
+    )
     restore_root = ensure_private_directory(c['restore_root'])
     service_root = ensure_private_directory(restore_root / service)
     root = service_root / (
@@ -319,6 +385,9 @@ def cmd_restore(c, args):
         validate_trusted_roots(c['trusted_data_roots'])
 
     policy = 'restore' if args.restore_manifest else 'keep' if args.keep_manifest else 'ask'
+    restore_options = {}
+    if vars(args).get('allow_low_space', False):
+        restore_options['allow_low_space'] = True
     restored = []
     failures = FailureSummary()
     with GlobalLock(c['lock_file']) as acquired:
@@ -327,7 +396,9 @@ def cmd_restore(c, args):
         for service in selected:
             print(f'\n== Restore: {service} ==')
             try:
-                m, root = restore_one(c, service, snapshot, policy)
+                m, root = restore_one(
+                    c, service, snapshot, policy, **restore_options,
+                )
                 if args.apply:
                     restore_apply.apply_one(c, m, root, start_services=args.start)
                     try:

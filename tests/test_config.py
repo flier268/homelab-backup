@@ -5,6 +5,8 @@ from io import StringIO
 from pathlib import Path
 from unittest import mock
 
+import yaml
+
 from homelab_backup import config, manifest as manifest_module
 from tests.helpers import manifest
 
@@ -197,6 +199,55 @@ class GlobalConfigValidationTests(unittest.TestCase):
                         mock.patch.object(config, 'load_yaml', return_value=config_data), \
                         self.assertRaisesRegex(SystemExit, '1'):
                     config.cfg()
+
+    def test_global_config_symlink_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / 'target.yaml'
+            target.write_text(
+                yaml.safe_dump(self.config_data(root)), encoding='utf-8',
+            )
+            config_path = root / 'config.yaml'
+            config_path.symlink_to(target)
+
+            with mock.patch.object(config, 'CFG', config_path), \
+                    mock.patch(
+                        'homelab_backup.security.validate_control_directory',
+                    ), \
+                    self.assertRaises(SystemExit):
+                config.cfg()
+
+    def test_group_writable_global_config_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / 'config.yaml'
+            config_path.write_text(
+                yaml.safe_dump(self.config_data(root)), encoding='utf-8',
+            )
+            config_path.chmod(0o660)
+
+            with mock.patch.object(config, 'CFG', config_path), \
+                    mock.patch(
+                        'homelab_backup.security.validate_control_directory',
+                    ), \
+                    self.assertRaises(SystemExit):
+                config.cfg()
+
+    def test_lock_selection_uses_the_same_protected_config_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / 'target.yaml'
+            target.write_text(
+                yaml.safe_dump(self.config_data(root)), encoding='utf-8',
+            )
+            config_path = root / 'config.yaml'
+            config_path.symlink_to(target)
+
+            with mock.patch.object(config, 'CFG', config_path), \
+                    mock.patch(
+                        'homelab_backup.security.validate_control_directory',
+                    ), self.assertRaises(SystemExit):
+                config.config_lock_file()
 
     def test_installed_release_helper_image_overrides_persistent_config(self):
         with tempfile.TemporaryDirectory() as tmp:

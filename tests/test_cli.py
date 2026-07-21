@@ -17,6 +17,13 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class LauncherTests(unittest.TestCase):
+    def test_restore_parser_accepts_explicit_low_space_override(self):
+        args = cli.build_parser().parse_args([
+            'restore', 'demo', '--allow-low-space', '--yes',
+        ])
+
+        self.assertTrue(args.allow_low_space)
+
     def test_cleanup_restores_parser_supports_selected_and_batch_modes(self):
         selected = cli.build_parser().parse_args([
             'cleanup-restores', 'demo/20260717-120000-000000001', '--yes',

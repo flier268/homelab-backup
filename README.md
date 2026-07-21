@@ -129,6 +129,11 @@ sudo backupctl restore minecraft --snapshot 01234567 --apply
 安全政策：只要 stdin 不是 TTY，所有 `restore`（包含只下載、不加
 `--apply`）都必須明確指定 `--yes`。
 
+下載每個 service 前，程式會以 Restic 的 `restore-size` 估算 snapshot 展開後的
+大小，並確認 `restore_root` 所在檔案系統完成下載後至少還有 1 GiB 可用空間。
+空間不足時會顯示估算值與缺口：互動模式可再次確認後繼續；非互動模式必須另外
+明確指定 `--allow-low-space`。`--yes` 本身不會略過磁碟空間保護。
+
 `restore --apply` 成功後會自動刪除該次下載的暫存副本；套用失敗或單純下載
 則保留，方便檢查或稍後手動套用。手動刪除指定副本或批量刪除全部副本：
 
