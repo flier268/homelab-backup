@@ -1,0 +1,136 @@
+name: CI and Release
+
+on:
+  push:
+    branches:
+      - "**"
+    tags:
+      - "v*"
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  static-checks:
+    name: Static checks
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install --yes shellcheck
+
+      - name: Check Python syntax
+        run: python3 -m py_compile backupctl homelab_backup/*.py
+
+      - name: Check shell syntax
+        run: |
+          bash -n install.sh
+          bash -n backup-configs.sh
+          bash -n restore-configs.sh
+          bash -n config-ops-runtime.sh
+
+      - name: Run ShellCheck
+        run: shellcheck install.sh backup-configs.sh restore-configs.sh config-ops-runtime.sh
+
+  tests:
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version:
+          - "3.10"
+          - "3.12"
+          - "3.13"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install locked dependencies
+        run: python -m pip install --require-hashes -r requirements.txt
+
+      - name: Run unit tests
+        # The supported runtime and security tests require root-owned control
+        # paths. Use the exact Python selected by setup-python under sudo.
+        run: sudo "$(command -v python)" -m unittest discover -s tests -v
+
+      - name: Smoke-test repository launcher
+        run: |
+          ./backupctl --help >/dev/null
+          ./backupctl --version
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - static-checks
+      - tests
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Validate release version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Release tag must use vX.Y.Z format: $RELEASE_TAG" >&2
+            exit 1
+          fi
+
+          declared_version="$(python3 - <<'PY'
+          from homelab_backup import VERSION
+          print(VERSION)
+          PY
+          )"
+          if [[ "v$declared_version" != "$RELEASE_TAG" ]]; then
+            echo "Tag $RELEASE_TAG does not match homelab_backup.VERSION ($declared_version)." >&2
+            exit 1
+          fi
+
+      - name: Build release archive
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          version="${RELEASE_TAG#v}"
+          archive="homelab-backup-${version}.tar"
+          mkdir -p dist
+          git archive \
+            --format=tar \
+            --prefix="homelab-backup-${version}/" \
+            --output="dist/$archive" \
+            "$GITHUB_SHA"
+          gzip --no-name "dist/$archive"
+          cd dist
+          sha256sum "${archive}.gz" > SHA256SUMS
+
+      - name: Publish release and assets
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$RELEASE_TAG" \
+            dist/homelab-backup-*.tar.gz \
+            dist/SHA256SUMS \
+            --verify-tag \
+            --generate-notes \
+            --title "homelab-backup $RELEASE_TAG"

@@ -25,6 +25,20 @@ cd homelab-backup
 sudo ./install.sh
 ```
 
+也可從 GitHub Releases 下載版本化的 `homelab-backup-X.Y.Z.tar.gz`，先用同一個
+Release 內的 `SHA256SUMS` 驗證，再解壓並執行安裝：
+
+```bash
+sha256sum --check SHA256SUMS
+tar -xzf homelab-backup-X.Y.Z.tar.gz
+cd homelab-backup-X.Y.Z
+sudo ./install.sh
+```
+
+維護者推送與 `homelab_backup.VERSION` 相同的 `vX.Y.Z` 標籤後，GitHub Actions
+會在 CI 全數通過時自動建立 Release、產生 release notes，並附上 archive 與
+checksum。一般 push 與 pull request 只執行 CI，不會發布。
+
 安裝期間不要關機；若因斷電中止，重新執行同一個 `install.sh` 讓完整 release
 重新發布。安裝器不維護跨斷電 transaction journal。
 
