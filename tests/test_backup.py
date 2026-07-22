@@ -7,7 +7,7 @@ from contextlib import redirect_stderr
 from pathlib import Path
 from unittest import mock
 
-from homelab_backup import backup, common, storage
+from homelab_backup import backup, capture, common, staging, storage
 from tests.helpers import manifest
 
 
@@ -117,8 +117,8 @@ class StagingLifecycleTests(unittest.TestCase):
                 dump.mkdir()
                 (dump / 'database.sql').write_text('dump', encoding='utf-8')
 
-        with mock.patch.object(backup, 'hooks', side_effect=create_dump), \
-                mock.patch.object(backup, 'sync_volumes'):
+        with mock.patch.object(capture, 'hooks', side_effect=create_dump), \
+                mock.patch.object(capture, 'sync_volumes'):
             stage = backup.stage_service(self.config, value)
 
         self.assertEqual(
@@ -134,7 +134,7 @@ class StagingLifecycleTests(unittest.TestCase):
 
         with mock.patch.object(
             storage, 'docker_volume_exists', return_value=False,
-        ), mock.patch.object(backup, 'hooks') as hooks_mock:
+        ), mock.patch.object(capture, 'hooks') as hooks_mock:
             with self.assertRaisesRegex(
                 RuntimeError, 'Docker volume does not exist',
             ):
@@ -150,21 +150,21 @@ class StagingLifecycleTests(unittest.TestCase):
             'trusted_data_roots': [str(self.root / 'demo')],
         }
         self.docker_patch = mock.patch.object(
-            backup, 'validate_docker_environment', return_value='unix:///var/run/docker.sock',
+            staging, 'validate_docker_environment', return_value='unix:///var/run/docker.sock',
         )
         self.compose_patch = mock.patch.object(
-            backup, 'compose_model', return_value={
+            staging, 'compose_model', return_value={
                 'name': 'demo', 'services': {'app': {}}, 'volumes': {},
             },
         )
         self.writer_patch = mock.patch.object(
-            backup, 'validate_no_docker_writers', return_value=None,
+            capture, 'validate_no_docker_writers', return_value=None,
         )
         self.bind_probe_patch = mock.patch.object(
-            backup, 'validate_docker_bind_probe', return_value=None,
+            staging, 'validate_docker_bind_probe', return_value=None,
         )
         self.snapshot_patch = mock.patch.object(
-            backup, 'cleanup_snapshot_state', return_value=None,
+            staging, 'cleanup_snapshot_state', return_value=None,
         )
         self.docker_patch.start()
         self.compose_patch.start()
@@ -189,9 +189,9 @@ class StagingLifecycleTests(unittest.TestCase):
         stale.write_text('old data', encoding='utf-8')
 
         value = manifest(self.root)
-        with mock.patch.object(backup, 'sync_paths', return_value=[]), \
-                mock.patch.object(backup, 'sync_volumes'), \
-                mock.patch.object(backup, 'hooks'):
+        with mock.patch.object(capture, 'sync_paths', return_value=[]), \
+                mock.patch.object(capture, 'sync_volumes'), \
+                mock.patch.object(capture, 'hooks'):
             backup.stage_service(self.config, value)
 
         self.assertFalse(stale.exists())
@@ -205,7 +205,7 @@ class StagingLifecycleTests(unittest.TestCase):
             'trusted_data_roots': [str(self.root / 'demo')],
         }
 
-        with mock.patch.object(backup, 'sync_paths') as sync_mock:
+        with mock.patch.object(capture, 'sync_paths') as sync_mock:
             with self.assertRaisesRegex(ValueError, 'overlaps'):
                 backup.stage_service(config, value)
 
@@ -217,16 +217,16 @@ class StagingLifecycleTests(unittest.TestCase):
         victim.mkdir()
         sentinel = victim / 'keep-me'
         sentinel.write_text('important', encoding='utf-8')
-        staging = self.root / 'staging'
-        staging.mkdir()
-        staging.chmod(0o700)
-        (staging / 'demo').symlink_to(victim, target_is_directory=True)
+        staging_root = self.root / 'staging'
+        staging_root.mkdir()
+        staging_root.chmod(0o700)
+        (staging_root / 'demo').symlink_to(victim, target_is_directory=True)
 
         value = manifest(self.root)
-        with mock.patch.object(backup, 'sync_paths') as sync_mock:
+        with mock.patch.object(capture, 'sync_paths') as sync_mock:
             with self.assertRaisesRegex(ValueError, 'symbolic link'):
                 backup.stage_service({
-                    'staging_root': str(staging),
+                'staging_root': str(staging_root),
                     'trusted_data_roots': [str(self.root / 'demo')],
                 }, value)
 
@@ -246,7 +246,7 @@ class StagingLifecycleTests(unittest.TestCase):
             'capture_method': 'quiesced-copy',
         }]
 
-        with mock.patch.object(backup, 'sync_volumes'):
+        with mock.patch.object(capture, 'sync_volumes'):
             stage = backup.stage_service(self.config, value)
 
         self.assertEqual(
@@ -273,10 +273,10 @@ class StagingLifecycleTests(unittest.TestCase):
                 live_source.mkdir()
             return mock.Mock(stdout='')
 
-        with mock.patch.object(backup, 'sync_paths', return_value=inventory), \
-                mock.patch.object(backup, 'sync_volumes'), \
-                mock.patch.object(backup, 'running_services', return_value=['app']), \
-                mock.patch.object(backup, 'run', side_effect=fake_run):
+        with mock.patch.object(capture, 'sync_paths', return_value=inventory), \
+                mock.patch.object(capture, 'sync_volumes'), \
+                mock.patch.object(capture, 'running_services', return_value=['app']), \
+                mock.patch.object(capture, 'run', side_effect=fake_run):
             stage = backup.stage_service(self.config, value)
 
         saved = json.loads((stage / '_meta' / 'inventory.json').read_text())
@@ -284,9 +284,9 @@ class StagingLifecycleTests(unittest.TestCase):
 
     def test_external_mode_does_not_run_hooks(self):
         value = manifest(self.root, consistency={'mode': 'external'})
-        with mock.patch.object(backup, 'hooks') as hooks_mock, \
-                mock.patch.object(backup, 'sync_paths', return_value=[]), \
-                mock.patch.object(backup, 'sync_volumes'):
+        with mock.patch.object(capture, 'hooks') as hooks_mock, \
+                mock.patch.object(capture, 'sync_paths', return_value=[]), \
+                mock.patch.object(capture, 'sync_volumes'):
             backup.stage_service(self.config, value)
 
         hooks_mock.assert_not_called()
@@ -298,8 +298,8 @@ class StagingLifecycleTests(unittest.TestCase):
         def record_hook(_manifest, name):
             calls.append(name)
 
-        with mock.patch.object(backup, 'hooks', side_effect=record_hook), \
-                mock.patch.object(backup, 'sync_paths', side_effect=RuntimeError('sync failed')):
+        with mock.patch.object(capture, 'hooks', side_effect=record_hook), \
+                mock.patch.object(capture, 'sync_paths', side_effect=RuntimeError('sync failed')):
             with self.assertRaisesRegex(RuntimeError, 'sync failed'):
                 backup.stage_service(self.config, value)
 
@@ -313,9 +313,9 @@ class StagingLifecycleTests(unittest.TestCase):
             if name == 'after':
                 raise RuntimeError('after failed')
 
-        with mock.patch.object(backup, 'hooks', side_effect=fail_after), \
+        with mock.patch.object(capture, 'hooks', side_effect=fail_after), \
                 mock.patch.object(
-                    backup, 'sync_paths', side_effect=RuntimeError('sync failed'),
+                    capture, 'sync_paths', side_effect=RuntimeError('sync failed'),
                 ), redirect_stderr(error):
             with self.assertRaisesRegex(RuntimeError, 'sync failed'):
                 backup.stage_service(self.config, value)
@@ -331,7 +331,7 @@ class StagingLifecycleTests(unittest.TestCase):
             if name == 'before':
                 raise RuntimeError('before failed')
 
-        with mock.patch.object(backup, 'hooks', side_effect=record_hook):
+        with mock.patch.object(capture, 'hooks', side_effect=record_hook):
             with self.assertRaisesRegex(RuntimeError, 'before failed'):
                 backup.stage_service(self.config, value)
 
@@ -345,11 +345,11 @@ class StagingLifecycleTests(unittest.TestCase):
                 raise common.CommandError(cmd, 1)
             return mock.Mock(stdout='')
 
-        with mock.patch.object(backup, 'hooks'), \
-                mock.patch.object(backup, 'sync_paths'), \
-                mock.patch.object(backup, 'sync_volumes'), \
-                mock.patch.object(backup, 'running_services', return_value=['app']), \
-                mock.patch.object(backup, 'run', side_effect=fake_run):
+        with mock.patch.object(capture, 'hooks'), \
+                mock.patch.object(capture, 'sync_paths'), \
+                mock.patch.object(capture, 'sync_volumes'), \
+                mock.patch.object(capture, 'running_services', return_value=['app']), \
+                mock.patch.object(capture, 'run', side_effect=fake_run):
             with self.assertRaises(common.CommandError):
                 backup.stage_service(self.config, value)
 
@@ -363,11 +363,11 @@ class StagingLifecycleTests(unittest.TestCase):
             return mock.Mock(stdout='')
 
         with mock.patch.object(
-            backup, 'sync_paths', side_effect=RuntimeError('sync failed'),
+            capture, 'sync_paths', side_effect=RuntimeError('sync failed'),
         ), mock.patch.object(
-            backup, 'running_services', return_value=['app'],
+            capture, 'running_services', return_value=['app'],
         ), mock.patch.object(
-            backup, 'run', side_effect=fake_run,
+            capture, 'run', side_effect=fake_run,
         ), redirect_stderr(error):
             with self.assertRaisesRegex(RuntimeError, 'sync failed'):
                 backup.stage_service(self.config, value)
@@ -377,10 +377,10 @@ class StagingLifecycleTests(unittest.TestCase):
     def test_stop_mode_restarts_only_existing_target_containers(self):
         value = manifest(self.root, consistency={'mode': 'stop'})
 
-        with mock.patch.object(backup, 'sync_paths', return_value=[]), \
-                mock.patch.object(backup, 'sync_volumes'), \
-                mock.patch.object(backup, 'running_services', return_value=['app']), \
-                mock.patch.object(backup, 'run') as run_mock:
+        with mock.patch.object(capture, 'sync_paths', return_value=[]), \
+                mock.patch.object(capture, 'sync_volumes'), \
+                mock.patch.object(capture, 'running_services', return_value=['app']), \
+                mock.patch.object(capture, 'run') as run_mock:
             backup.stage_service(self.config, value)
 
         restart_command = run_mock.call_args_list[-1].args[0]
@@ -396,11 +396,11 @@ class BackupCommandTests(unittest.TestCase):
             root = Path(tmp)
             value = {'service': 'demo'}
             disk = mock.Mock(free=common.MIN_FREE_BYTES + 99)
-            with mock.patch.object(backup.shutil, 'disk_usage', return_value=disk), \
+            with mock.patch.object(capture.shutil, 'disk_usage', return_value=disk), \
                     self.assertRaisesRegex(RuntimeError, 'insufficient backup'):
                 backup._check_backup_space({}, value, root, 100)
 
-            with mock.patch.object(backup.shutil, 'disk_usage', return_value=disk):
+            with mock.patch.object(capture.shutil, 'disk_usage', return_value=disk):
                 backup._check_backup_space(
                     {}, value, root, 100, allow_low_space=True,
                 )
@@ -409,7 +409,7 @@ class BackupCommandTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             disk = mock.Mock(free=common.MIN_FREE_BYTES + 100)
-            with mock.patch.object(backup.shutil, 'disk_usage', return_value=disk):
+            with mock.patch.object(capture.shutil, 'disk_usage', return_value=disk):
                 backup._check_backup_space({}, {'service': 'demo'}, root, 100)
 
     def test_unknown_service_does_not_skip_later_explicit_service(self):
