@@ -77,6 +77,32 @@ class DockerIntegrationTests(unittest.TestCase):
     'set HOMELAB_BACKUP_INTEGRATION=1 and HOMELAB_BACKUP_BTRFS_ROOT on Btrfs',
 )
 class BtrfsIntegrationTests(unittest.TestCase):
+    def test_plain_directory_is_not_a_snapshot_source(self):
+        root = Path(os.environ['HOMELAB_BACKUP_BTRFS_ROOT'])
+        token = uuid.uuid4().hex
+        payload = root / f'homelab-backup-plain-source-{token}'
+        state_root = root / f'.homelab-backup-plain-state-{token}'
+        payload.mkdir()
+        state_root.mkdir(mode=0o700)
+        manifest = {
+            'service': f'test-{token}',
+            'sources': {'paths': [{
+                'id': 'data', 'path': str(payload),
+            }]},
+        }
+        try:
+            transaction = btrfs_snapshot.SnapshotTransaction(
+                {
+                    'state_root': str(state_root),
+                    'trusted_data_roots': [str(root)],
+                }, manifest, lambda _path: (),
+            )
+            self.assertEqual(transaction.create(), {})
+            self.assertFalse(any(state_root.iterdir()))
+        finally:
+            payload.rmdir()
+            state_root.rmdir()
+
     def test_readonly_snapshot_excludes_later_writes_and_cleans_state(self):
         root = Path(os.environ['HOMELAB_BACKUP_BTRFS_ROOT'])
         token = uuid.uuid4().hex

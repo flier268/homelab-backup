@@ -63,15 +63,28 @@ class BtrfsIdentityTests(unittest.TestCase):
             btrfs_snapshot._load_state({'state_root': '/state'}, 'demo')
 
     def test_plain_btrfs_directory_is_not_a_snapshot_source(self):
-        mount = SimpleNamespace(filesystem_type='btrfs')
         result = SimpleNamespace(
-            returncode=1, stdout='', stderr='ERROR: not a subvolume',
+            returncode=1, stdout='',
+            stderr='ERROR: Not a Btrfs subvolume: Invalid argument',
         )
-        with mock.patch.object(btrfs_snapshot, 'containing_mount', return_value=mount), \
-                mock.patch.object(btrfs_snapshot, 'run', return_value=result):
+        metadata = SimpleNamespace(st_mode=0o040755)
+        with mock.patch.object(btrfs_snapshot, 'run', return_value=result):
             self.assertIsNone(btrfs_snapshot.subvolume_details(
-                '/data/plain', allow_plain=True,
+                '/proc/self/fd/7', allow_plain=True,
+                filesystem_type='btrfs', opened_metadata=metadata,
             ))
+
+    def test_subvolume_inspection_failure_includes_command_diagnostics(self):
+        result = SimpleNamespace(
+            returncode=1, stdout='', stderr='ERROR: cannot access device',
+        )
+        metadata = SimpleNamespace(st_mode=0o040755)
+        with mock.patch.object(btrfs_snapshot, 'run', return_value=result), \
+                self.assertRaisesRegex(RuntimeError, 'cannot access device'):
+            btrfs_snapshot.subvolume_details(
+                '/proc/self/fd/7', allow_plain=True,
+                filesystem_type='btrfs', opened_metadata=metadata,
+            )
 
     def test_workspace_is_under_trusted_root_not_container_owned_parent(self):
         self.assertEqual(
@@ -239,10 +252,6 @@ class BtrfsIdentityTests(unittest.TestCase):
                     ), mock.patch.object(
                         btrfs_snapshot, '_validate_workspace',
                         return_value=root / btrfs_snapshot.SNAPSHOT_DIRECTORY,
-                    ), mock.patch.object(
-                        btrfs_snapshot.os, 'lstat', return_value=SimpleNamespace(
-                            st_dev=os.fstat(fd).st_dev,
-                        ),
                     ), mock.patch.object(
                         btrfs_snapshot, 'filesystem_uuid', return_value=FILESYSTEM_UUID,
                     ), mock.patch.object(

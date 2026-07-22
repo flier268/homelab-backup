@@ -152,6 +152,20 @@ def _parse_subvolume_show(path, output):
     }
 
 
+def _command_diagnostic(result):
+    return '\n'.join(
+        value.strip() for value in (result.stderr, result.stdout)
+        if value and value.strip()
+    )
+
+
+def _is_not_subvolume_error(output):
+    return re.search(
+        r'\bnot (?:a )?(?:btrfs )?subvolume\b', output,
+        flags=re.IGNORECASE,
+    ) is not None
+
+
 def subvolume_details(
         path, *, allow_plain=False, filesystem_type=None, pass_fds=(),
         opened_metadata=None,
@@ -178,10 +192,13 @@ def subvolume_details(
         pass_fds=pass_fds,
     )
     if result.returncode != 0:
-        output = f'{result.stdout}\n{result.stderr}'.lower()
-        if allow_plain and 'not a subvolume' in output:
+        diagnostic = _command_diagnostic(result)
+        if allow_plain and _is_not_subvolume_error(diagnostic):
             return None
-        raise RuntimeError(f'cannot inspect Btrfs subvolume {display_path}')
+        message = f'cannot inspect Btrfs subvolume {display_path}'
+        if diagnostic:
+            message = f'{message}: {diagnostic}'
+        raise RuntimeError(message)
     return _parse_subvolume_show(display_path, result.stdout)
 
 
@@ -364,11 +381,9 @@ class SnapshotTransaction:
                 if source_details is None:
                     continue
                 workspace = _validate_workspace(snapshot_parent(trusted_root))
-                if os.fstat(source_fd).st_dev != os.lstat(workspace).st_dev:
-                    raise RuntimeError(
-                        'Btrfs snapshot workspace is not on the source filesystem: '
-                        f'{workspace}'
-                    )
+                # Btrfs may expose each subvolume with a distinct st_dev even
+                # though they belong to the same filesystem.  The filesystem
+                # UUID is the authoritative cross-subvolume identity here.
                 source_filesystem_uuid = filesystem_uuid(trusted_root)
                 if filesystem_uuid(workspace) != source_filesystem_uuid:
                     raise RuntimeError(
