@@ -6,7 +6,7 @@ import unittest
 import uuid
 from pathlib import Path
 
-from homelab_backup import security, storage
+from homelab_backup import btrfs_snapshot, security, storage
 
 
 INTEGRATION = os.environ.get('HOMELAB_BACKUP_INTEGRATION') == '1'
@@ -77,6 +77,54 @@ class DockerIntegrationTests(unittest.TestCase):
     'set HOMELAB_BACKUP_INTEGRATION=1 and HOMELAB_BACKUP_BTRFS_ROOT on Btrfs',
 )
 class BtrfsIntegrationTests(unittest.TestCase):
+    def test_readonly_snapshot_excludes_later_writes_and_cleans_state(self):
+        root = Path(os.environ['HOMELAB_BACKUP_BTRFS_ROOT'])
+        token = uuid.uuid4().hex
+        payload = root / f'homelab-backup-source-{token}'
+        state_root = root / f'.homelab-backup-state-{token}'
+        subprocess.run(
+            ['btrfs', 'subvolume', 'create', payload],
+            check=True, capture_output=True,
+        )
+        state_root.mkdir(mode=0o700)
+        manifest = {
+            'service': f'test-{token}',
+            'sources': {'paths': [{
+                'id': 'data', 'path': str(payload),
+            }]},
+        }
+        transaction = None
+        try:
+            (payload / 'world.sav').write_text('before', encoding='utf-8')
+            transaction = btrfs_snapshot.SnapshotTransaction(
+                {
+                    'state_root': str(state_root),
+                    'trusted_data_roots': [str(root)],
+                }, manifest, lambda _path: (),
+            )
+            snapshot = transaction.create()['data']
+            (payload / 'world.sav').write_text('after', encoding='utf-8')
+            self.assertEqual(
+                (snapshot / 'world.sav').read_text(encoding='utf-8'), 'before',
+            )
+            transaction.cleanup()
+            self.assertFalse(snapshot.exists())
+            self.assertFalse(any(state_root.iterdir()))
+        finally:
+            if transaction is not None:
+                try:
+                    transaction.cleanup()
+                except Exception:
+                    pass
+            subprocess.run(
+                ['btrfs', 'subvolume', 'delete', payload],
+                check=False, capture_output=True,
+            )
+            try:
+                state_root.rmdir()
+            except OSError:
+                pass
+
     def test_nested_subvolume_is_rejected(self):
         root = Path(os.environ['HOMELAB_BACKUP_BTRFS_ROOT'])
         payload = root / f'homelab-backup-test-{uuid.uuid4().hex}'

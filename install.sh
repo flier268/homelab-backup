@@ -3,7 +3,7 @@ set -euo pipefail
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd -- "$ROOT_DIR"
 apt-get update
-apt-get install -y python3 python3-venv rsync restic rclone age ca-certificates openssl btrfs-progs util-linux
+apt-get install -y python3 python3-venv rsync restic rclone age ca-certificates curl openssl btrfs-progs util-linux
 if ! python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 10))'; then
   echo 'ERROR: homelab-backup requires Python 3.10 or newer.' >&2
   exit 1
@@ -171,11 +171,19 @@ fi
 install -m 0755 backupctl "$LAUNCHER_NEXT"
 install -d -o root -g root -m 0700 \
   /etc/homelab-backup /etc/homelab-backup/rclone
-install -d -m 0700 /var/lib/homelab-backup/{staging,restores,state}
+install -d -o root -g root -m 0700 \
+  /var/lib/homelab-backup/{staging,restores,state}
 install -d -o root -g root -m 0700 /run/homelab-backup
-install -d -o root -g root -m 0755 /var/cache/homelab-backup/restic /srv/stacks /srv/data
+install -d -o root -g root -m 0700 /var/cache/homelab-backup/restic
+install -d -o root -g root -m 0755 /srv/stacks /srv/data
 if [[ ! -f /etc/homelab-backup/restic-password ]]; then
   umask 077; openssl rand -base64 48 > /etc/homelab-backup/restic-password
+fi
+chown root:root /etc/homelab-backup/restic-password
+chmod 0600 /etc/homelab-backup/restic-password
+if [[ -f /etc/homelab-backup/rclone/rclone.conf ]]; then
+  chown root:root /etc/homelab-backup/rclone/rclone.conf
+  chmod 0600 /etc/homelab-backup/rclone/rclone.conf
 fi
 if [[ ! -f /etc/homelab-backup/config.yaml ]]; then
   install -m 0600 config.yaml.example /etc/homelab-backup/config.yaml

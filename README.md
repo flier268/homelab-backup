@@ -13,6 +13,8 @@ Docker Compose 服務的 Restic + OneDrive 備份工具。
 - 備份以單份 manifest 為交易邊界；所有來源 staging 完成後才提交 Restic
   snapshot。任一來源失敗會跳過整份 manifest、清除半成品 staging，不產生
   該服務的部分備份。
+- 一致性策略支援停服、hook、外部靜止、live best-effort 與 Btrfs subvolume
+  snapshot；所有模式都可先執行具 timeout／required 政策的 argv action。
 - 支援本機部署交叉驗證後覆寫，以及所有 target 均不存在的全新重建；混合
   狀態一律拒絕。
 
@@ -97,7 +99,7 @@ timestamped 密文。
 
 ## 支援與安全邊界
 
-- 僅支援 Linux、root 執行、本機 `ext4`／`xfs`／`btrfs` 與本機 rootful
+- 僅支援 Linux、root coordinator、本機 `ext4`／`xfs`／`btrfs` 與本機 rootful
   Docker。trusted root 本身可以是核准 mount 或 Btrfs subvolume，其下不允許
   其他 mount、bind mount或 nested Btrfs subvolume。
 - `sources.paths[].path` 必須嚴格位於唯一的 trusted root 之下，不能等於 trusted
@@ -110,11 +112,24 @@ timestamped 密文。
   `root:root` 或 `1000:1000`；manifest 不需增加任何欄位。沒有這項 metadata 的
   舊快照仍可還原到祖先已存在的部署，但不會在全新 rebuild 時猜測權限。
 - payload 支援普通檔案、目錄、symlink、ACL、xattr 與 payload 內 hardlink；
-  FIFO、socket、device node會被拒絕。不保存 Btrfs subvolume identity、snapshot
-  關係、reflink、compression或 CoW 屬性。
-- 操作期間不得存在未受控 writer。程式會停止及檢查已知 Compose/Docker writer，
-  唯讀 Docker mount 不視為 writer；共用 UID 程序、排程與其他 privileged process
-  仍是 operator obligation。
+  FIFO、socket、device node會被拒絕。`snapshot` 模式只對來源本身就是 Btrfs
+  subvolume 的 path 建立唯讀 snapshot；來源內若有 nested subvolume 會拒絕，
+  必須拆成獨立 source。Restic 不保存 subvolume identity、snapshot 關係、reflink、
+  compression或 CoW 屬性。
+- `stop`、`hooks`、`external` 不允許已知 Compose/Docker writer；`live` 與
+  `snapshot` 對未受 filesystem snapshot 保護的普通 path／named volume 顯示警告，
+  並在 inventory 標成 `best-effort`。唯讀 Docker mount 不視為 writer；共用 UID
+  程序、排程與其他 privileged process 仍是 operator obligation。
+- 多個獨立 Btrfs subvolume 會先依序建立全部 snapshot，再開始 staging；這不代表
+  多個 subvolume 之間具有同一時間點的原子性。Inventory 會在每個來源記錄
+  `capture_method`，並在 `consistency` 記錄實際 mode、整體 `guarantee`、staging
+  前後的 optional action failures 與偵測到的 writer container IDs。
+- Btrfs 暫存 snapshot 固定建立在來源所屬 trusted root 的
+  `.homelab-backup-snapshots`（root-only 0700）中。建立時來源會先以 FD 釘住，
+  container-owned parent 隨後被 rename／替換也不會改變 snapshot 來源。內部
+  journal 以 `creating`、`ready`、`deleting` 保存完整 identity；每次備份執行
+  action 前及非 dry-run maintenance 都會自動回收 crash 遺留項目，包含已停用或
+  已移除服務。live source 消失或重建不會阻止舊 snapshot 精確回收。
 - 所有 Compose YAML、`compose.env_file`、Restic 密碼與 rclone 設定必須是
   root-owned、不可 group/world write 的普通檔案，且不可為 symlink。Compose
   不載入隱含 `.env` 或外部 `COMPOSE_*` 設定；需要插值時必須在 manifest 明確設定：
@@ -124,8 +139,26 @@ timestamped 密文。
     files: [compose.yaml]
     env_file: compose.env
   ```
+- staging copy、Docker named volume copy、Restic 備份與 retention 固定以 root
+  執行，以完整保存來源的數字 UID/GID、mode、ACL、xattr 與 hardlink。還原也以
+  root 套用 snapshot 內的原始 metadata；完成後的資料不會一律變成 root:root，
+  因此原本以指定 UID/GID 執行的容器仍可存取。
 - `hooks.before` 可以建立或更新 `sources.paths` 的 payload artifact；所有 required
   Docker named volumes 必須在靜態 preflight 前已存在，不支援由 hook 動態建立。
+- `actions.before[]` 與 `actions.finally[]` 都是不經 shell 的 argv；相對 executable
+  會被拒絕。每個 action 都必須明確設定 `run_as`，可使用帳號名稱或加引號的
+  Docker 風格 `"UID:GID"`。`run_as: root` 或 `run_as: "0:0"` 的 executable 與全部父目錄必須由
+  root 擁有、不可 group/world write，且 executable 不可為 symlink。預設 timeout
+  30 秒且 `required: true`。Finally 會在模式本身的重啟、hook 恢復或 snapshot
+  清理之後執行，即使 before／staging 失敗也會嘗試執行。HTTP 可使用 `curl`，
+  RCON 可使用既有 CLI 或 `docker compose exec`。敏感值應放在 root-only 工具設定
+  或 secret，不要放入 argv。
+- `actions.on_success[]` 在 Restic snapshot 成功提交後執行；
+  `actions.on_failure[]` 在 staging、Restic、on-success 或 state 失敗時執行。
+  Failure action 會收到 `BACKUPCTL_FAILURE_PHASE`、`BACKUPCTL_FAILURE_TYPE`、
+  `BACKUPCTL_FAILURE_REASON`、`BACKUPCTL_FAILURE_SERVICE` 與
+  `BACKUPCTL_FAILURE_SECONDARY`。這些環境變數不包含命令輸出
+  或 argv；若 failure action 使用 `docker exec`，必須自行明確轉交需要的變數給容器。
 - Snapshot 中的 Compose service 清單僅供診斷；現有部署的授權比對使用 project
   name、path/source declarations 與 logical-to-actual volume mapping。
 - 不支援 remote/rootless Docker、跨 mount、ZFS、
@@ -158,6 +191,10 @@ sudo ./backup-configs.sh --rotate configs/homelab-backup-configs.zip.age
 ```bash
 sudo backupctl backup minecraft
 ```
+
+Palworld 零停機範例可參考 `examples/palworld.backup.yaml`。若其中宣告的資料 path
+本身是 Btrfs subvolume，`snapshot` 會從唯讀 filesystem snapshot staging；若只是
+普通目錄，仍會直接 staging，偵測到 writer 時整份備份會標為 `best-effort`。
 
 備份會在來源靜止後保守估算 path 與 Docker volume 的 staging 大小，並要求
 staging filesystem 至少保留 1 GiB。空間不足時預設中止；只有人工操作可明確

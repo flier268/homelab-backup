@@ -442,7 +442,7 @@ class RestoreApplyPreflightTests(unittest.TestCase):
                 'version': 1, 'schedule': {'cron': '0 0 * * *'},
                 'retention': {'keep_last': 1},
                 'compose': {'files': ['compose.yaml']},
-                'consistency': {'mode': 'none'},
+                'consistency': {'mode': 'external'},
                 'sources': {
                     'paths': [{'id': 'data', 'path': str(target)}],
                     'volumes': [],
@@ -476,7 +476,7 @@ class RestoreApplyPreflightTests(unittest.TestCase):
                 'version': 1, 'schedule': {'cron': '0 0 * * *'},
                 'retention': {'keep_last': 1},
                 'sources': {'paths': [], 'volumes': []},
-                'consistency': {'mode': 'none'},
+                'consistency': {'mode': 'external'},
             }
 
             with mock.patch.object(restore_plan, 'running_services') as running_mock:
@@ -495,7 +495,7 @@ class RestoreApplyPreflightTests(unittest.TestCase):
                 'version': 1, 'schedule': {'cron': '0 0 * * *'},
                 'retention': {'keep_last': 1},
                 'sources': {'paths': [], 'volumes': []},
-                'consistency': {'mode': 'none'},
+                'consistency': {'mode': 'external'},
             }
 
             with self.assertRaisesRegex(RuntimeError, 'inventory is missing'):

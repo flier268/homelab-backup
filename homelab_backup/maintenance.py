@@ -4,6 +4,7 @@ import sys
 
 from .backup import backup_one, retention_cmd
 from .backup_state import due_status, load_state, save_state
+from .btrfs_snapshot import cleanup_snapshot_state, snapshot_state_services
 from .common import (
     CommandError, FailureSummary, GlobalLock, _print_command_failure, die,
     restic_env, run,
@@ -142,6 +143,29 @@ def cmd_maintenance(c, args):
             print('SKIP: backup or maintenance is still running')
             return
         failures = FailureSummary()
+        if not args.dry_run:
+            try:
+                snapshot_services = snapshot_state_services(c)
+            except Exception as err:
+                failures.record_exception(
+                    'Btrfs snapshot recovery', err,
+                    message='ERROR: Btrfs snapshot journal scan failed: {error}',
+                )
+                snapshot_services = []
+            for service in snapshot_services:
+                try:
+                    cleanup_snapshot_state(c, service)
+                except Exception as err:
+                    failures.record_exception(
+                        service, err,
+                        message=(
+                            'ERROR: Btrfs snapshot recovery failed for '
+                            f'{service}: {{error}}'
+                        ),
+                        summary_error=f'Btrfs snapshot recovery failed: {err}',
+                    )
+                    if os.environ.get('BACKUPCTL_DEBUG') == '1':
+                        raise
         for m in manifests(c, on_error=_manifest_error_recorder(failures)):
             service = m.get('service', '<unnamed>')
             print(f"\n== Retention: {service} ==")

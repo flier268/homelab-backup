@@ -208,6 +208,7 @@ class RuntimeValidationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             stage = root / 'stage'
+            stage.mkdir()
             value = manifest(root, sources={
                 'paths': [],
                 'volumes': [{'id': 'db', 'name': 'demo-db'}],
@@ -224,6 +225,8 @@ class RuntimeValidationTests(unittest.TestCase):
             self.assertNotIn('demo-db:/src:ro', command)
             self.assertNotIn('-v', command)
             self.assertNotIn('bind-create-src', ' '.join(command))
+            self.assertNotIn('--user', command)
+            self.assertNotIn('--super', command)
 
     def test_pre_resolved_volume_name_is_revalidated_at_docker_boundary(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -296,6 +299,65 @@ class PathSyncTests(unittest.TestCase):
                     root / 'stage',
                 )[0]
 
+            metadata = {
+                item['path']: item for item in entry['ancestors']
+            }
+            self.assertEqual(metadata['demo/parent']['mode'], 0o750)
+
+    def test_copy_reuses_source_fd_from_ancestor_metadata_walk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            value = manifest(root, sources={
+                'paths': [{'id': 'data', 'path': 'parent/data'}],
+                'volumes': [],
+            })
+            parent = Path(value['_dir']) / 'parent'
+            payload = parent / 'data'
+            payload.mkdir(parents=True)
+            (payload / 'value').write_text('original', encoding='utf-8')
+
+            with mock.patch.object(
+                storage, 'open_data_path', wraps=storage.open_data_path,
+            ) as reopen:
+                storage.sync_paths(
+                    {'trusted_data_roots': [str(root)]},
+                    value,
+                    root / 'stage',
+                )
+
+            # The logical path is reopened once after copying to verify that
+            # it still names the pinned object, never to select what to copy.
+            reopen.assert_called_once_with(
+                payload, [str(root)],
+            )
+            archived = root / 'stage' / 'paths' / 'data' / 'value'
+            self.assertEqual(archived.read_text(encoding='utf-8'), 'original')
+
+    def test_source_override_keeps_logical_ancestor_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            value = manifest(root, sources={
+                'paths': [{'id': 'data', 'path': 'parent/data'}],
+                'volumes': [],
+            })
+            parent = Path(value['_dir']) / 'parent'
+            payload = parent / 'data'
+            payload.mkdir(parents=True)
+            (payload / 'value').write_text('live', encoding='utf-8')
+            parent.chmod(0o750)
+            snapshot = root / 'snapshot'
+            snapshot.mkdir()
+            (snapshot / 'value').write_text('snapshot', encoding='utf-8')
+
+            entry = storage.sync_paths(
+                {'trusted_data_roots': [str(root)]},
+                value,
+                root / 'stage',
+                source_overrides={'data': snapshot},
+            )[0]
+
+            archived = root / 'stage' / 'paths' / 'data' / 'value'
+            self.assertEqual(archived.read_text(encoding='utf-8'), 'snapshot')
             metadata = {
                 item['path']: item for item in entry['ancestors']
             }
@@ -512,7 +574,7 @@ class PathSyncTests(unittest.TestCase):
 
             self.assertEqual(inventory, [{
                 'id': 'optional', 'path': 'missing', 'type': None,
-                'present': False,
+                'present': False, 'capture_method': 'quiesced-copy',
             }])
 
     def test_inventory_type_is_captured_by_the_sync_operation(self):
@@ -535,8 +597,10 @@ class PathSyncTests(unittest.TestCase):
                 inventory = storage.sync_paths(value, root / 'stage')
 
             self.assertEqual(inventory, [
-                {'id': 'file', 'path': 'file.txt', 'type': 'file', 'present': True},
-                {'id': 'directory', 'path': 'directory', 'type': 'directory', 'present': True},
+                {'id': 'file', 'path': 'file.txt', 'type': 'file', 'present': True,
+                 'capture_method': 'quiesced-copy'},
+                {'id': 'directory', 'path': 'directory', 'type': 'directory',
+                 'present': True, 'capture_method': 'quiesced-copy'},
             ])
 
     def test_final_sync_removes_slot_when_optional_source_disappears(self):

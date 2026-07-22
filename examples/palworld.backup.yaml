@@ -1,0 +1,60 @@
+version: 1
+service: Palworld
+enabled: true
+
+schedule:
+  cron: "0 */6 * * *"
+  retry_after: 30m
+  max_lateness: 2h
+
+retention:
+  keep_last: 8
+  keep_daily: 14
+  keep_weekly: 8
+  keep_monthly: 12
+
+compose:
+  files: [compose.yml]
+
+consistency:
+  mode: snapshot
+  timeout: 120
+
+actions:
+  before:
+    # Adjust the service name and RCON command to match the selected image.
+    # Keep passwords in the container's secret/config, never in this argv.
+    - name: save-world
+      command:
+        - /usr/bin/docker
+        - compose
+        - exec
+        - -T
+        - palworld
+        - rcon-cli
+        - Save
+      timeout: 30
+      required: true
+      # Docker socket access is root-equivalent. Prefer direct HTTP/RCON when
+      # the command can run as a less-privileged identity.
+      run_as: root
+  # Optional finalizer, for example to resume writes after staging and snapshot
+  # cleanup. It runs even when before or staging fails.
+  finally: []
+  # These run after the Restic outcome. on_failure receives BACKUPCTL_FAILURE_*
+  # including BACKUPCTL_FAILURE_SERVICE in its local process environment.
+  on_success: []
+  on_failure: []
+
+sources:
+  paths:
+    - id: compose
+      path: compose.yml
+    # For filesystem-atomic capture, create ./palworld itself as a Btrfs
+    # subvolume. A normal directory is still copied, but active writers make
+    # that source best-effort.
+    - id: palworld-data
+      path: ./palworld
+      exclude:
+        - "**/Logs/**"
+  volumes: []

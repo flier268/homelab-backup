@@ -175,6 +175,20 @@ def validate_no_docker_writers(m, identity, resolved, *, project_must_be_stopped
         )
 
 
+def docker_writer_maps(m, resolved):
+    path_writers = {}
+    volume_writers = {}
+    for source in (m.get('sources') or {}).get('paths', []):
+        conflicts = docker_mount_conflicts([source_path(m, source)], [])
+        if conflicts:
+            path_writers[source['id']] = tuple(conflicts)
+    for source, name in resolved:
+        conflicts = docker_mount_conflicts([], [name])
+        if conflicts:
+            volume_writers[source['id']] = tuple(conflicts)
+    return path_writers, volume_writers
+
+
 def resolved_volume_sources(m, model=None):
     resolved = []
     seen = {}
@@ -221,13 +235,17 @@ def rsync(src, dst, excludes=None, delete=True):
     run(cmd)
 
 
-def _missing_path_inventory(source):
-    return {
+def _missing_path_inventory(source, capture_method='quiesced-copy', writers=()):
+    entry = {
         'id': source['id'],
         'path': source['path'],
         'type': None,
         'present': False,
+        'capture_method': capture_method,
     }
+    if writers:
+        entry['writers'] = list(writers)
+    return entry
 
 
 def _same_object(left, right):
@@ -317,12 +335,12 @@ def _estimate_open_source(fd, metadata, display_path):
     return total
 
 
-def estimate_path_source(c, m, source):
-    src = source_path(m, source)
+def estimate_path_source(c, m, source, *, physical_source=None):
+    src = Path(physical_source) if physical_source is not None else source_path(m, source)
     trusted_roots = _source_trusted_roots(c, m)
     try:
         fd, metadata = _open_path_source(
-            src, trusted_roots=trusted_roots,
+            src, trusted_roots=None if physical_source is not None else trusted_roots,
         )
     except FileNotFoundError:
         if source.get('required', True):
@@ -333,7 +351,8 @@ def estimate_path_source(c, m, source):
         validate_payload_fd(fd, src, filesystem_type=filesystem)
         size = _estimate_open_source(fd, metadata, src)
         _verify_path_source(
-            src, metadata, trusted_roots=trusted_roots,
+            src, metadata,
+            trusted_roots=None if physical_source is not None else trusted_roots,
         )
         return size
     finally:
@@ -367,9 +386,12 @@ def estimate_volume_source(c, source, name):
     return max(allocated, apparent)
 
 
-def estimate_backup_size(c, m, resolved=None):
+def estimate_backup_size(c, m, resolved=None, *, source_overrides=None):
+    source_overrides = source_overrides or {}
     total = sum(
-        estimate_path_source(c, m, source)
+        estimate_path_source(
+            c, m, source, physical_source=source_overrides.get(source['id']),
+        )
         for source in (m.get('sources') or {}).get('paths', [])
     )
     volume_sources = (
@@ -455,7 +477,10 @@ def validate_path_payloads(c, m, *, allow_missing=False):
             os.close(fd)
 
 
-def sync_paths(c, m=None, stage=None, *, before_copy=None):
+def sync_paths(
+        c, m=None, stage=None, *, before_copy=None, source_overrides=None,
+        capture_methods=None, writer_map=None,
+):
     if stage is None:
         # Backward-compatible library call used by focused unit tests. The
         # root-only CLI always supplies the explicit global policy.
@@ -467,40 +492,60 @@ def sync_paths(c, m=None, stage=None, *, before_copy=None):
         )) or [m['_dir']]
         c = {'trusted_data_roots': roots}
     trusted_roots = _source_trusted_roots(c, m)
+    source_overrides = source_overrides or {}
+    capture_methods = capture_methods or {}
+    writer_map = writer_map or {}
     inventory = []
     for source in (m.get('sources') or {}).get('paths', []):
         src = source_path(m, source)
+        physical = source_overrides.get(source['id'])
+        copy_source = Path(physical) if physical is not None else src
+        capture_method = capture_methods.get(source['id'], 'quiesced-copy')
+        writers = tuple(writer_map.get(source['id'], ()))
         dst = stage / 'paths' / source['id']
         try:
             if before_copy is not None:
                 before_copy(source)
-            filesystem = containing_mount(src).filesystem_type
-            fd, metadata, ancestors = open_data_path_with_parent_metadata(
+            logical_fd, logical_metadata, ancestors = open_data_path_with_parent_metadata(
                 src, trusted_roots,
             )
+            fd = logical_fd
             try:
+                filesystem = containing_mount(copy_source).filesystem_type
+                if physical is None:
+                    metadata = logical_metadata
+                else:
+                    os.close(fd)
+                    fd = None
+                    fd, metadata = _open_path_source(copy_source)
                 validate_payload_fd(
-                    fd, src, filesystem_type=filesystem,
+                    fd, copy_source, filesystem_type=filesystem,
                 )
                 source_type = _copy_path_source(
-                    src, dst, source.get('exclude'), fd=fd, metadata=metadata,
-                    trusted_roots=trusted_roots,
+                    copy_source, dst, source.get('exclude'), fd=fd, metadata=metadata,
+                    trusted_roots=trusted_roots if physical is None else None,
                 )
             finally:
-                os.close(fd)
+                if fd is not None:
+                    os.close(fd)
         except FileNotFoundError:
             if source.get('required', True):
                 raise ValueError(f'missing source {src}')
             dst.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
             clear_control_leaf(dst)
-            inventory.append(_missing_path_inventory(source))
+            inventory.append(_missing_path_inventory(
+                source, capture_method=capture_method, writers=writers,
+            ))
             continue
         entry = {
             'id': source['id'],
             'path': source['path'],
             'type': source_type,
             'present': True,
+            'capture_method': capture_method,
         }
+        if writers:
+            entry['writers'] = list(writers)
         if ancestors:
             entry['ancestors'] = ancestors
         inventory.append(entry)
@@ -509,8 +554,11 @@ def sync_paths(c, m=None, stage=None, *, before_copy=None):
 
 def sync_volumes(
         c, m, stage, restore=False, resolved=None, *, before_copy=None,
+        capture_methods=None, writer_map=None,
 ):
     volume_sources = resolved_volume_sources(m) if resolved is None else resolved
+    capture_methods = capture_methods or {}
+    writer_map = writer_map or {}
     inventory = []
     for source, name in volume_sources:
         name = validate_docker_volume_name(name)
@@ -534,11 +582,17 @@ def sync_volumes(
                     'id': source['id'], 'name': source.get('name'),
                     'compose_volume': source.get('compose_volume'),
                     'actual_name': name, 'present': False,
+                    'capture_method': capture_methods.get(
+                        source['id'], 'quiesced-copy',
+                    ),
                 })
                 continue
             if before_copy is not None:
                 before_copy(source)
-            dst.mkdir(parents=True, exist_ok=True)
+            dst.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+            if dst.exists() or dst.is_symlink():
+                clear_control_leaf(dst)
+            dst.mkdir(mode=0o700)
             cmd = [
                 'docker', 'run', '--rm', '--network', 'none',
                 '--mount', f'type=volume,src={name},dst=/src,readonly',
@@ -558,11 +612,18 @@ def sync_volumes(
         run(cmd)
         if not restore:
             validate_payload(dst)
-            inventory.append({
+            entry = {
                 'id': source['id'], 'name': source.get('name'),
                 'compose_volume': source.get('compose_volume'),
                 'actual_name': name, 'present': True,
-            })
+                'capture_method': capture_methods.get(
+                    source['id'], 'quiesced-copy',
+                ),
+            }
+            writers = tuple(writer_map.get(source['id'], ()))
+            if writers:
+                entry['writers'] = list(writers)
+            inventory.append(entry)
     return inventory
 
 

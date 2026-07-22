@@ -163,16 +163,21 @@ class StagingLifecycleTests(unittest.TestCase):
         self.bind_probe_patch = mock.patch.object(
             backup, 'validate_docker_bind_probe', return_value=None,
         )
+        self.snapshot_patch = mock.patch.object(
+            backup, 'cleanup_snapshot_state', return_value=None,
+        )
         self.docker_patch.start()
         self.compose_patch.start()
         self.writer_patch.start()
         self.bind_probe_patch.start()
+        self.snapshot_patch.start()
 
     def tearDown(self):
         self.compose_patch.stop()
         self.docker_patch.stop()
         self.writer_patch.stop()
         self.bind_probe_patch.stop()
+        self.snapshot_patch.stop()
         self.temp.cleanup()
 
     def test_stale_staging_content_is_removed(self):
@@ -232,12 +237,13 @@ class StagingLifecycleTests(unittest.TestCase):
         source = Path(manifest(self.root)['_dir']) / 'data'
         source.mkdir(parents=True)
         (source / 'payload.txt').write_text('snapshot', encoding='utf-8')
-        value = manifest(self.root, consistency={'mode': 'none'}, sources={
+        value = manifest(self.root, consistency={'mode': 'external'}, sources={
             'paths': [{'id': 'data', 'path': 'data'}],
             'volumes': [],
         })
         inventory = [{
             'id': 'data', 'path': 'data', 'type': 'directory', 'present': True,
+            'capture_method': 'quiesced-copy',
         }]
 
         with mock.patch.object(backup, 'sync_volumes'):
@@ -276,8 +282,8 @@ class StagingLifecycleTests(unittest.TestCase):
         saved = json.loads((stage / '_meta' / 'inventory.json').read_text())
         self.assertEqual(saved['paths'], inventory)
 
-    def test_none_mode_does_not_run_hooks(self):
-        value = manifest(self.root, consistency={'mode': 'none'})
+    def test_external_mode_does_not_run_hooks(self):
+        value = manifest(self.root, consistency={'mode': 'external'})
         with mock.patch.object(backup, 'hooks') as hooks_mock, \
                 mock.patch.object(backup, 'sync_paths', return_value=[]), \
                 mock.patch.object(backup, 'sync_volumes'):

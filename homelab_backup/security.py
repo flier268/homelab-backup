@@ -535,7 +535,8 @@ def validate_payload_fd(fd, display_path, *, filesystem_type=None, run=None):
                 )
             if result.stdout.strip():
                 raise ValueError(
-                    f'nested Btrfs subvolume is not supported: {display_path}'
+                    f'nested Btrfs subvolume is not supported: {display_path}; '
+                    'declare each nested subvolume as a separate source'
                 )
         _scan_payload_tree_fd(fd, display_path)
     elif not (stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)):
@@ -555,7 +556,10 @@ def validate_payload(path, *, filesystem_type=None, run=None):
             if result.returncode != 0:
                 raise RuntimeError(f'cannot inspect Btrfs subvolumes below {path}')
             if result.stdout.strip():
-                raise ValueError(f'nested Btrfs subvolume is not supported: {path}')
+                raise ValueError(
+                    f'nested Btrfs subvolume is not supported: {path}; '
+                    'declare each nested subvolume as a separate source'
+                )
         _scan_payload_tree(path)
     elif not (stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)):
         raise ValueError(f'unsupported payload object: {path}')

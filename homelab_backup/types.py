@@ -56,6 +56,22 @@ class ConsistencyConfig(TypedDict, total=False):
     after: list[str]
 
 
+class BeforeAction(TypedDict, total=False):
+    name: str
+    command: list[str]
+    timeout: int
+    required: bool
+    run_as: str
+
+
+ActionsConfig = TypedDict('ActionsConfig', {
+    'before': list[BeforeAction],
+    'finally': list[BeforeAction],
+    'on_success': list[BeforeAction],
+    'on_failure': list[BeforeAction],
+}, total=False)
+
+
 class ComposeConfig(TypedDict, total=False):
     files: list[str]
     env_file: str
@@ -89,6 +105,7 @@ class ServiceManifest(TypedDict, total=False):
     retention: RetentionConfig
     compose: ComposeConfig
     consistency: ConsistencyConfig
+    actions: ActionsConfig
     sources: SourcesConfig
     _path: str
     _dir: str
@@ -102,6 +119,8 @@ class InventoryPath(TypedDict, total=False):
     type: Optional[str]
     present: bool
     ancestors: list['InventoryAncestor']
+    capture_method: str
+    writers: list[str]
 
 
 class InventoryAncestor(TypedDict):
@@ -117,6 +136,8 @@ class InventoryVolume(TypedDict, total=False):
     compose_volume: str
     actual_name: str
     present: bool
+    capture_method: str
+    writers: list[str]
 
 
 class ComposeVolumeIdentity(TypedDict, total=False):
@@ -139,6 +160,7 @@ class RestoreInventory(TypedDict, total=False):
     paths: list[InventoryPath]
     volumes: list[InventoryVolume]
     compose: ComposeIdentity
+    consistency: dict
 
 
 class BackupState(TypedDict, total=False):

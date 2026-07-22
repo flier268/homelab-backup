@@ -8,6 +8,38 @@ from tests.helpers import manifest, write_restore_inventory
 
 
 class RestoreInventoryTests(unittest.TestCase):
+    def test_capture_and_consistency_metadata_are_validated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            value = manifest(root, consistency={'mode': 'snapshot'}, sources={
+                'paths': [{'id': 'data', 'path': 'data'}], 'volumes': [],
+            })
+            inventory = {
+                'version': 1, 'service': 'demo',
+                'paths': [{
+                    'id': 'data', 'path': 'data', 'type': 'directory',
+                    'present': True, 'capture_method': 'btrfs-snapshot',
+                    'writers': ['container'],
+                }],
+                'volumes': [],
+                'compose': {
+                    'project_name': 'demo', 'services': [],
+                    'compose_files': ['compose.yaml'], 'volumes': [],
+                },
+                'consistency': {
+                    'mode': 'snapshot', 'guarantee': 'btrfs-snapshot',
+                    'optional_action_failures': [{
+                        'phase': 'finally', 'name': 'resume',
+                        'result': 'failed',
+                    }],
+                    'writers': ['container'],
+                },
+            }
+            restore_inventory.validate_restore_inventory(value, inventory)
+            inventory['paths'][0]['capture_method'] = 'unknown'
+            with self.assertRaisesRegex(RuntimeError, 'capture method'):
+                restore_inventory.validate_restore_inventory(value, inventory)
+
     def test_ancestor_metadata_rejects_parent_traversal(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

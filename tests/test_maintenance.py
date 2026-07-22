@@ -170,6 +170,7 @@ class MaintenanceCommandTests(unittest.TestCase):
             config = {
                 'lock_file': str(Path(tmp) / 'backupctl.lock'),
                 'host_id': 'host',
+                'state_root': str(Path(tmp) / 'state'),
             }
             first = {'service': 'first', 'retention': {'keep_last': 1}}
             second = {'service': 'second', 'retention': {'keep_last': 1}}
@@ -190,11 +191,59 @@ class MaintenanceCommandTests(unittest.TestCase):
             self.assertTrue(any('service:second' in command for command in commands))
             self.assertIn(['restic', 'prune'], commands)
 
+    def test_maintenance_recovers_orphan_journals_and_continues_after_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = {
+                'lock_file': str(Path(tmp) / 'backupctl.lock'),
+                'host_id': 'host', 'state_root': str(Path(tmp) / 'state'),
+            }
+            args = mock.Mock(no_wait=False, dry_run=False)
+
+            def cleanup(_config, service):
+                if service == 'disabled':
+                    raise RuntimeError('identity mismatch')
+
+            with mock.patch.object(
+                maintenance, 'snapshot_state_services',
+                return_value=['disabled', 'removed'],
+            ), mock.patch.object(
+                maintenance, 'cleanup_snapshot_state', side_effect=cleanup,
+            ) as cleanup_mock, mock.patch.object(
+                maintenance, 'manifests', return_value=[],
+            ), mock.patch.object(
+                maintenance, 'restic_env', return_value={},
+            ), mock.patch.object(maintenance, 'run') as run_mock, \
+                    self.assertRaises(SystemExit):
+                maintenance.cmd_maintenance(config, args)
+
+            self.assertEqual(
+                [call.args[1] for call in cleanup_mock.call_args_list],
+                ['disabled', 'removed'],
+            )
+            run_mock.assert_called_once_with(['restic', 'prune'], env={})
+
+    def test_dry_run_does_not_recover_snapshot_journals(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = {
+                'lock_file': str(Path(tmp) / 'backupctl.lock'),
+                'host_id': 'host',
+                'state_root': str(Path(tmp) / 'state'),
+            }
+            args = mock.Mock(no_wait=False, dry_run=True)
+            with mock.patch.object(
+                maintenance, 'snapshot_state_services',
+            ) as scanner, mock.patch.object(
+                maintenance, 'manifests', return_value=[],
+            ):
+                maintenance.cmd_maintenance(config, args)
+            scanner.assert_not_called()
+
     def test_maintenance_clears_retention_error_after_success(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = {
                 'lock_file': str(Path(tmp) / 'backupctl.lock'),
                 'host_id': 'host',
+                'state_root': str(Path(tmp) / 'state'),
             }
             value = {'service': 'demo', 'retention': {'keep_last': 1}}
             state = {'last_retention_error': 'forget failed'}
@@ -219,6 +268,7 @@ class MaintenanceCommandTests(unittest.TestCase):
             config = {
                 'lock_file': str(Path(tmp) / 'backupctl.lock'),
                 'host_id': 'host',
+                'state_root': str(Path(tmp) / 'state'),
             }
             value = {'service': '../outside', 'retention': {'keep_last': 1}}
             args = mock.Mock(no_wait=False, dry_run=False)
@@ -244,6 +294,7 @@ class MaintenanceCommandTests(unittest.TestCase):
             config = {
                 'lock_file': str(Path(tmp) / 'backupctl.lock'),
                 'host_id': 'host',
+                'state_root': str(Path(tmp) / 'state'),
             }
             values = [
                 {'service': 'first', 'retention': {'keep_last': 1}},

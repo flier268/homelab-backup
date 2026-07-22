@@ -20,7 +20,7 @@ def manifest(tmp_path, **overrides):
         'service': 'demo',
         'schedule': {'cron': '0 0 * * *'},
         'retention': {'keep_last': 1},
-        'consistency': {'mode': 'none'},
+        'consistency': {'mode': 'external'},
         'sources': {'paths': [], 'volumes': []},
     }
     value.update(overrides)

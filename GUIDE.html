@@ -337,6 +337,12 @@ consistency:
   before: []
   after: []
 
+actions:
+  before: []
+  finally: []
+  on_success: []
+  on_failure: []
+
 sources:
   paths:
     - id: compose
@@ -363,7 +369,9 @@ sources:
 <tr><th>模式</th><th>行為</th><th>用途</th></tr>
 <tr><td><code>stop</code></td><td>停止整個 Compose project 中原本運行的 services → 動態 preflight → 單次同步與 volume 備份 → 重啟原本運行的 services。</td><td>Minecraft、Palworld、持續寫入檔案、raw database volume。</td></tr>
 <tr><td><code>hooks</code></td><td>執行 before hook → 動態 preflight → 同步 → 執行 after hook；before hook 可建立或更新 <code>sources.paths</code> payload artifact，且必須確實停止或隔離所有 target writer。所有 required Docker named volumes 必須在靜態 preflight 前已存在，不支援由 hook 動態建立。</td><td>SQL dump、RCON save、應用內建 snapshot。</td></tr>
-<tr><td><code>none</code></td><td>直接同步，不停止、不執行一致性 hook；Docker 對 target 的 mount 必須是唯讀。</td><td>靜態檔、唯讀資料、可重建內容。</td></tr>
+<tr><td><code>external</code></td><td>不控制服務，但要求所有 Docker writer 已由外部停止，再同步至 staging。</td><td>由其他編排器靜止的服務、唯讀資料。</td></tr>
+<tr><td><code>live</code></td><td>不停止 writer，直接同步至 staging；偵測到 writer 時警告並在 inventory 標成 <code>best-effort</code>。</td><td>可接受 fuzzy copy 的可重建內容。</td></tr>
+<tr><td><code>snapshot</code></td><td>來源 path 本身是 Btrfs subvolume 時建立唯讀 snapshot；普通 path 與 named volume 直接同步。未受 snapshot 保護且仍有 writer 的來源標成 <code>best-effort</code>。</td><td>不停機的 Palworld、Minecraft 與其他檔案型服務。</td></tr>
 </table>
 <h3><code>stop</code> 範例</h3>
 <pre><code>consistency:
@@ -375,6 +383,49 @@ sources:
   before:
     - ./scripts/dump-database.sh
   after: []</code></pre>
+<h3>備份交易 action</h3>
+<p>staging copy、Docker named volume copy、Restic 備份與 retention 固定以 root 執行，以完整保存來源的數字 UID/GID、mode、ACL、xattr 與 hardlink。還原也以 root 套用 snapshot 內的原始 metadata；完成後的資料不會一律變成 root:root，因此原本以指定 UID/GID 執行的容器仍可存取。</p>
+<p><code>actions.before</code> 與 <code>actions.finally</code> 適用所有 mode，命令以 argv 執行、不經 shell。非零退出、找不到程式或逾時時，<code>required: true</code> 會中止整份備份；<code>false</code> 會警告、繼續並把整體保證降為 <code>best-effort</code>。Finally 位於 staging 交易的最外層：會在 stop 重啟、hook 恢復或 snapshot 清理之後執行，before 或 staging 失敗時也會嘗試執行；finally 錯誤不會覆蓋既有主要錯誤。</p>
+<pre><code>actions:
+  before:
+    - name: save-palworld
+      command:
+        - /usr/bin/docker
+        - compose
+        - exec
+        - -T
+        - palworld
+        - rcon-cli
+        - Save
+      timeout: 30
+      required: true
+      run_as: root
+  finally:
+    - name: notify-backup-complete
+      command: [/usr/bin/docker, exec, palworld, rcon-cli, Broadcast, BackupComplete]
+      timeout: 30
+      required: true
+      run_as: root</code></pre>
+<p>每個 action 都必須明確設定 <code>run_as</code>，可使用本機帳號名稱或加引號的 Docker 風格 <code>"UID:GID"</code>；數字身分不需要 passwd entry。相對 executable 會被拒絕。<code>run_as: root</code> 或 <code>run_as: "0:0"</code> 的 executable 與父目錄必須由 root 擁有且不可由 group/other 寫入，也不可為 symlink。Docker socket 權限實質接近 root，能直接使用 HTTP/RCON endpoint 時不要把低權限帳號加入 docker group。</p>
+<p><code>actions.on_success</code> 在 Restic snapshot 成功提交後執行；<code>actions.on_failure</code> 在 staging、Restic、on-success 或 state 失敗時執行。Failure action 會收到 <code>BACKUPCTL_FAILURE_PHASE</code>、<code>BACKUPCTL_FAILURE_TYPE</code>、<code>BACKUPCTL_FAILURE_REASON</code>、<code>BACKUPCTL_FAILURE_SERVICE</code> 與 <code>BACKUPCTL_FAILURE_SECONDARY</code>。不會提供命令輸出或 argv；若命令使用 <code>docker exec</code>，需自行明確把需要的環境變數轉交給容器。</p>
+<pre><code>actions:
+  on_success:
+    - name: notify-success
+      command: [/usr/local/bin/notify-backup, success]
+      timeout: 15
+      required: false
+      run_as: root
+  on_failure:
+    - name: notify-failure
+      command: [/usr/local/bin/notify-backup-failure]
+      timeout: 15
+      required: false
+      run_as: root</code></pre>
+<div class="box warn">Restic 已成功後，required on-success action 失敗仍會觸發 on-failure 並讓命令回傳失敗；但已提交的 snapshot 不可能撤回，因此 state 仍記錄該次備份成功，排程不會把它當成可重試的備份失敗。</div>
+<p>HTTP GET／POST 可把 <code>curl</code> 與每個參數分別放入 command 陣列。密碼與 token 不要放進 argv 或 manifest；使用 root-only curl config、Docker secret 或 RCON 工具的密碼檔。</p>
+<div class="box warn"><code>none</code> 已移除；原本需要拒絕 writer 的設定改用 <code>external</code>，明確接受線上 fuzzy copy 才使用 <code>live</code>。</div>
+<p><code>snapshot</code> 的暫存唯讀 subvolume 固定位於來源所屬 trusted root 的 <code>.homelab-backup-snapshots</code> root-only 0700 workspace，並與來源位於同一 filesystem。建立前會以 FD 釘住來源，因此 container-owned parent 隨後被 rename 或替換不會改變實際 snapshot 來源。內部 journal 以 <code>creating</code>、<code>ready</code>、<code>deleting</code> 記錄 filesystem UUID、source UUID／subvolume ID、snapshot UUID／subvolume ID、parent UUID 與 path；每次備份的 action 前及非 dry-run maintenance 都會自動接管 crash 遺留項目，包含已停用或已移除服務。live source 已消失、rename 或重建時，舊 snapshot 仍依自身完整 identity 回收；任一 identity 不吻合則拒絕自動刪除。來源含 nested subvolume 時必須拆成各自的 source。多個獨立 subvolume 會依序完成全部 snapshot 後才開始 staging，但不宣稱它們具有跨 subvolume 的同時點原子性。</p>
+<p>Inventory 的每個 path／volume 會記錄 <code>capture_method</code>；頂層 <code>consistency</code> 則記錄實際 mode、整體 <code>guarantee</code>、staging 前後的 optional action failures 與偵測到的 writer container IDs。Restic 結果之後才執行的 success／failure action 不會回寫已提交的 snapshot inventory。命令輸出、敏感 argv 與暫存 snapshot path 不會寫入 inventory。</p>
 <div class="box warn">不確定時先使用 <code>stop</code>。它較保守，也比較容易實際驗證還原結果。</div>
 </section>
 

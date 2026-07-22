@@ -134,13 +134,126 @@ class ManifestValidationTests(unittest.TestCase):
     def test_hooks_are_only_allowed_in_hooks_mode(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            for mode in ('none', 'stop'):
+            for mode in ('external', 'stop', 'live', 'snapshot'):
                 with self.subTest(mode=mode):
                     value = manifest(root, consistency={
                         'mode': mode, 'before': ['echo freeze'], 'after': [],
                     })
                     with self.assertRaisesRegex(ValueError, 'only valid with mode hooks'):
                         manifest_module.validate_manifest(value)
+
+    def test_none_mode_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(ValueError, 'invalid consistency.mode'):
+                manifest_module.validate_manifest(manifest(
+                    Path(tmp), consistency={'mode': 'none'},
+                ))
+
+    def test_before_actions_schema_is_validated(self):
+        valid = {
+            'before': [{
+                'name': 'save', 'command': ['curl', '--fail', 'http://localhost'],
+                'timeout': 10, 'required': False, 'run_as': 'root',
+            }],
+            'finally': [{
+                'name': 'resume', 'command': ['docker', 'exec', 'app', 'resume'],
+                'run_as': 'root',
+            }],
+            'on_success': [{
+                'name': 'success', 'command': ['notify', 'success'], 'run_as': 'root',
+            }],
+            'on_failure': [{
+                'name': 'failure', 'command': ['notify', 'failure'], 'run_as': 'root',
+            }],
+        }
+        invalid = (
+            [],
+            {'during': []},
+            {'before': 'save'},
+            {'before': [{}]},
+            {'before': [{
+                'name': 'save', 'command': [], 'run_as': 'root',
+            }]},
+            {'before': [{
+                'name': 'save', 'command': ['curl', 1], 'run_as': 'root',
+            }]},
+            {'before': [{
+                'name': 'save', 'command': ['curl'], 'timeout': True,
+                'run_as': 'root',
+            }]},
+            {'before': [{
+                'name': 'save', 'command': ['curl'], 'required': 1,
+                'run_as': 'root',
+            }]},
+            {'before': [
+                {'name': 'save', 'command': ['one'], 'run_as': 'root'},
+                {'name': 'save', 'command': ['two'], 'run_as': 'root'},
+            ]},
+            {
+                'before': [{
+                    'name': 'same', 'command': ['one'], 'run_as': 'root',
+                }],
+                'finally': [{
+                    'name': 'same', 'command': ['two'], 'run_as': 'root',
+                }],
+            },
+            {
+                'finally': [
+                    {'name': 'same', 'command': ['one'], 'run_as': 'root'},
+                    {'name': 'same', 'command': ['two'], 'run_as': 'root'},
+                ],
+            },
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertTrue(manifest_module.validate_manifest(
+                manifest(root, actions=valid),
+            ))
+            for actions in invalid:
+                with self.subTest(actions=actions), self.assertRaises(ValueError):
+                    manifest_module.validate_manifest(
+                        manifest(root, actions=actions),
+                    )
+
+    def test_execution_section_is_not_supported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with self.assertRaisesRegex(ValueError, 'unsupported manifest fields'):
+                manifest_module.validate_manifest(manifest(
+                    root, execution={'user': 'root', 'allow_root': True},
+                ))
+
+    def test_action_identity_uses_single_run_as_field(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            invalid = (
+                {'user': 1000, 'before': []},
+                {'group': 1000, 'before': []},
+                {'before': [{
+                    'name': 'missing', 'command': ['/usr/bin/true'],
+                }]},
+                {'before': [{
+                    'name': 'numeric', 'command': ['/usr/bin/true'],
+                    'run_as': 1000,
+                }]},
+                {'before': [{
+                    'name': 'old-shape', 'command': ['/usr/bin/true'],
+                    'run_as': '2000:2000', 'run_group': 2000,
+                }]},
+            )
+            for actions in invalid:
+                with self.subTest(actions=actions), self.assertRaises(ValueError):
+                    manifest_module.validate_manifest(manifest(
+                        root, actions=actions,
+                    ))
+            self.assertTrue(manifest_module.validate_manifest(manifest(
+                root, actions={
+                    'before': [{
+                        'name': 'numeric', 'command': ['/usr/bin/true'],
+                        'run_as': '2000:3000',
+                    }],
+                },
+            )))
 
     def test_duplicate_or_overlapping_path_targets_are_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:

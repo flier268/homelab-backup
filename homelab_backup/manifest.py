@@ -6,6 +6,7 @@ from pathlib import Path
 import yaml
 
 from .common import CommandError, _print_command_failure, run
+from .identity import validate_identity
 from .security import (
     lexical_absolute, path_contains, paths_overlap, read_control_text,
     validate_control_directory, validate_control_file,
@@ -159,7 +160,7 @@ def _validate_manifest_header(m):
     path = m.get('_path', '<manifest>')
     allowed_manifest = {
         'version', 'service', 'enabled', 'schedule', 'retention',
-        'compose', 'consistency', 'sources', '_path', '_dir',
+        'compose', 'consistency', 'actions', 'sources', '_path', '_dir',
         '_snapshot_manifest', '_restore_manifest_requested',
     }
     unknown_manifest = sorted(set(m) - allowed_manifest)
@@ -192,8 +193,12 @@ def _validate_consistency(m, path):
     if unknown_consistency:
         raise ValueError(f'{path}: unsupported consistency fields: {unknown_consistency}')
     mode = consistency.get('mode', 'stop')
-    if mode not in ('stop', 'hooks', 'none'):
-        raise ValueError(f'{path}: invalid consistency.mode {mode!r}; expected stop, hooks, or none')
+    modes = ('stop', 'hooks', 'external', 'live', 'snapshot')
+    if mode not in modes:
+        raise ValueError(
+            f'{path}: invalid consistency.mode {mode!r}; expected '
+            + ', '.join(modes)
+        )
     timeout = consistency.get('timeout', 120)
     if type(timeout) is not int or timeout <= 0:
         raise ValueError(f'{path}: consistency.timeout must be an integer greater than zero')
@@ -209,6 +214,58 @@ def _validate_consistency(m, path):
             raise ValueError(
                 f'{path}: consistency.{hook_name} is only valid with mode hooks'
             )
+
+
+def _validate_actions(m, path):
+    actions = m.get('actions')
+    if actions is None:
+        return
+    if not isinstance(actions, dict):
+        raise ValueError(f'{path}: actions must be a mapping')
+    phases = ('before', 'finally', 'on_success', 'on_failure')
+    unknown = sorted(set(actions) - set(phases))
+    if unknown:
+        raise ValueError(f'{path}: unsupported actions fields: {unknown}')
+    seen = set()
+    for phase in phases:
+        entries = actions.get(phase, [])
+        if not isinstance(entries, list):
+            raise ValueError(f'{path}: actions.{phase} must be a list')
+        for index, action in enumerate(entries):
+            field = f'{path}: actions.{phase}[{index}]'
+            if not isinstance(action, dict):
+                raise ValueError(f'{field} must be a mapping')
+            unknown_action = sorted(
+                set(action) - {
+                    'name', 'command', 'timeout', 'required',
+                    'run_as',
+                }
+            )
+            if unknown_action:
+                raise ValueError(f'{field} has unsupported fields: {unknown_action}')
+            name = action.get('name')
+            if not isinstance(name, str) or not name:
+                raise ValueError(f'{field}.name must be a non-empty string')
+            if name in seen:
+                raise ValueError(
+                    f'{path}: duplicate action name {name!r}'
+                )
+            seen.add(name)
+            validate_identity(action.get('run_as'), f'{field}.run_as')
+            command = action.get('command')
+            if not isinstance(command, list) or not command or not all(
+                isinstance(item, str) and item for item in command
+            ):
+                raise ValueError(
+                    f'{field}.command must be a non-empty list of non-empty strings'
+                )
+            timeout = action.get('timeout', 30)
+            if type(timeout) is not int or timeout <= 0:
+                raise ValueError(
+                    f'{field}.timeout must be an integer greater than zero'
+                )
+            if not isinstance(action.get('required', True), bool):
+                raise ValueError(f'{field}.required must be boolean')
 
 
 def _validate_compose(m, path):
@@ -323,6 +380,7 @@ def _validate_sources(m, path):
 def validate_manifest(m: ServiceManifest):
     path = _validate_manifest_header(m)
     _validate_consistency(m, path)
+    _validate_actions(m, path)
     _validate_compose(m, path)
     validate_schedule(m)
     validate_retention(m)

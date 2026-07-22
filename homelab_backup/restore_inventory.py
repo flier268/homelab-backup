@@ -8,6 +8,53 @@ from .security import (
 from .types import RestoreInventory, ServiceManifest
 
 
+CAPTURE_METHODS = {'btrfs-snapshot', 'quiesced-copy', 'best-effort'}
+
+
+def _validate_capture_entry(entry, source_id):
+    method = entry.get('capture_method')
+    # Inventories created before capture metadata existed remain restorable.
+    if method is not None and method not in CAPTURE_METHODS:
+        raise RuntimeError(
+            f'restore inventory capture method is invalid: {source_id!r}'
+        )
+    writers = entry.get('writers', [])
+    if not isinstance(writers, list) or not all(
+            isinstance(item, str) and item for item in writers
+    ) or len(writers) != len(set(writers)):
+        raise RuntimeError(f'restore inventory writers are invalid: {source_id!r}')
+
+
+def _validate_consistency_metadata(inventory):
+    metadata = inventory.get('consistency')
+    if metadata is None:
+        return
+    if not isinstance(metadata, dict) or set(metadata) != {
+            'mode', 'guarantee', 'optional_action_failures', 'writers',
+    }:
+        raise RuntimeError('restore inventory consistency metadata is invalid')
+    if metadata['mode'] not in {
+            'stop', 'hooks', 'external', 'live', 'snapshot',
+    } or metadata['guarantee'] not in CAPTURE_METHODS:
+        raise RuntimeError('restore inventory consistency metadata is invalid')
+    failures = metadata['optional_action_failures']
+    if not isinstance(failures, list):
+        raise RuntimeError('restore inventory optional action failures are invalid')
+    for failure in failures:
+        if not isinstance(failure, dict) \
+                or set(failure) != {'phase', 'name', 'result'} \
+                or failure['phase'] not in {
+                    'before', 'finally', 'on_success', 'on_failure',
+                } \
+                or not isinstance(failure['name'], str) or not failure['name'] \
+                or failure['result'] not in {'failed', 'timeout'}:
+            raise RuntimeError('restore inventory optional action failures are invalid')
+    writers = metadata['writers']
+    if not isinstance(writers, list) or writers != sorted(set(writers)) \
+            or not all(isinstance(item, str) and item for item in writers):
+        raise RuntimeError('restore inventory consistency writers are invalid')
+
+
 def load_restore_inventory(root) -> RestoreInventory:
     path = Path(root) / '_meta' / 'inventory.json'
     try:
@@ -34,6 +81,7 @@ def validate_restore_inventory(
     path_entries = inventory.get('paths')
     volume_entries = inventory.get('volumes')
     identity = inventory.get('compose')
+    _validate_consistency_metadata(inventory)
     if not isinstance(path_entries, list) or not isinstance(volume_entries, list):
         raise RuntimeError('restore inventory paths and volumes must be lists')
     if not isinstance(identity, dict) or not isinstance(identity.get('project_name'), str):
@@ -55,6 +103,7 @@ def validate_restore_inventory(
         raise RuntimeError('restore inventory volume source IDs do not match manifest')
     for source_id, source in declared_paths.items():
         entry = inventory_paths[source_id]
+        _validate_capture_entry(entry, source_id)
         if entry.get('path') != source['path']:
             raise RuntimeError(f'restore inventory path differs for source {source_id!r}')
         if type(entry.get('present')) is not bool:
@@ -99,6 +148,7 @@ def validate_restore_inventory(
         raise RuntimeError('restore inventory Compose volume mapping differs from sources')
     for source_id, source in declared_volumes.items():
         entry = inventory_volumes[source_id]
+        _validate_capture_entry(entry, source_id)
         if type(entry.get('present')) is not bool:
             raise RuntimeError(f'restore inventory volume present flag is invalid: {source_id!r}')
         if source.get('required', True) and not entry['present']:

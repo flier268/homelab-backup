@@ -402,5 +402,78 @@ class BackupStateTests(unittest.TestCase):
                 for call in run_mock.call_args_list
             ))
 
+    def test_success_action_runs_after_restic_commit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            value = manifest(root)
+            events = []
+
+            def fake_run(command, **_kwargs):
+                if command[:2] == ['restic', 'backup']:
+                    events.append('restic')
+                return mock.Mock(stdout='')
+
+            with mock.patch.object(backup, 'load_state', return_value={}), \
+                    mock.patch.object(backup, 'save_state'), \
+                    mock.patch.object(backup, 'stage_service', return_value=root), \
+                    mock.patch.object(backup, 'restic_env', return_value={}), \
+                    mock.patch.object(backup, 'run', side_effect=fake_run), \
+                    mock.patch.object(
+                        backup, 'run_success_actions',
+                        side_effect=lambda _m: events.append('on_success') or [],
+                    ):
+                self.assertTrue(backup.backup_one(
+                    {'host_id': 'host'}, value, apply_retention=False,
+                ))
+
+            self.assertEqual(events, ['restic', 'on_success'])
+
+    def test_staging_failure_passes_reason_to_failure_action(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            value = manifest(Path(tmp))
+            failure = RuntimeError('staging failed')
+            with mock.patch.object(backup, 'load_state', return_value={}), \
+                    mock.patch.object(backup, 'save_state'), \
+                    mock.patch.object(
+                        backup, 'stage_service', side_effect=failure,
+                    ), mock.patch.object(
+                        backup, 'run_failure_actions', return_value=[],
+                    ) as on_failure, self.assertRaises(RuntimeError) as caught:
+                backup.backup_one({'host_id': 'host'}, value)
+
+            self.assertIs(caught.exception, failure)
+            on_failure.assert_called_once_with(
+                value, error=failure, phase='staging',
+            )
+
+    def test_success_action_failure_triggers_failure_action_but_state_is_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            value = manifest(root)
+            failure = RuntimeError('notification failed')
+            saved = []
+            with mock.patch.object(backup, 'load_state', return_value={}), \
+                    mock.patch.object(
+                        backup, 'save_state', side_effect=lambda _c, _s, state:
+                        saved.append(copy.deepcopy(state)),
+                    ), mock.patch.object(
+                        backup, 'stage_service', return_value=root,
+                    ), mock.patch.object(
+                        backup, 'restic_env', return_value={},
+                    ), mock.patch.object(backup, 'run'), mock.patch.object(
+                        backup, 'run_success_actions', side_effect=failure,
+                    ), mock.patch.object(
+                        backup, 'run_failure_actions', return_value=[],
+                    ) as on_failure, self.assertRaises(RuntimeError) as caught:
+                backup.backup_one(
+                    {'host_id': 'host'}, value, apply_retention=False,
+                )
+
+            self.assertIs(caught.exception, failure)
+            self.assertEqual(saved[-1]['last_result'], 'success')
+            on_failure.assert_called_once_with(
+                value, error=failure, phase='on_success',
+            )
+
 if __name__ == '__main__':
     unittest.main()
