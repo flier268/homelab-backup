@@ -219,6 +219,16 @@ sudo backupctl restore --all \
   --restore-manifest --apply --start --yes
 ```
 
+查詢指定服務的 snapshot：
+
+```bash
+sudo backupctl snapshots minecraft
+```
+
+指定服務的 snapshot 清單會追加唯讀 retention preview，顯示每份 snapshot
+目前符合的保留原因（例如 last、daily、weekly）以及 policy 將移除的項目；
+preview 不會執行 forget 或 prune。
+
 指定歷史 snapshot ID 時只允許單一服務；程式會先確認該 ID 屬於目前
 host 與指定的 service tag，再開始下載：
 

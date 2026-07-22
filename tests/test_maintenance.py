@@ -324,13 +324,69 @@ class MaintenanceCommandTests(unittest.TestCase):
 
     def test_snapshots_always_filters_by_host(self):
         args = mock.Mock(service=None)
+        output = io.StringIO()
         with mock.patch.object(maintenance, 'restic_env', return_value={}), \
-                mock.patch.object(maintenance, 'run') as run_mock:
+                mock.patch.object(maintenance, 'run') as run_mock, \
+                redirect_stdout(output):
             maintenance.cmd_snapshots({'host_id': 'server-a'}, args)
 
         self.assertEqual(
             run_mock.call_args.args[0],
             ['restic', 'snapshots', '--host', 'server-a'],
+        )
+        self.assertIn('backupctl snapshots SERVICE', output.getvalue())
+
+    def test_snapshots_for_service_include_retention_reasons_preview(self):
+        args = mock.Mock(service='demo')
+        config = {'host_id': 'server-a'}
+        value = {'service': 'demo', 'retention': {'keep_last': 3}}
+        environment = {'RESTIC_REPOSITORY': 'repo'}
+        output = io.StringIO()
+        with mock.patch.object(
+            maintenance, 'restic_env', return_value=environment,
+        ), mock.patch.object(
+            maintenance, 'manifest', return_value=value,
+        ), mock.patch.object(
+            maintenance, 'validate_manifest',
+        ) as validate_mock, mock.patch.object(
+            maintenance, 'run',
+        ) as run_mock, redirect_stdout(output):
+            maintenance.cmd_snapshots(config, args)
+
+        validate_mock.assert_called_once_with(value)
+        self.assertEqual(run_mock.call_args_list, [
+            mock.call([
+                'restic', 'snapshots', '--host', 'server-a',
+                '--tag', 'service:demo',
+            ], env=environment),
+            mock.call([
+                'restic', 'forget', '--host', 'server-a',
+                '--tag', 'service:demo', '--group-by', 'host,tags',
+                '--keep-last', '3', '--dry-run',
+            ], env=environment),
+        ])
+        self.assertIn('== Retention preview: demo ==', output.getvalue())
+
+    def test_snapshots_remain_available_without_a_local_manifest(self):
+        args = mock.Mock(service='removed')
+        config = {'host_id': 'server-a'}
+        error = io.StringIO()
+        with mock.patch.object(
+            maintenance, 'restic_env', return_value={},
+        ), mock.patch.object(
+            maintenance, 'manifest', side_effect=ValueError('unknown service'),
+        ), mock.patch.object(
+            maintenance, 'run',
+        ) as run_mock, redirect_stderr(error):
+            maintenance.cmd_snapshots(config, args)
+
+        run_mock.assert_called_once_with([
+            'restic', 'snapshots', '--host', 'server-a',
+            '--tag', 'service:removed',
+        ], env={})
+        self.assertIn(
+            'WARNING: retention preview unavailable for removed',
+            error.getvalue(),
         )
 
     def test_unlock_removes_only_stale_repository_locks(self):

@@ -9,7 +9,7 @@ from .common import (
     CommandError, FailureSummary, GlobalLock, _print_command_failure, die,
     restic_env, run,
 )
-from .manifest import manifests, valid_service_name
+from .manifest import manifest, manifests, valid_service_name, validate_manifest
 from .schedule import local_now
 
 
@@ -131,10 +131,28 @@ def cmd_run_due(c, args):
 
 
 def cmd_snapshots(c, args):
+    env = restic_env(c)
     cmd = ['restic', 'snapshots', '--host', c['host_id']]
     if args.service:
         cmd += ['--tag', f'service:{args.service}']
-    run(cmd, env=restic_env(c))
+    run(cmd, env=env)
+    if not args.service:
+        print('\nSpecify a service to include retention reasons: '
+              'backupctl snapshots SERVICE')
+        return
+
+    try:
+        m = manifest(c, args.service)
+        validate_manifest(m)
+    except Exception as err:
+        print(
+            f'WARNING: retention preview unavailable for {args.service}: {err}',
+            file=sys.stderr,
+        )
+        return
+
+    print(f'\n== Retention preview: {args.service} ==')
+    run(retention_cmd(c, m, dry_run=True), env=env)
 
 
 def cmd_maintenance(c, args):
