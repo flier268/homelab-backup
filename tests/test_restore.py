@@ -55,6 +55,134 @@ class RepositoryBoundaryTests(unittest.TestCase):
                 )
         run_mock.assert_not_called()
 
+    def test_delete_snapshot_resolves_scope_before_forget(self):
+        args = mock.Mock(
+            service='demo', snapshot='aaaaaaaa', prune=False, yes=True,
+        )
+        config_data = {'host_id': 'host'}
+        with mock.patch.object(
+            backupctl, 'resolve_explicit_snapshot', return_value='a' * 64,
+        ) as resolve_mock, mock.patch.object(
+            backupctl, 'restic_env', return_value={'RESTIC': 'env'},
+        ), mock.patch.object(backupctl, 'run') as run_mock:
+            backupctl.cmd_delete_snapshot(config_data, args)
+
+        resolve_mock.assert_called_once_with(config_data, 'demo', 'aaaaaaaa')
+        run_mock.assert_called_once_with(
+            ['restic', 'forget', 'a' * 64], env={'RESTIC': 'env'},
+        )
+
+    def test_delete_snapshot_rejects_invalid_service_before_repository_access(self):
+        args = mock.Mock(
+            service='../other', snapshot='aaaaaaaa', prune=False, yes=True,
+        )
+        with mock.patch.object(
+            backupctl, 'resolve_explicit_snapshot',
+        ) as resolve_mock, mock.patch.object(backupctl, 'run') as run_mock:
+            with self.assertRaises(SystemExit):
+                backupctl.cmd_delete_snapshot({'host_id': 'host'}, args)
+
+        resolve_mock.assert_not_called()
+        run_mock.assert_not_called()
+
+    def test_delete_snapshot_can_prune_immediately(self):
+        args = mock.Mock(
+            service='demo', snapshot='aaaaaaaa', prune=True, yes=True,
+        )
+        with mock.patch.object(
+            backupctl, 'resolve_explicit_snapshot', return_value='a' * 64,
+        ), mock.patch.object(
+            backupctl, 'restic_env', return_value={},
+        ), mock.patch.object(backupctl, 'run') as run_mock:
+            backupctl.cmd_delete_snapshot({'host_id': 'host'}, args)
+
+        self.assertEqual(run_mock.call_args_list, [
+            mock.call(['restic', 'forget', 'a' * 64], env={}),
+            mock.call(['restic', 'prune'], env={}),
+        ])
+
+    def test_delete_snapshot_reports_committed_forget_when_prune_fails(self):
+        snapshot = 'a' * 64
+        args = mock.Mock(
+            service='demo', snapshot='aaaaaaaa', prune=True, yes=True,
+        )
+        error = StringIO()
+        with mock.patch.object(
+            backupctl, 'resolve_explicit_snapshot', return_value=snapshot,
+        ), mock.patch.object(
+            backupctl, 'restic_env', return_value={'RESTIC': 'env'},
+        ), mock.patch.object(
+            backupctl, 'run', side_effect=[None, OSError('prune unavailable')],
+        ) as run_mock, redirect_stderr(error):
+            with self.assertRaisesRegex(OSError, 'prune unavailable'):
+                backupctl.cmd_delete_snapshot({'host_id': 'host'}, args)
+
+        self.assertEqual(run_mock.call_args_list, [
+            mock.call(
+                ['restic', 'forget', snapshot], env={'RESTIC': 'env'},
+            ),
+            mock.call(['restic', 'prune'], env={'RESTIC': 'env'}),
+        ])
+        self.assertIn(
+            f'Snapshot {snapshot} for demo was deleted, but repository prune failed',
+            error.getvalue(),
+        )
+
+    def test_delete_snapshot_reports_prune_command_details_once(self):
+        snapshot = 'a' * 64
+        args = mock.Mock(
+            service='demo', snapshot='aaaaaaaa', prune=True, yes=True,
+        )
+        failure = backupctl.CommandError(
+            ['restic', 'prune'], 1, stderr='backend unavailable',
+        )
+        error = StringIO()
+        with mock.patch.object(
+            backupctl, 'resolve_explicit_snapshot', return_value=snapshot,
+        ), mock.patch.object(
+            backupctl, 'restic_env', return_value={},
+        ), mock.patch.object(
+            backupctl, 'run', side_effect=[None, failure],
+        ), redirect_stderr(error):
+            with self.assertRaises(backupctl.CommandError):
+                backupctl.cmd_delete_snapshot({'host_id': 'host'}, args)
+
+        self.assertTrue(failure.reported)
+        self.assertIn(
+            f'Snapshot {snapshot} for demo was deleted, but repository prune failed',
+            error.getvalue(),
+        )
+        self.assertIn('backend unavailable', error.getvalue())
+
+    def test_noninteractive_delete_snapshot_requires_yes(self):
+        args = mock.Mock(
+            service='demo', snapshot='aaaaaaaa', prune=False, yes=False,
+        )
+        with mock.patch.object(
+            backupctl, 'resolve_explicit_snapshot', return_value='a' * 64,
+        ), mock.patch.object(
+            backupctl.sys.stdin, 'isatty', return_value=False,
+        ), mock.patch.object(backupctl, 'run') as run_mock:
+            with self.assertRaises(SystemExit):
+                backupctl.cmd_delete_snapshot({'host_id': 'host'}, args)
+
+        run_mock.assert_not_called()
+
+    def test_interactive_delete_snapshot_can_be_cancelled(self):
+        args = mock.Mock(
+            service='demo', snapshot='aaaaaaaa', prune=False, yes=False,
+        )
+        with mock.patch.object(
+            backupctl, 'resolve_explicit_snapshot', return_value='a' * 64,
+        ), mock.patch.object(
+            backupctl.sys.stdin, 'isatty', return_value=True,
+        ), mock.patch.object(
+            backupctl, 'prompt_yes_no', return_value=False,
+        ), mock.patch.object(backupctl, 'run') as run_mock:
+            backupctl.cmd_delete_snapshot({'host_id': 'host'}, args)
+
+        run_mock.assert_not_called()
+
     def test_restore_size_is_scoped_to_service_snapshot_and_host(self):
         result = mock.Mock(stdout=json.dumps({
             'total_size': 123456,

@@ -10,8 +10,8 @@ import yaml
 
 from . import restore_apply
 from .common import (
-    MIN_FREE_BYTES, FailureSummary, GlobalLock, die, format_bytes, restic_env,
-    run,
+    MIN_FREE_BYTES, CommandError, FailureSummary, GlobalLock,
+    _print_command_failure, die, format_bytes, restic_env, run,
 )
 from .manifest import manifest, valid_service_name, validate_manifest
 from .security import (
@@ -76,6 +76,44 @@ def resolve_explicit_snapshot(c, service, selector):
     if len(matches) > 1:
         die(f'snapshot prefix {selector!r} is ambiguous for service {service!r}')
     return matches[0]
+
+
+def cmd_delete_snapshot(c, args):
+    if not valid_service_name(args.service):
+        die(f'invalid service name: {args.service!r}')
+    snapshot = resolve_explicit_snapshot(c, args.service, args.snapshot)
+    if not args.yes:
+        if not sys.stdin.isatty():
+            die('non-interactive snapshot deletion requires --yes')
+        if not prompt_yes_no(
+                f'Delete snapshot {snapshot} for service {args.service}?',
+                default=False,
+        ):
+            print('Snapshot deletion cancelled.')
+            return
+
+    env = restic_env(c)
+    run(['restic', 'forget', snapshot], env=env)
+    print(f'Deleted snapshot {snapshot} for {args.service}.')
+    if not args.prune:
+        return
+
+    context = (
+        f'Snapshot {snapshot} for {args.service} was deleted, '
+        'but repository prune failed'
+    )
+    try:
+        run(['restic', 'prune'], env=env)
+    except Exception as err:
+        if isinstance(err, CommandError):
+            _print_command_failure(err, context=context)
+        else:
+            print(
+                f'ERROR: {context}: {type(err).__name__}: {err}',
+                file=sys.stderr,
+            )
+        raise
+    print('Reclaimed unreferenced repository data.')
 
 
 def estimate_restore_size(c, service, snapshot):

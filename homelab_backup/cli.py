@@ -14,7 +14,9 @@ from .maintenance import (
     cmd_check, cmd_list, cmd_maintenance, cmd_run_due, cmd_snapshots,
     cmd_status, cmd_unlock,
 )
-from .restore import cmd_apply, cmd_cleanup_restores, cmd_restore
+from .restore import (
+    cmd_apply, cmd_cleanup_restores, cmd_delete_snapshot, cmd_restore,
+)
 
 
 COMMANDS = {
@@ -25,6 +27,7 @@ COMMANDS = {
     'backup': cmd_backup,
     'run-due': cmd_run_due,
     'snapshots': cmd_snapshots,
+    'delete-snapshot': cmd_delete_snapshot,
     'restore': cmd_restore,
     'cleanup-restores': cmd_cleanup_restores,
     'apply': cmd_apply,
@@ -67,6 +70,17 @@ def build_parser():
     sub.add_parser('run-due')
     command = sub.add_parser('snapshots')
     command.add_argument('service', nargs='?')
+    command = sub.add_parser('delete-snapshot')
+    command.add_argument('service')
+    command.add_argument('snapshot', help='8-64 character snapshot ID or prefix')
+    command.add_argument(
+        '--prune', action='store_true',
+        help='immediately reclaim repository space after deleting the snapshot',
+    )
+    command.add_argument(
+        '--yes', action='store_true',
+        help='confirm deletion; required whenever stdin is not a TTY',
+    )
     command = sub.add_parser('restore')
     command.add_argument('services', nargs='*')
     command.add_argument('--all', action='store_true', help='restore all services without the selector')

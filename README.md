@@ -226,6 +226,15 @@ host 與指定的 service tag，再開始下載：
 sudo backupctl restore minecraft --snapshot 01234567 --apply
 ```
 
+刪除指定 snapshot 時也會先驗證目前 host 與 service tag。互動模式會再次
+確認；非互動模式必須指定 `--yes`。預設只移除 snapshot metadata，未被引用的
+repository 資料會在下次 maintenance 回收；需要立即回收可加 `--prune`：
+
+```bash
+sudo backupctl delete-snapshot minecraft 01234567
+sudo backupctl delete-snapshot minecraft 01234567 --prune --yes
+```
+
 安全政策：只要 stdin 不是 TTY，所有 `restore`（包含只下載、不加
 `--apply`）都必須明確指定 `--yes`。
 

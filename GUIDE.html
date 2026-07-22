@@ -650,6 +650,9 @@ sources:
 <pre><code>sudo backupctl backup minecraft</code></pre>
 <p>查看 snapshot：</p>
 <pre><code>sudo backupctl snapshots minecraft</code></pre>
+<p>刪除指定 snapshot 時會先確認 ID 屬於目前 host 與指定服務。互動模式會再次確認；非互動模式必須加 <code>--yes</code>。預設未引用資料會留待下次 maintenance 回收；加 <code>--prune</code> 可立即回收：</p>
+<pre><code>sudo backupctl delete-snapshot minecraft 01234567
+sudo backupctl delete-snapshot minecraft 01234567 --prune --yes</code></pre>
 <p>再測其他服務：</p>
 <pre><code>sudo backupctl backup ghost
 sudo backupctl backup palworld</code></pre>

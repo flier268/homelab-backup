@@ -49,6 +49,16 @@ class LauncherTests(unittest.TestCase):
         self.assertTrue(batch.all)
         self.assertTrue(batch.yes)
 
+    def test_delete_snapshot_parser_accepts_confirmation_and_prune(self):
+        args = cli.build_parser().parse_args([
+            'delete-snapshot', 'demo', '01234567', '--prune', '--yes',
+        ])
+
+        self.assertEqual(args.service, 'demo')
+        self.assertEqual(args.snapshot, '01234567')
+        self.assertTrue(args.prune)
+        self.assertTrue(args.yes)
+
     def test_non_root_subcommand_is_rejected_before_loading_config(self):
         with mock.patch.object(cli.os, 'geteuid', return_value=1000), \
                 mock.patch.object(cli, 'cfg') as cfg_mock, \
