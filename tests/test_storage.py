@@ -96,6 +96,28 @@ class RuntimeValidationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'missing required source'):
                 storage.validate_runtime_sources({}, value, {})
 
+    def test_runtime_validation_rejects_include_for_file_and_symlink_sources(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stack = root / 'demo'
+            stack.mkdir()
+            (stack / 'file').write_text('payload', encoding='utf-8')
+            (stack / 'link').symlink_to('file')
+
+            for name in ('file', 'link'):
+                with self.subTest(name=name):
+                    value = manifest(root, sources={
+                        'paths': [{
+                            'id': name, 'path': name,
+                            'include': ['payload/**'],
+                        }],
+                        'volumes': [],
+                    })
+                    with self.assertRaisesRegex(
+                        ValueError, 'only supported for directory',
+                    ):
+                        storage.validate_runtime_sources({}, value, {})
+
     def test_declared_volume_is_inspected(self):
         with tempfile.TemporaryDirectory() as tmp:
             value = manifest(Path(tmp), sources={
@@ -270,6 +292,174 @@ class RuntimeValidationTests(unittest.TestCase):
 
 
 class PathSyncTests(unittest.TestCase):
+    def test_path_filter_args_are_ordered_with_excludes_first(self):
+        source = {
+            'include': ['world/**', 'server.properties'],
+            'exclude': ['world/cache/**'],
+        }
+
+        self.assertEqual(storage.build_path_filter_args(source), [
+            '--exclude', 'world/cache/**',
+            '--include', '*/',
+            '--include', 'world/**',
+            '--include', 'server.properties',
+            '--exclude', '*',
+            '--prune-empty-dirs',
+        ])
+        self.assertEqual(
+            storage.build_path_filter_args(
+                source, protect_destination_dirs=True,
+            ),
+            [
+                '--exclude', 'world/cache/**',
+                '--filter', 'P */',
+                '--include', '*/',
+                '--include', 'world/**',
+                '--include', 'server.properties',
+                '--exclude', '*',
+                '--prune-empty-dirs',
+            ],
+        )
+        self.assertEqual(
+            storage.build_path_filter_args({'exclude': ['cache/**']}),
+            ['--exclude', 'cache/**'],
+        )
+        self.assertEqual(storage.build_path_filter_args({}), [])
+
+    def test_include_copies_only_selected_paths_and_prunes_empty_directories(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payload = root / 'demo' / 'data'
+            (payload / 'world' / 'region').mkdir(parents=True)
+            (payload / 'world' / 'cache').mkdir()
+            (payload / 'junk' / 'nested').mkdir(parents=True)
+            (payload / 'world' / 'region' / 'r.0.0.mca').write_text(
+                'region', encoding='utf-8',
+            )
+            (payload / 'world' / 'cache' / 'drop.bin').write_text(
+                'drop', encoding='utf-8',
+            )
+            (payload / 'junk' / 'nested' / 'drop.txt').write_text(
+                'drop', encoding='utf-8',
+            )
+            (payload / 'server.properties').write_text(
+                'online-mode=true', encoding='utf-8',
+            )
+            value = manifest(root, sources={
+                'paths': [{
+                    'id': 'data', 'path': 'data',
+                    'include': ['world/**', 'server.properties'],
+                    'exclude': ['world/cache/**'],
+                }],
+                'volumes': [],
+            })
+
+            storage.sync_paths(value, root / 'stage')
+
+            archived = root / 'stage' / 'paths' / 'data'
+            self.assertTrue((archived / 'world' / 'region' / 'r.0.0.mca').is_file())
+            self.assertTrue((archived / 'server.properties').is_file())
+            self.assertFalse((archived / 'world' / 'cache').exists())
+            self.assertFalse((archived / 'junk').exists())
+
+    def test_include_is_rejected_for_file_and_symlink_sources(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stack = root / 'demo'
+            stack.mkdir()
+            (stack / 'file').write_text('payload', encoding='utf-8')
+            (stack / 'link').symlink_to('file')
+            for name in ('file', 'link'):
+                with self.subTest(name=name):
+                    value = manifest(root, sources={
+                        'paths': [{
+                            'id': name, 'path': name, 'include': ['payload/**'],
+                        }],
+                        'volumes': [],
+                    })
+                    with self.assertRaisesRegex(
+                        ValueError, 'only supported for directory',
+                    ):
+                        storage.sync_paths(value, root / f'stage-{name}')
+
+    def test_filtered_size_estimate_uses_selected_rsync_file_list(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payload = root / 'demo' / 'data'
+            (payload / 'keep').mkdir(parents=True)
+            (payload / 'drop').mkdir()
+            (payload / 'keep' / 'small.txt').write_text('small', encoding='utf-8')
+            (payload / 'drop' / 'large.bin').write_bytes(b'x' * 1024 * 1024)
+            source = {
+                'id': 'data', 'path': 'data', 'include': ['keep/**'],
+            }
+            value = manifest(root, sources={
+                'paths': [source], 'volumes': [],
+            })
+
+            estimate = storage.estimate_path_source(
+                {'trusted_data_roots': [str(root)]},
+                value,
+                source,
+                allocation_unit=4096,
+            )
+
+            self.assertEqual(estimate, 5 + 2 * 4096)
+
+    def test_excluded_content_is_not_counted_in_size_estimate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payload = root / 'demo' / 'data'
+            (payload / 'keep').mkdir(parents=True)
+            (payload / 'drop').mkdir()
+            (payload / 'keep' / 'small.txt').write_text('small', encoding='utf-8')
+            (payload / 'drop' / 'large.bin').write_bytes(b'x' * 1024 * 1024)
+            source = {
+                'id': 'data', 'path': 'data', 'exclude': ['drop/**'],
+            }
+            value = manifest(root, sources={
+                'paths': [source], 'volumes': [],
+            })
+
+            estimate = storage.estimate_path_source(
+                {'trusted_data_roots': [str(root)]},
+                value,
+                source,
+                allocation_unit=4096,
+            )
+
+            self.assertLess(estimate, 1024 * 1024)
+
+    def test_backup_estimate_uses_staging_filesystem_allocation_unit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = {'id': 'data', 'path': 'data'}
+            value = manifest(root, sources={
+                'paths': [source], 'volumes': [],
+            })
+            filesystem = SimpleNamespace(f_frsize=8192)
+            with mock.patch.object(
+                storage.os, 'statvfs', return_value=filesystem,
+            ) as statvfs, mock.patch.object(
+                storage, 'estimate_path_source', return_value=0,
+            ) as estimate:
+                storage.estimate_backup_size(
+                    {'staging_root': str(root)},
+                    value,
+                    resolved=[],
+                    staging_path=root / 'stage',
+                )
+
+            self.assertEqual(estimate.call_args.kwargs['allocation_unit'], 8192)
+            statvfs.assert_called_once_with(root / 'stage')
+
+    def test_filtered_size_estimate_rejects_invalid_rsync_stats(self):
+        source = {'id': 'data', 'include': ['keep/**']}
+        with mock.patch.object(
+            storage, 'run', return_value=SimpleNamespace(stdout='invalid\n'),
+        ), self.assertRaisesRegex(RuntimeError, 'invalid filtered size estimate'):
+            storage._estimate_filtered_directory(1, source, 4096)
+
     def test_ancestor_metadata_comes_from_the_pinned_source_walk(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

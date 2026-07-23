@@ -68,6 +68,7 @@ def _sync_stage(
     estimated_size = estimate_backup_size(
         c, m, resolved=context.resolved_volumes,
         source_overrides=source_overrides,
+        staging_path=stage,
     )
     _check_backup_space(
         c, m, stage, estimated_size,

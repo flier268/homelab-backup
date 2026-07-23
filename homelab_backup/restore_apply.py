@@ -27,9 +27,9 @@ from .security import (
     remove_data_entry, validate_data_parent, validate_data_path, validate_payload,
 )
 from .storage import (
-    create_restore_volume, docker_mount_conflicts, docker_project_containers,
-    docker_volume_exists, sync_volumes, validate_volume_identity,
-    volume_owned_by_operation,
+    build_path_filter_args, create_restore_volume, docker_mount_conflicts,
+    docker_project_containers, docker_volume_exists, sync_volumes,
+    validate_volume_identity, volume_owned_by_operation,
 )
 from .types import GlobalConfig, ServiceManifest
 
@@ -123,7 +123,7 @@ def _restore_non_directory(restored, parent_fd, name, *, on_publish=None):
 
 
 def _restore_rebuild_directory(
-        restored, parent_fd, name, excludes, *, on_publish=None,
+        restored, parent_fd, name, *, on_publish=None,
 ):
     temporary = None
     temporary_fd = -1
@@ -154,8 +154,6 @@ def _restore_rebuild_directory(
         if temporary_fd < 0:
             raise RuntimeError('cannot reserve a restore publication directory')
         command = ['rsync', '-aHAX', '--numeric-ids', '--delete']
-        for item in excludes or []:
-            command += ['--exclude', item]
         command += [f'{restored}/', f'/proc/self/fd/{temporary_fd}/']
         run(command, pass_fds=(temporary_fd,))
         prepared_state = data_object_state(temporary_fd)
@@ -225,8 +223,7 @@ def restore_path_source(
             )
         if rebuild:
             return _restore_rebuild_directory(
-                restored, parent_fd, name, source.get('exclude'),
-                on_publish=on_publish,
+                restored, parent_fd, name, on_publish=on_publish,
             )
         try:
             os.mkdir(name, 0o700, dir_fd=parent_fd)
@@ -238,8 +235,9 @@ def restore_path_source(
         )
         try:
             command = ['rsync', '-aHAX', '--numeric-ids', '--delete']
-            for item in source.get('exclude', []):
-                command += ['--exclude', item]
+            command += build_path_filter_args(
+                source, protect_destination_dirs=True,
+            )
             command += [f'{restored}/', f'/proc/self/fd/{target_fd}/']
             run(command, pass_fds=(target_fd,))
             metadata = os.fstat(target_fd)

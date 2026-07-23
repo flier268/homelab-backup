@@ -372,7 +372,7 @@ def _validate_compose(m, path):
 
 def _validate_source_common(path, kind, index, source, ids):
     allowed_source = (
-        {'id', 'path', 'required', 'exclude'} if kind == 'paths'
+        {'id', 'path', 'required', 'include', 'exclude'} if kind == 'paths'
         else {'id', 'name', 'compose_volume', 'required', 'exclude'}
     )
     unknown_source = sorted(set(source) - allowed_source)
@@ -395,6 +395,15 @@ def _validate_source_common(path, kind, index, source, ids):
     excludes = source.get('exclude', [])
     if not isinstance(excludes, list) or not all(isinstance(x, str) for x in excludes):
         raise ValueError(f'{path}: sources.{kind}[{index}].exclude must be a list of strings')
+    if kind == 'paths' and 'include' in source:
+        includes = source['include']
+        if not isinstance(includes, list) or not includes or not all(
+            isinstance(x, str) and x for x in includes
+        ):
+            raise ValueError(
+                f'{path}: sources.paths[{index}].include must be '
+                'a non-empty list of non-empty strings'
+            )
     if not isinstance(source.get('required', True), bool):
         raise ValueError(f'{path}: sources.{kind}[{index}].required must be boolean')
 

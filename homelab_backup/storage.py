@@ -13,7 +13,7 @@ from .manifest import (
 from .security import (
     clear_control_leaf, containing_mount, docker_mount_users,
     ensure_private_directory, open_data_path, open_data_path_with_parent_metadata,
-    validate_data_path, validate_payload, validate_payload_fd,
+    validate_payload, validate_payload_fd,
 )
 
 def docker_volume_exists(name):
@@ -208,18 +208,44 @@ def _source_trusted_roots(c, m):
     return c.get('trusted_data_roots') or [m['_dir']]
 
 
+def _validate_path_filter_type(source, metadata, path):
+    if source.get('include') and not stat.S_ISDIR(metadata.st_mode):
+        raise ValueError(
+            f'include is only supported for directory path sources: {path}'
+        )
+
+
 def validate_runtime_sources(c, m, model, *, allow_missing_paths=False):
     trusted_roots = _source_trusted_roots(c, m)
     for source in (m.get('sources') or {}).get('paths', []):
         path = source_path(m, source)
         try:
-            validate_data_path(path, trusted_roots)
+            fd, metadata = open_data_path(path, trusted_roots)
+            try:
+                _validate_path_filter_type(source, metadata, path)
+            finally:
+                os.close(fd)
         except FileNotFoundError:
             if source.get('required', True) and not allow_missing_paths:
                 raise ValueError(f'missing required source: {path}')
     for source, name in resolved_volume_sources(m, model=model):
         if not docker_volume_exists(name) and source.get('required', True):
             raise RuntimeError(f'Docker volume does not exist or is inaccessible: {name}')
+
+
+def build_path_filter_args(source, *, protect_destination_dirs=False):
+    args = []
+    for item in source.get('exclude', []):
+        args += ['--exclude', item]
+    includes = source.get('include')
+    if includes:
+        if protect_destination_dirs:
+            args += ['--filter', 'P */']
+        args += ['--include', '*/']
+        for item in includes:
+            args += ['--include', item]
+        args += ['--exclude', '*', '--prune-empty-dirs']
+    return args
 
 
 def rsync(src, dst, excludes=None, delete=True):
@@ -335,7 +361,47 @@ def _estimate_open_source(fd, metadata, display_path):
     return total
 
 
-def estimate_path_source(c, m, source, *, physical_source=None):
+def _parse_filtered_size_stats(output, source):
+    number = r'([0-9][0-9,]*)'
+    file_match = re.search(
+        rf'^Number of created files:\s+{number}(?:\s|\(|$)',
+        output,
+        re.MULTILINE,
+    )
+    size_match = re.search(
+        rf'^Total file size:\s+{number}\s+bytes$', output, re.MULTILINE,
+    )
+    if file_match is None or size_match is None:
+        raise RuntimeError(
+            f'invalid filtered size estimate for path source {source["id"]!r}'
+        )
+    return (
+        int(file_match.group(1).replace(',', '')),
+        int(size_match.group(1).replace(',', '')),
+    )
+
+
+def _estimate_filtered_directory(fd, source, allocation_unit):
+    with tempfile.TemporaryDirectory(prefix='homelab-backup-estimate-') as destination:
+        command = [
+            'rsync', '-aHAX', '--numeric-ids', '--dry-run', '--stats',
+            *build_path_filter_args(source),
+            f'/proc/self/fd/{fd}/', f'{destination}/',
+        ]
+        environment = os.environ.copy()
+        environment['LC_ALL'] = 'C'
+        result = run(
+            command, capture=True, pass_fds=(fd,), env=environment,
+        )
+    item_count, logical_size = _parse_filtered_size_stats(
+        result.stdout, source,
+    )
+    return logical_size + item_count * allocation_unit
+
+
+def estimate_path_source(
+        c, m, source, *, physical_source=None, allocation_unit=4096,
+):
     src = Path(physical_source) if physical_source is not None else source_path(m, source)
     trusted_roots = _source_trusted_roots(c, m)
     try:
@@ -349,7 +415,13 @@ def estimate_path_source(c, m, source, *, physical_source=None):
     filesystem = containing_mount(src).filesystem_type
     try:
         validate_payload_fd(fd, src, filesystem_type=filesystem)
-        size = _estimate_open_source(fd, metadata, src)
+        _validate_path_filter_type(source, metadata, src)
+        if stat.S_ISDIR(metadata.st_mode) and build_path_filter_args(source):
+            size = _estimate_filtered_directory(
+                fd, source, allocation_unit,
+            )
+        else:
+            size = _estimate_open_source(fd, metadata, src)
         _verify_path_source(
             src, metadata,
             trusted_roots=None if physical_source is not None else trusted_roots,
@@ -386,11 +458,17 @@ def estimate_volume_source(c, source, name):
     return max(allocated, apparent)
 
 
-def estimate_backup_size(c, m, resolved=None, *, source_overrides=None):
+def estimate_backup_size(
+        c, m, resolved=None, *, source_overrides=None, staging_path=None,
+):
     source_overrides = source_overrides or {}
+    allocation_path = Path(staging_path or c['staging_root'])
+    allocation_unit = os.statvfs(allocation_path).f_frsize
     total = sum(
         estimate_path_source(
-            c, m, source, physical_source=source_overrides.get(source['id']),
+            c, m, source,
+            physical_source=source_overrides.get(source['id']),
+            allocation_unit=allocation_unit,
         )
         for source in (m.get('sources') or {}).get('paths', [])
     )
@@ -405,7 +483,7 @@ def estimate_backup_size(c, m, resolved=None, *, source_overrides=None):
 
 
 def _copy_path_source(
-        src, dst, excludes, *, fd=None, metadata=None, trusted_roots=None,
+        src, dst, source, *, fd=None, metadata=None, trusted_roots=None,
 ):
     src = Path(src)
     own_fd = fd is None
@@ -416,6 +494,7 @@ def _copy_path_source(
     dst.mkdir(parents=True, mode=0o700)
     archived = dst / src.name
     try:
+        _validate_path_filter_type(source, metadata, src)
         if stat.S_ISLNK(metadata.st_mode):
             target = os.readlink('', dir_fd=fd)
             os.symlink(target, archived)
@@ -440,8 +519,7 @@ def _copy_path_source(
             source_type = 'symlink'
         elif stat.S_ISDIR(metadata.st_mode):
             cmd = ['rsync', '-aHAX', '--numeric-ids', '--delete']
-            for item in excludes or []:
-                cmd += ['--exclude', item]
+            cmd += build_path_filter_args(source)
             cmd += [f'/proc/self/fd/{fd}/', f'{dst}/']
             run(cmd, pass_fds=(fd,))
             source_type = 'directory'
@@ -522,7 +600,7 @@ def sync_paths(
                     fd, copy_source, filesystem_type=filesystem,
                 )
                 source_type = _copy_path_source(
-                    copy_source, dst, source.get('exclude'), fd=fd, metadata=metadata,
+                    copy_source, dst, source, fd=fd, metadata=metadata,
                     trusted_roots=trusted_roots if physical is None else None,
                 )
             finally:

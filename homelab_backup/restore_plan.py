@@ -1,6 +1,8 @@
 from dataclasses import dataclass
 from pathlib import Path
 
+import yaml
+
 from .manifest import (
     compose_model, manifest, source_path, validate_manifest,
 )
@@ -8,7 +10,9 @@ from .restore_inventory import (
     load_restore_inventory, restored_path_details, validate_restore_inventory,
     validate_restore_path_separation, validate_restore_sources,
 )
-from .security import lexical_absolute, validate_data_parent, validate_data_path
+from .security import (
+    lexical_absolute, read_control_text, validate_data_parent, validate_data_path,
+)
 from .storage import (
     compose_identity, docker_mount_conflicts, docker_project_containers,
     docker_volume_exists, resolved_volume_sources, running_services,
@@ -70,7 +74,7 @@ def restore_authorization_projection(m):
         'paths': [
             {
                 key: source.get(key)
-                for key in ('id', 'path', 'required', 'exclude')
+                for key in ('id', 'path', 'required', 'include', 'exclude')
             }
             for source in sources.get('paths', [])
         ],
@@ -82,6 +86,48 @@ def restore_authorization_projection(m):
             for source in sources.get('volumes', [])
         ],
     }
+
+
+def restore_filter_projection(m):
+    return {
+        source['id']: {
+            'include': list(source.get('include') or []),
+            'exclude': list(source.get('exclude') or []),
+        }
+        for source in (m.get('sources') or {}).get('paths', [])
+    }
+
+
+def _snapshot_manifest(m):
+    snapshot_path = m.get('_snapshot_manifest')
+    if not snapshot_path:
+        return m
+    try:
+        snapshot = yaml.safe_load(
+            read_control_text(snapshot_path, require_protected=False)
+        ) or {}
+    except FileNotFoundError as err:
+        raise RuntimeError(
+            f'snapshot manifest is missing: {snapshot_path}'
+        ) from err
+    except yaml.YAMLError as err:
+        raise RuntimeError(
+            f'snapshot manifest is invalid: {snapshot_path}: {err}'
+        ) from err
+    if not isinstance(snapshot, dict):
+        raise RuntimeError(
+            f'snapshot manifest must be a mapping: {snapshot_path}'
+        )
+    snapshot['_path'] = str(snapshot_path)
+    snapshot['_dir'] = m['_dir']
+    snapshot['_relative_dir'] = m.get('_relative_dir', Path(m['_dir']).name)
+    validate_manifest(snapshot)
+    if snapshot.get('service') != m.get('service'):
+        raise RuntimeError(
+            f'snapshot manifest belongs to {snapshot.get("service")!r}, '
+            f'expected {m.get("service")!r}'
+        )
+    return snapshot
 
 
 def compose_authorization_projection(identity):
@@ -155,6 +201,11 @@ def _authorize_existing_restore(c, m, inventory, restored_volumes):
     local_m = manifest(c, m['service']) if c.get('services_root') else m
     validate_manifest(local_m)
     validate_restore_inventory(local_m, inventory)
+    snapshot_m = _snapshot_manifest(m)
+    if restore_filter_projection(snapshot_m) != restore_filter_projection(local_m):
+        raise RuntimeError(
+            'snapshot path filters differ from local authorization'
+        )
     if m.get('_restore_manifest_requested') and \
             restore_authorization_projection(m) != \
             restore_authorization_projection(local_m):

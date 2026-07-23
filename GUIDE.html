@@ -368,9 +368,13 @@ sources:
 
     - id: data
       path: ./data
+      include:
+        - world/**
+        - config/**
+        - mods/**
+        - server.properties
       exclude:
-        - logs/**
-        - crash-reports/**
+        - mods/cache/**
 
   volumes: []</code></pre>
 <div class="box warn">若服務原本依賴 Compose 自動尋找 <code>.env</code>，升級後
@@ -460,9 +464,20 @@ sources:
   paths:
     - id: data
       path: ./data
+      include:
+        - world/**
+        - config/**
+        - mods/**
+        - server.properties
       exclude:
-        - logs/**
-        - crash-reports/**</code></pre>
+        - mods/cache/**</code></pre>
+<p><code>include</code> 是相對於來源根目錄的 rsync pattern 白名單，只適用於目錄型
+path source；未設定時會備份整個來源。程式會自動保留走到深層檔案所需的父目錄，
+並移除沒有任何選取內容的空目錄。若同一項目同時符合兩者，<code>exclude</code>
+優先於 <code>include</code>。</p>
+<p>空間預檢會使用與實際備份相同的 filter 規則，只估算會進入 staging 的內容。
+原地還原也會使用相同規則保護未納入備份的現場資料；全新 rebuild 則直接發布
+snapshot 中已完成篩選的 payload。</p>
 <h3>路徑來源的安全邊界</h3>
 <ul>
 <li>每個 path 必須嚴格位於唯一的 trusted root 之下，不能等於 trusted root。trusted root 與其控制路徑必須由 root 擁有、不可 group/world write 且不是 symlink；其下的資料樹可完全由容器 UID/GID 擁有，也可選取其中任意深層路徑。程式從 trusted root 的固定 descriptor 逐層開啟來源與還原目標，中間 symlink 會被拒絕，可寫祖先被換名也不會把 root 寫入導向外部。</li>
@@ -671,7 +686,7 @@ sudo backupctl cleanup-restores \
   ghost/20260717-120500-000000002 --yes
 sudo backupctl cleanup-restores --all --yes</code></pre>
 <div class="box warn">第一次上線前至少實際執行一次 <code>restore --apply</code> 測試。成功上傳不等於能成功還原。</div>
-<div class="box">套用前會先驗證所有 required path、volume 與 Compose 檔案均存在於還原資料中，並停止該 Compose project 目前所有運行中的 services；任何必要來源缺失都會中止，不會以空目錄覆寫正式 volume。設定的 exclude 也會在還原時保留。</div>
+<div class="box">套用前會先驗證所有 required path、volume 與 Compose 檔案均存在於還原資料中，並停止該 Compose project 目前所有運行中的 services；任何必要來源缺失都會中止，不會以空目錄覆寫正式 volume。原地還原會保留未被 include 選取或已被 exclude 排除的現場資料，且 snapshot 與本機 manifest 的 path filters 必須一致。</div>
 <div class="box warn">操作期間不存在未受控 writer 是 operator obligation。程式會檢查已知 Docker containers，但無法證明主機上沒有共用 UID 程序、排程或其他 privileged process。</div>
 </section>
 

@@ -35,5 +35,18 @@ sources:
       required: false
     - id: data
       path: ./data
-      exclude: ["logs/**", "crash-reports/**"]
+      include:
+        - "world/**"
+        - "bluemap/**"
+        - "config/**"
+        - "defaultconfigs/**"
+        - "mods/**"
+        - "patchouli_books/**"
+        - "scripts/**"
+        - "server.properties"
+        - "banned-ips.json"
+        - "banned-players.json"
+        - "options.txt"
+        - "whitelist.json"
+        - "server-icon.png"
   volumes: []

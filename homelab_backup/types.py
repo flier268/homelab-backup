@@ -81,6 +81,7 @@ class PathSource(TypedDict, total=False):
     id: str
     path: str
     required: bool
+    include: list[str]
     exclude: list[str]
 
 

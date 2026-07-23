@@ -98,6 +98,40 @@ class ManifestValidationTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         manifest_module.validate_manifest(manifest(root, sources=sources))
 
+    def test_path_include_must_be_a_non_empty_list_of_non_empty_strings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            valid = manifest(root, sources={
+                'paths': [{
+                    'id': 'data', 'path': 'data',
+                    'include': ['world/**', 'server.properties'],
+                }],
+                'volumes': [],
+            })
+            self.assertTrue(manifest_module.validate_manifest(valid))
+
+            for include in ([], 'world/**', [1], ['']):
+                with self.subTest(include=include), self.assertRaisesRegex(
+                    ValueError, 'include must be',
+                ):
+                    manifest_module.validate_manifest(manifest(root, sources={
+                        'paths': [{
+                            'id': 'data', 'path': 'data', 'include': include,
+                        }],
+                        'volumes': [],
+                    }))
+
+    def test_volume_include_is_not_supported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            value = manifest(Path(tmp), sources={
+                'paths': [],
+                'volumes': [{
+                    'id': 'db', 'name': 'demo-db', 'include': ['data/**'],
+                }],
+            })
+            with self.assertRaisesRegex(ValueError, 'unsupported'):
+                manifest_module.validate_manifest(value)
+
     def test_docker_volume_name_cannot_be_a_host_path_or_mount_option(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

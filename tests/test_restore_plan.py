@@ -4,11 +4,51 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import yaml
+
 from homelab_backup import restore_apply, restore_plan
 from tests.helpers import manifest, write_restore_inventory
 
 
 class RestorePlanningTests(unittest.TestCase):
+    def test_existing_restore_rejects_snapshot_filter_mismatch_when_manifest_is_kept(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            local = manifest(base, sources={
+                'paths': [{
+                    'id': 'data', 'path': 'data', 'include': ['config/**'],
+                }],
+                'volumes': [],
+            })
+            snapshot = {
+                key: value for key, value in local.items()
+                if not key.startswith('_')
+            }
+            snapshot['sources'] = {
+                'paths': [{
+                    'id': 'data', 'path': 'data', 'include': ['world/**'],
+                }],
+                'volumes': [],
+            }
+            snapshot_path = base / 'snapshot-backup.yaml'
+            snapshot_path.write_text(
+                yaml.safe_dump(snapshot), encoding='utf-8',
+            )
+            requested = dict(local)
+            requested['_snapshot_manifest'] = str(snapshot_path)
+            requested['_restore_manifest_requested'] = False
+
+            with mock.patch.object(
+                restore_plan, 'manifest', return_value=local,
+            ), mock.patch.object(restore_plan, 'validate_restore_inventory'):
+                with self.assertRaisesRegex(RuntimeError, 'filters differ'):
+                    restore_plan._authorize_existing_restore(
+                        {'services_root': str(base)},
+                        requested,
+                        {'paths': [], 'volumes': []},
+                        (),
+                    )
+
     def test_service_list_change_is_diagnostic_not_authorization(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)

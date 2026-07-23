@@ -294,6 +294,82 @@ class RestoreSourceTests(unittest.TestCase):
             self.assertIn('--exclude', run_mock.call_args.args[0])
             self.assertIn('logs/**', run_mock.call_args.args[0])
 
+    def test_filtered_path_restore_updates_managed_content_and_preserves_other_data(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / 'restore'
+            staged = root / 'paths' / 'data'
+            (staged / 'world').mkdir(parents=True)
+            (staged / 'world' / 'current.dat').write_text(
+                'snapshot', encoding='utf-8',
+            )
+            target = base / 'target'
+            (target / 'world' / 'cache').mkdir(parents=True)
+            (target / 'junk').mkdir()
+            (target / 'junk-empty').mkdir()
+            (target / 'world' / 'cache' / 'empty-dir').mkdir()
+            (target / 'world' / 'stale.dat').write_text('stale', encoding='utf-8')
+            (target / 'world' / 'cache' / 'keep.bin').write_text(
+                'cache', encoding='utf-8',
+            )
+            (target / 'junk' / 'keep.txt').write_text('local', encoding='utf-8')
+            source = {
+                'id': 'data', 'path': str(target),
+                'include': ['world/**'],
+                'exclude': ['world/cache/**'],
+            }
+
+            restore_apply.restore_path_source(
+                {'_dir': str(base)}, root, source, path_inventory(source),
+            )
+
+            self.assertEqual(
+                (target / 'world' / 'current.dat').read_text(encoding='utf-8'),
+                'snapshot',
+            )
+            self.assertFalse((target / 'world' / 'stale.dat').exists())
+            self.assertEqual(
+                (target / 'world' / 'cache' / 'keep.bin').read_text(encoding='utf-8'),
+                'cache',
+            )
+            self.assertEqual(
+                (target / 'junk' / 'keep.txt').read_text(encoding='utf-8'),
+                'local',
+            )
+            self.assertTrue((target / 'junk-empty').is_dir())
+            self.assertTrue((target / 'world' / 'cache' / 'empty-dir').is_dir())
+
+    def test_rebuild_does_not_reapply_path_filters(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / 'restore'
+            staged = root / 'paths' / 'data'
+            staged.mkdir(parents=True)
+            (staged / 'selected.txt').write_text('snapshot', encoding='utf-8')
+            target = base / 'target'
+            source = {
+                'id': 'data', 'path': str(target),
+                'include': ['selected.txt'], 'exclude': ['cache/**'],
+            }
+            inventory = path_inventory(source)
+            inventory['paths'][0]['ancestors'] = []
+
+            with mock.patch.object(
+                restore_apply, 'run', wraps=common.run,
+            ) as run_mock:
+                restore_apply.restore_path_source(
+                    {'_dir': str(base)}, root, source, inventory,
+                    c={'trusted_data_roots': [str(base)]}, rebuild=True,
+                )
+
+            command = run_mock.call_args.args[0]
+            self.assertNotIn('--include', command)
+            self.assertNotIn('--exclude', command)
+            self.assertEqual(
+                (target / 'selected.txt').read_text(encoding='utf-8'),
+                'snapshot',
+            )
+
     def test_volume_restore_preserves_excluded_targets(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / 'restore'
