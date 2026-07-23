@@ -3,7 +3,10 @@ import json
 import unittest
 from pathlib import Path
 
+from pydantic import ValidationError
+
 from homelab_backup import restore_inventory
+from homelab_backup.inventory_models import RestoreInventoryModel
 from tests.helpers import manifest, write_restore_inventory
 
 
@@ -186,6 +189,52 @@ class RestoreInventoryTests(unittest.TestCase):
             inventory = restore_inventory.load_restore_inventory(restored)
             with self.assertRaisesRegex(RuntimeError, 'required volume.*absent'):
                 restore_inventory.validate_restore_inventory(value, inventory)
+
+    def test_inventory_model_round_trips_current_snapshot_shape(self):
+        data = {
+            'version': 1,
+            'service': 'demo',
+            'service_directory': '/srv/stacks/demo',
+            'service_relative_directory': 'demo',
+            'paths': [{
+                'id': 'data', 'path': 'data', 'type': 'directory',
+                'present': True, 'capture_method': 'quiesced-copy',
+            }],
+            'volumes': [],
+            'compose': {
+                'project_name': 'demo', 'compose_files': ['compose.yaml'],
+                'services': [], 'volumes': [],
+            },
+            'consistency': {
+                'mode': 'external', 'guarantee': 'quiesced-copy',
+                'optional_action_failures': [], 'writers': [],
+            },
+        }
+
+        model = RestoreInventoryModel.from_snapshot_data(data)
+
+        self.assertEqual(model.to_snapshot_dict(), data)
+        with self.assertRaises(ValidationError):
+            model.service = 'changed'
+
+    def test_inventory_model_rejects_unknown_fields_and_coercion(self):
+        base = {
+            'version': 1, 'service': 'demo',
+            'paths': [], 'volumes': [],
+            'compose': {
+                'project_name': 'demo', 'compose_files': ['compose.yaml'],
+                'services': [], 'volumes': [],
+            },
+        }
+        for update in (
+                {'unknown': True},
+                {'version': '1'},
+                {'version': True},
+                {'version': 1.0},
+        ):
+            with self.subTest(update=update), self.assertRaises(ValidationError):
+                RestoreInventoryModel.from_snapshot_data(base | update)
+
 
 if __name__ == '__main__':
     unittest.main()

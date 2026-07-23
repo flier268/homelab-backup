@@ -3,6 +3,7 @@ from pathlib import Path
 
 import yaml
 
+from .inventory_models import ComposeIdentityModel, RestoreInventoryModel
 from .manifest import (
     compose_model, manifest, source_path, validate_manifest,
 )
@@ -18,13 +19,13 @@ from .storage import (
     docker_volume_exists, resolved_volume_sources, running_services,
     validate_volume_identity,
 )
-from .types import GlobalConfig, RestoreInventory, ServiceManifest, VolumeSource
+from .types import GlobalConfig, ServiceManifest, VolumeSource
 
 
 @dataclass(frozen=True)
 class RestorePlan:
     root: Path
-    inventory: RestoreInventory
+    inventory: RestoreInventoryModel
     manifest: ServiceManifest
     mode: str
     volumes: tuple[tuple[VolumeSource, str], ...]
@@ -44,12 +45,9 @@ def compose_targets(m):
 def inventory_volumes(m, inventory):
     sources = {item['id']: item for item in (m.get('sources') or {}).get('volumes', [])}
     values = []
-    for entry in inventory.get('volumes', []):
-        source = sources[entry['id']]
-        name = entry.get('actual_name')
-        if not isinstance(name, str):
-            raise RuntimeError(f'inventory volume has no actual_name: {entry["id"]}')
-        values.append((source, name, bool(entry.get('present', True))))
+    for entry in inventory.volumes:
+        source = sources[entry.id]
+        values.append((source, entry.actual_name, entry.present))
     return tuple(values)
 
 
@@ -131,6 +129,8 @@ def _snapshot_manifest(m):
 
 
 def compose_authorization_projection(identity):
+    if isinstance(identity, ComposeIdentityModel):
+        identity = identity.model_dump(mode='json')
     return {
         'project_name': identity.get('project_name'),
         'compose_files': identity.get('compose_files'),
@@ -143,7 +143,7 @@ def _load_and_validate_restore_input(m, root):
     root = Path(root)
     if not root.is_dir():
         raise RuntimeError(f'restore directory does not exist: {root}')
-    inventory = load_restore_inventory(root)
+    inventory = load_restore_inventory(root, expected_service=m['service'])
     validate_restore_inventory(m, inventory)
     validate_restore_sources(m, root, inventory)
     validate_restore_path_separation(m, root, inventory)
@@ -176,7 +176,7 @@ def _validate_rebuild_compose_sources(m, mode, compose_file_targets):
 def _validate_path_targets(c, m, inventory, mode):
     targets = [source_path(m, source) for source in (m.get('sources') or {}).get('paths', [])]
     for source in (m.get('sources') or {}).get('paths', []):
-        entry = next(item for item in inventory['paths'] if item['id'] == source['id'])
+        entry = inventory.paths_by_id[source['id']]
         target = source_path(m, source)
         trusted_roots = c.get('trusted_data_roots') or [str(Path(target).parent)]
         if mode == 'rebuild':
@@ -184,7 +184,7 @@ def _validate_path_targets(c, m, inventory, mode):
         else:
             validate_data_path(target, trusted_roots)
         exists = target.exists() or target.is_symlink()
-        if not entry['present']:
+        if not entry.present:
             if mode == 'rebuild' and exists:
                 raise RuntimeError(
                     f'snapshot-absent path already exists during rebuild: {target}'
@@ -217,12 +217,12 @@ def _authorize_existing_restore(c, m, inventory, restored_volumes):
         resolved = tuple(resolved_volume_sources(local_m, model=model))
         identity = compose_identity(local_m, model=model, resolved=resolved)
     else:
-        identity = inventory.get('compose')
+        identity = inventory.compose
         resolved = tuple(
             (source, name) for source, name, _present in restored_volumes
         )
     if compose_authorization_projection(identity) != \
-            compose_authorization_projection(inventory.get('compose')):
+            compose_authorization_projection(inventory.compose):
         raise RuntimeError('snapshot Compose identity does not match local deployment')
     expected = {source['id']: name for source, name in resolved}
     for source, name, present in restored_volumes:
@@ -232,22 +232,30 @@ def _authorize_existing_restore(c, m, inventory, restored_volumes):
             raise RuntimeError(f'existing deployment volume is missing: {name}')
         if present:
             validate_volume_identity(
-                name, project_name=identity['project_name'],
+                name, project_name=_identity_project_name(identity),
                 logical_name=source.get('compose_volume'),
             )
     return local_m, identity, tuple(running_services(local_m))
 
 
 def _authorize_rebuild_restore(m, inventory, restored_volumes):
-    identity = inventory.get('compose')
-    if not isinstance(identity, dict) or not identity.get('project_name'):
+    identity = inventory.compose
+    if not identity.project_name:
         raise RuntimeError('snapshot has no Compose project identity')
     for _source, name, _present in restored_volumes:
         if docker_volume_exists(name):
             raise RuntimeError(f'rebuild volume already exists: {name}')
-    if docker_project_containers(identity['project_name'], include_stopped=True):
+    if docker_project_containers(identity.project_name, include_stopped=True):
         raise RuntimeError('rebuild Compose project already has containers')
     return m, identity, ()
+
+
+def _identity_project_name(identity):
+    return (
+        identity.project_name
+        if isinstance(identity, ComposeIdentityModel)
+        else identity['project_name']
+    )
 
 
 def _validate_restore_conflicts(targets, mode, volumes, all_volume_names):
@@ -282,5 +290,5 @@ def prepare_restore_plan(
     _validate_restore_conflicts(targets, mode, volumes, all_volume_names)
     return RestorePlan(
         root, inventory, authorized_manifest, mode, volumes, all_volume_names, running,
-        deferred, identity['project_name'],
+        deferred, _identity_project_name(identity),
     )

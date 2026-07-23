@@ -116,57 +116,6 @@ class ServiceManifest(TypedDict, total=False):
     _restore_manifest_requested: bool
 
 
-class InventoryPath(TypedDict, total=False):
-    id: str
-    path: str
-    type: Optional[str]
-    present: bool
-    ancestors: list['InventoryAncestor']
-    capture_method: str
-    writers: list[str]
-
-
-class InventoryAncestor(TypedDict):
-    path: str
-    uid: int
-    gid: int
-    mode: int
-
-
-class InventoryVolume(TypedDict, total=False):
-    id: str
-    name: str
-    compose_volume: str
-    actual_name: str
-    present: bool
-    capture_method: str
-    writers: list[str]
-
-
-class ComposeVolumeIdentity(TypedDict, total=False):
-    id: str
-    logical_name: str
-    actual_name: str
-
-
-class ComposeIdentity(TypedDict, total=False):
-    project_name: str
-    compose_files: list[str]
-    services: list[str]
-    volumes: list[ComposeVolumeIdentity]
-
-
-class RestoreInventory(TypedDict, total=False):
-    version: int
-    service: str
-    service_directory: str
-    service_relative_directory: str
-    paths: list[InventoryPath]
-    volumes: list[InventoryVolume]
-    compose: ComposeIdentity
-    consistency: dict
-
-
 class BackupState(TypedDict, total=False):
     service: str
     first_seen_at: str

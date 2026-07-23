@@ -4,7 +4,9 @@ import re
 import shutil
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 import yaml
 
@@ -301,27 +303,72 @@ def prepare_restored_manifest(c, service, root, *, policy='ask'):
     return m
 
 
+@dataclass(frozen=True)
+class RestoreDownloadDependencies:
+    check_space: Callable
+    ensure_private_directory: Callable
+    restore_id: Callable
+    run_command: Callable
+    restic_environment: Callable
+    prepare_manifest: Callable
+
+    @classmethod
+    def production(cls):
+        return cls(
+            check_space=check_restore_space,
+            ensure_private_directory=ensure_private_directory,
+            restore_id=lambda: (
+                time.strftime('%Y%m%d-%H%M%S')
+                + f'-{time.time_ns() % 1_000_000_000:09d}'
+            ),
+            run_command=run,
+            restic_environment=restic_env,
+            prepare_manifest=prepare_restored_manifest,
+        )
+
+
+class RestoreDownloadWorkflow:
+    def __init__(self, dependencies: RestoreDownloadDependencies):
+        self.dependencies = dependencies
+
+    def restore(
+            self, c, service, snapshot, manifest_policy, *,
+            allow_low_space=False,
+    ):
+        if not valid_service_name(service):
+            raise ValueError(
+                f'invalid service name from repository: {service!r}'
+            )
+        deps = self.dependencies
+        deps.check_space(
+            c, service, snapshot, allow_low_space=allow_low_space,
+        )
+        restore_root = deps.ensure_private_directory(c['restore_root'])
+        service_root = deps.ensure_private_directory(restore_root / service)
+        root = service_root / deps.restore_id()
+        deps.ensure_private_directory(root)
+        deps.run_command([
+            'restic', 'restore', snapshot, '--host', c['host_id'],
+            '--tag', f'service:{service}', '--target', str(root),
+        ], env=deps.restic_environment(c))
+        m = deps.prepare_manifest(
+            c, service, root, policy=manifest_policy,
+        )
+        print(f'Restored snapshot for {service_label(m)}: {root}')
+        return m, root
+
+
 def restore_one(
         c, service, snapshot, manifest_policy, *, allow_low_space=False,
+        dependencies=None,
 ):
-    if not valid_service_name(service):
-        raise ValueError(f'invalid service name from repository: {service!r}')
-    check_restore_space(
-        c, service, snapshot, allow_low_space=allow_low_space,
+    workflow = RestoreDownloadWorkflow(
+        dependencies or RestoreDownloadDependencies.production(),
     )
-    restore_root = ensure_private_directory(c['restore_root'])
-    service_root = ensure_private_directory(restore_root / service)
-    root = service_root / (
-        time.strftime('%Y%m%d-%H%M%S') + f'-{time.time_ns() % 1_000_000_000:09d}'
+    return workflow.restore(
+        c, service, snapshot, manifest_policy,
+        allow_low_space=allow_low_space,
     )
-    ensure_private_directory(root)
-    run([
-        'restic', 'restore', snapshot, '--host', c['host_id'],
-        '--tag', f'service:{service}', '--target', str(root),
-    ], env=restic_env(c))
-    m = prepare_restored_manifest(c, service, root, policy=manifest_policy)
-    print(f'Restored snapshot for {service_label(m)}: {root}')
-    return m, root
 
 
 RESTORE_ID_RE = re.compile(r'[0-9]{8}-[0-9]{6}-[0-9]{9}')

@@ -825,8 +825,12 @@ class DeploymentScriptTests(unittest.TestCase):
         )
         self.assertIn('--require-hashes', script)
         self.assertNotIn('--target', script)
-        self.assertEqual(requirements_input.splitlines(), ['cronsim', 'PyYAML'])
+        self.assertEqual(
+            requirements_input.splitlines(),
+            ['cronsim', 'pydantic>=2.12,<3', 'PyYAML'],
+        )
         self.assertIn('cronsim==2.7', requirements)
+        self.assertIn('pydantic==2.13.4', requirements)
         self.assertIn('pyyaml==6.0.3', requirements.lower())
         self.assertIn('--hash=sha256:', requirements)
         pyyaml_lock = requirements.lower().split('pyyaml==6.0.3', 1)[1]

@@ -6,6 +6,7 @@ from .actions import run_before_actions, run_finally_actions
 from .btrfs_snapshot import cleanup_snapshot_state
 from .capture import _check_backup_space
 from .common import run_cleanup
+from .inventory_models import RestoreInventoryModel
 from .manifest import compose_model, source_path, validate_manifest
 from .security import (
     atomic_copy_file, atomic_write_json, ensure_private_directory,
@@ -98,7 +99,7 @@ def _write_stage_metadata(context, captured, optional_action_failures):
     # backup.yaml is always included as recovery metadata, even when it is not
     # listed in sources.paths.
     atomic_copy_file(m['_path'], meta / 'backup.yaml')
-    atomic_write_json(meta / 'inventory.json', {
+    inventory = RestoreInventoryModel.from_snapshot_data({
         'version': 1,
         'service': m['service'],
         'service_directory': m['_dir'],
@@ -115,6 +116,7 @@ def _write_stage_metadata(context, captured, optional_action_failures):
             'writers': all_writers,
         },
     })
+    atomic_write_json(meta / 'inventory.json', inventory.to_snapshot_dict())
     return context.stage
 
 

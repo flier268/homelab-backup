@@ -1,7 +1,9 @@
 import datetime as dt
 import shutil
 import sys
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from . import backup_state as _backup_state
 from .actions import (
@@ -50,137 +52,236 @@ def retention_cmd(
     return cmd
 
 
-def backup_one(
-        c: GlobalConfig, m: ServiceManifest, *, apply_retention=True,
-        allow_low_space=False,
-):
-    validate_manifest(m)
-    label = service_label(m)
-    partial_stage = (
-        Path(c['staging_root']) / m['service']
-        if c.get('staging_root') else None
-    )
-    started = dt.datetime.now().astimezone()
-    state = load_state(c, m['service'])
-    state.update({
-        'service': m['service'],
-        'last_attempt_at': started.isoformat(),
-        'last_result': 'running',
-        'last_error': None,
-    })
-    state.setdefault('first_seen_at', started.isoformat())
-    try:
-        save_state(c, m['service'], state)
-    except Exception as err:
-        run_cleanup(
-            lambda: run_failure_actions(m, error=err, phase='state'),
-            'on_failure actions',
+@dataclass(frozen=True)
+class BackupDependencies:
+    now: Callable
+    load_state: Callable
+    save_state: Callable
+    stage: Callable
+    check_space: Callable
+    run_command: Callable
+    restic_environment: Callable
+    success_actions: Callable
+    failure_actions: Callable
+    cleanup: Callable
+    remove_stage: Callable
+    print_command_failure: Callable
+
+    @classmethod
+    def production(cls):
+        # Resolve module globals at call time so compatibility callers that
+        # replace a low-level adapter still affect the production workflow.
+        return cls(
+            now=lambda: dt.datetime.now().astimezone(),
+            load_state=load_state,
+            save_state=save_state,
+            stage=stage_service,
+            check_space=_check_backup_space,
+            run_command=run,
+            restic_environment=restic_env,
+            success_actions=run_success_actions,
+            failure_actions=run_failure_actions,
+            cleanup=run_cleanup,
+            remove_stage=clear_control_leaf,
+            print_command_failure=_print_command_failure,
         )
-        raise
-    failure_phase = 'staging'
-    try:
-        stage_options = {}
-        if allow_low_space:
-            stage_options['allow_low_space'] = True
-        stage = stage_service(c, m, **stage_options)
-        _check_backup_space(
-            c, m, stage, 0, allow_low_space=allow_low_space,
+
+
+class BackupWorkflow:
+    def __init__(
+            self, c: GlobalConfig, m: ServiceManifest, *,
+            dependencies: BackupDependencies, apply_retention=True,
+            allow_low_space=False,
+    ):
+        self.c = c
+        self.m = m
+        self.dependencies = dependencies
+        self.apply_retention = apply_retention
+        self.allow_low_space = allow_low_space
+        self.label = service_label(m)
+        self.started = None
+        self.state = None
+
+    def execute(self):
+        validate_manifest(self.m)
+        self._mark_running()
+        try:
+            stage = self._prepare_stage()
+        except Exception as err:
+            self._record_precommit_failure(err, 'staging')
+            raise
+        try:
+            self._commit_snapshot(stage)
+        except Exception as err:
+            self._record_precommit_failure(err, 'restic')
+            raise
+        postcommit_error = self._run_success_actions()
+        retention_error = self._apply_retention()
+        self._mark_success(retention_error)
+        if postcommit_error is not None:
+            raise postcommit_error
+        return True
+
+    def _mark_running(self):
+        deps = self.dependencies
+        self.started = deps.now()
+        self.state = deps.load_state(self.c, self.m['service'])
+        self.state.update({
+            'service': self.m['service'],
+            'last_attempt_at': self.started.isoformat(),
+            'last_result': 'running',
+            'last_error': None,
+        })
+        self.state.setdefault('first_seen_at', self.started.isoformat())
+        try:
+            deps.save_state(self.c, self.m['service'], self.state)
+        except Exception as err:
+            deps.cleanup(
+                lambda: deps.failure_actions(
+                    self.m, error=err, phase='state',
+                ),
+                'on_failure actions',
+            )
+            raise
+
+    def _prepare_stage(self):
+        deps = self.dependencies
+        stage_options = (
+            {'allow_low_space': True} if self.allow_low_space else {}
         )
-        failure_phase = 'restic'
-        run([
-            'restic', 'backup', '.', '--host', c['host_id'],
-            '--tag', f"service:{m['service']}",
-        ], cwd=stage, env=restic_env(c))
-    except Exception as err:
-        run_cleanup(
-            lambda: run_failure_actions(
-                m, error=err, phase=failure_phase,
+        stage = deps.stage(self.c, self.m, **stage_options)
+        deps.check_space(
+            self.c, self.m, stage, 0,
+            allow_low_space=self.allow_low_space,
+        )
+        return stage
+
+    def _commit_snapshot(self, stage):
+        deps = self.dependencies
+        deps.run_command([
+            'restic', 'backup', '.', '--host', self.c['host_id'],
+            '--tag', f"service:{self.m['service']}",
+        ], cwd=stage, env=deps.restic_environment(self.c))
+
+    def _record_precommit_failure(self, err, failure_phase):
+        deps = self.dependencies
+        deps.cleanup(
+            lambda: deps.failure_actions(
+                self.m, error=err, phase=failure_phase,
             ),
             'on_failure actions',
+        )
+        partial_stage = (
+            Path(self.c['staging_root']) / self.m['service']
+            if self.c.get('staging_root') else None
         )
         if partial_stage is not None:
             def remove_partial_stage():
                 if partial_stage.exists() or partial_stage.is_symlink():
-                    clear_control_leaf(partial_stage)
+                    deps.remove_stage(partial_stage)
 
-            run_cleanup(
+            deps.cleanup(
                 remove_partial_stage,
-                f'remove partial staging for {label}',
+                f'remove partial staging for {self.label}',
             )
-        finished = dt.datetime.now().astimezone()
-        state.update({
+        finished = deps.now()
+        self.state.update({
             'last_finished_at': finished.isoformat(),
             'last_result': 'failed',
-            'last_duration_seconds': round((finished - started).total_seconds(), 3),
+            'last_duration_seconds': round(
+                (finished - self.started).total_seconds(), 3,
+            ),
             'last_error': f'{type(err).__name__}: {err}',
         })
-        run_cleanup(
-            lambda: save_state(c, m['service'], state),
-            f'save failed backup state for {label}',
-        )
-        raise
-
-    # The restic command returning successfully is the durability boundary.
-    # Failures after this point must not make the committed snapshot retryable
-    # or remove its complete staging data.
-    postcommit_error = None
-    try:
-        run_success_actions(m)
-    except Exception as err:
-        postcommit_error = err
-        print(
-            f'ERROR: Restic snapshot for {service_label(m)} was committed, but '
-            f'on_success actions failed: {type(err).__name__}: {err}',
-            file=sys.stderr,
-        )
-        run_cleanup(
-            lambda: run_failure_actions(
-                m, error=err, phase='on_success',
+        deps.cleanup(
+            lambda: deps.save_state(
+                self.c, self.m['service'], self.state,
             ),
-            'on_failure actions',
+            f'save failed backup state for {self.label}',
         )
 
-    retention_error = state.get('last_retention_error')
-    if apply_retention:
+    def _run_success_actions(self):
+        deps = self.dependencies
         try:
-            run(retention_cmd(c, m), env=restic_env(c))
-            retention_error = None
+            deps.success_actions(self.m)
+        except Exception as err:
+            print(
+                f'ERROR: Restic snapshot for {self.label} was committed, but '
+                f'on_success actions failed: {type(err).__name__}: {err}',
+                file=sys.stderr,
+            )
+            deps.cleanup(
+                lambda: deps.failure_actions(
+                    self.m, error=err, phase='on_success',
+                ),
+                'on_failure actions',
+            )
+            return err
+        return None
+
+    def _apply_retention(self):
+        deps = self.dependencies
+        retention_error = self.state.get('last_retention_error')
+        if not self.apply_retention:
+            return retention_error
+        try:
+            deps.run_command(
+                retention_cmd(self.c, self.m),
+                env=deps.restic_environment(self.c),
+            )
+            return None
         except Exception as err:
             context = (
-                f"Snapshot for {service_label(m)} succeeded, but retention failed; "
+                f"Snapshot for {self.label} succeeded, but retention failed; "
                 'maintenance will retry it later'
             )
             if isinstance(err, CommandError):
-                _print_command_failure(err, context=context)
-                retention_error = err.stderr.strip() or str(err)
-            else:
-                print(
-                    f'ERROR: {context}: {type(err).__name__}: {err}',
-                    file=sys.stderr,
-                )
-                retention_error = f'{type(err).__name__}: {err}'
-    finished = dt.datetime.now().astimezone()
-    state.update({
-        # Boundary: completion is the schedule watermark. Cron occurrences
-        # reached while this backup was running are skipped, not queued.
-        'last_success_at': finished.isoformat(),
-        'last_finished_at': finished.isoformat(),
-        'last_result': 'success',
-        'last_duration_seconds': round((finished - started).total_seconds(), 3),
-        'last_error': None,
-        'last_retention_error': retention_error,
-    })
-    try:
-        save_state(c, m['service'], state)
-    except Exception as err:
-        run_cleanup(
-            lambda: run_failure_actions(m, error=err, phase='state'),
-            'on_failure actions',
-        )
-        raise
-    if postcommit_error is not None:
-        raise postcommit_error
-    return True
+                deps.print_command_failure(err, context=context)
+                return err.stderr.strip() or str(err)
+            print(
+                f'ERROR: {context}: {type(err).__name__}: {err}',
+                file=sys.stderr,
+            )
+            return f'{type(err).__name__}: {err}'
+
+    def _mark_success(self, retention_error):
+        deps = self.dependencies
+        finished = deps.now()
+        self.state.update({
+            # Completion is the schedule watermark. Cron occurrences reached
+            # while this backup ran are skipped rather than queued.
+            'last_success_at': finished.isoformat(),
+            'last_finished_at': finished.isoformat(),
+            'last_result': 'success',
+            'last_duration_seconds': round(
+                (finished - self.started).total_seconds(), 3,
+            ),
+            'last_error': None,
+            'last_retention_error': retention_error,
+        })
+        try:
+            deps.save_state(self.c, self.m['service'], self.state)
+        except Exception as err:
+            deps.cleanup(
+                lambda: deps.failure_actions(
+                    self.m, error=err, phase='state',
+                ),
+                'on_failure actions',
+            )
+            raise
+
+
+def backup_one(
+        c: GlobalConfig, m: ServiceManifest, *, apply_retention=True,
+        allow_low_space=False, dependencies=None,
+):
+    workflow = BackupWorkflow(
+        c, m,
+        dependencies=dependencies or BackupDependencies.production(),
+        apply_retention=apply_retention,
+        allow_low_space=allow_low_space,
+    )
+    return workflow.execute()
 
 
 def cmd_validate(c, args):

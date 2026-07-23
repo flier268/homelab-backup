@@ -8,6 +8,11 @@ from pathlib import Path
 from unittest import mock
 
 import cronsim
+import annotated_types
+import pydantic
+import pydantic_core
+import typing_extensions
+import typing_inspection
 import yaml
 
 from homelab_backup import VERSION
@@ -200,12 +205,22 @@ class LauncherTests(unittest.TestCase):
                 ],
                 text=True, capture_output=True, check=True,
             ).stdout.strip())
-            for dependency in (cronsim, yaml):
-                dependency_path = Path(dependency.__file__).parent
-                shutil.copytree(
-                    dependency_path,
-                    site_packages / dependency_path.name,
-                )
+            for dependency in (
+                cronsim, yaml, annotated_types, pydantic, pydantic_core,
+                typing_extensions, typing_inspection,
+            ):
+                dependency_file = Path(dependency.__file__)
+                if dependency_file.name == '__init__.py':
+                    dependency_path = dependency_file.parent
+                    shutil.copytree(
+                        dependency_path,
+                        site_packages / dependency_path.name,
+                    )
+                else:
+                    shutil.copy2(
+                        dependency_file,
+                        site_packages / dependency_file.name,
+                    )
             shutil.copy2(ROOT / 'backupctl', sbin / 'backupctl')
             shutil.copytree(ROOT / 'homelab_backup', package_root / 'homelab_backup')
             for argument in ('--help', '--version'):
