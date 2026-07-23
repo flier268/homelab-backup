@@ -57,10 +57,10 @@ table{width:100%;border-collapse:collapse;margin:16px 0}th,td{border:1px solid v
 
 <section id="goal">
 <h2>1. 目標與架構</h2>
-<div class="box ok"><strong>服務仍由 Docker Compose 管理。</strong> 每個服務在自己的目錄放一份 <code>backup.yaml</code>，自行宣告排程、保留策略、備份來源與一致性方式。</div>
-<div class="flow">/srv/stacks/minecraft/backup.yaml ─┐
-/srv/stacks/palworld/backup.yaml  ├─ backupctl 每 5 分鐘掃描
-/srv/stacks/ghost/backup.yaml     ┘
+<div class="box ok"><strong>服務仍由 Docker Compose 管理。</strong> 每個服務在自己的目錄放一份 <code>backup.yaml</code>，自行宣告穩定服務 ID、顯示名稱、排程、保留策略、備份來源與一致性方式。目錄可依用途分層分類，不必與服務 ID 同名。</div>
+<div class="flow">/srv/stacks/Minecraft/Advent of Ascension Plus-2026/backup.yaml ─┐
+/srv/stacks/Game Servers/palworld/backup.yaml                         ├─ backupctl 每 5 分鐘遞迴掃描
+/srv/stacks/Web/ghost/backup.yaml                                     ┘
             ↓
 停止服務或執行 hook
             ↓
@@ -73,7 +73,7 @@ rclone → OneDrive repository</div>
 <tr><th>元件</th><th>用途</th></tr>
 <tr><td>Docker Compose</td><td>執行 Minecraft、Palworld、Ghost 等服務。</td></tr>
 <tr><td><code>backup.yaml</code></td><td>每個服務自己的排程、保留策略與來源清單。</td></tr>
-<tr><td><code>backupctl</code></td><td>掃描 manifest、建立 staging、控制 Compose、執行 Restic。</td></tr>
+<tr><td><code>backupctl</code></td><td>遞迴掃描 manifest、建立 staging、控制 Compose、執行 Restic。</td></tr>
 <tr><td>Restic</td><td>加密、去重、snapshot、forget、prune、check、restore。</td></tr>
 <tr><td>rclone</td><td>讓 Restic 使用 OneDrive 作為 repository backend。</td></tr>
 <tr><td>systemd timer</td><td>每 5 分鐘執行一次到期檢查；另有週期性維護。</td></tr>
@@ -135,30 +135,37 @@ docker compose version</code></pre>
 
 <section id="directories">
 <h2>4. 建立 Compose 服務目錄</h2>
-<p>Compose 專案統一放在：</p>
-<pre><code>/srv/stacks/&lt;service&gt;</code></pre>
-<p>建立 root 控制目錄。manifest、Compose files 與其父目錄不可由一般使用者寫入；需要修改時使用 <code>sudoedit</code>：</p>
-<pre><code>sudo install -d -o root -g root -m 755 /srv/stacks /srv/stacks/&lt;service&gt;
+<p>Compose 專案統一放在 <code>services_root</code> 下，可直接放在根層下一級，也可使用多層分類目錄：</p>
+<pre><code>/srv/stacks/&lt;分類&gt;/&lt;顯示用目錄名稱&gt;</code></pre>
+<p>建立 root 控制目錄。manifest、Compose files 與從 <code>/srv/stacks</code> 到服務目錄的每層父目錄都不可由一般使用者寫入；路徑含空白時必須加上引號，需要修改時使用 <code>sudoedit</code>：</p>
+<pre><code>sudo install -d -o root -g root -m 755 \
+  /srv/stacks \
+  "/srv/stacks/Minecraft" \
+  "/srv/stacks/Minecraft/Advent of Ascension Plus-2026"
 sudo chmod 755 /srv /srv/stacks
-sudoedit /srv/stacks/&lt;service&gt;/backup.yaml</code></pre>
+sudoedit "/srv/stacks/Minecraft/Advent of Ascension Plus-2026/backup.yaml"</code></pre>
 <div class="box warn"><code>backup.yaml</code> 可宣告由 root 執行的 consistency hooks，因此服務目錄與控制檔不能交給一般帳號或設成 group/world writable。服務目錄下的資料子樹則可由容器 UID/GID 擁有；不要對混有容器資料的目錄使用遞迴 <code>chown</code>。</div>
+<div class="box">每層目錄名稱可包含英數、<code>.</code>、<code>_</code>、<code>-</code> 與單字間的單一 ASCII 空白。不可使用前後空白、連續空白、斜線、<code>.</code>、<code>..</code> 或控制字元。程式不會跟隨目錄 symlink。</div>
 <p>建議結構：</p>
 <pre><code>/srv/stacks/
-├── minecraft/
-│   ├── compose.yaml
-│   ├── .env
-│   ├── backup.yaml
-│   └── data/
-├── palworld/
-│   ├── compose.yaml
-│   ├── .env
-│   ├── backup.yaml
-│   └── data/
-└── ghost/
-    ├── compose.yaml
-    ├── .env
-    ├── backup.yaml
-    └── content/</code></pre>
+├── Minecraft/
+│   └── Advent of Ascension Plus-2026/
+│       ├── compose.yaml
+│       ├── .env
+│       ├── backup.yaml
+│       └── data/
+├── Game Servers/
+│   └── palworld/
+│       ├── compose.yaml
+│       ├── .env
+│       ├── backup.yaml
+│       └── data/
+└── Web/
+    └── ghost/
+        ├── compose.yaml
+        ├── .env
+        ├── backup.yaml
+        └── content/</code></pre>
 <p>一般權限：</p>
 <pre><code>chmod 644 compose.yaml backup.yaml
 chmod 600 .env</code></pre>
@@ -305,13 +312,20 @@ sudo ./restore-configs.sh</code></pre>
 
 <section id="manifest">
 <h2>10. 每個服務的 <code>backup.yaml</code></h2>
-<p>每個服務在自己的 Compose 目錄放一份 manifest：</p>
+<p><code>backupctl</code> 會在 <code>services_root</code> 下安全地遞迴尋找每一份 <code>backup.yaml</code>。每個服務在自己的 Compose 目錄放一份 manifest：</p>
 <div class="box ok"><code>backup.yaml</code> 由備份程式自動保存到每份 snapshot 的 <code>_meta/backup.yaml</code>，不需要再把它寫進 <code>sources.paths</code>。</div>
-<div class="box">目錄名稱必須與 <code>service</code> 完全相同；manifest、compose、sources 與各 source entry 的未知欄位會被拒絕，避免拼字錯誤造成靜默漏備份。</div>
-<pre><code>/srv/stacks/minecraft/backup.yaml</code></pre>
+<table>
+<tr><th>項目</th><th>用途與規則</th></tr>
+<tr><td><code>service</code></td><td>機器使用的穩定唯一 ID，用於 CLI、Restic tag、state、staging 與 restore workspace。只能包含英數、<code>.</code>、<code>_</code>、<code>-</code>，不可包含空白。</td></tr>
+<tr><td><code>name</code></td><td>可選的顯示名稱，可在單字間使用單一 ASCII 空白；未設定時顯示 <code>service</code>。顯示名稱不必唯一。</td></tr>
+<tr><td>相對目錄</td><td>獨立的部署分類與災難還原位置，可有多層且不必與 <code>service</code> 或 <code>name</code> 相同。</td></tr>
+</table>
+<div class="box">所有啟用與停用的 manifest 都參與 <code>service</code> ID 重名檢查。目錄名稱不代表服務身分；移動目錄或修改 <code>name</code> 不會改變 Restic 備份身分、state 或排程歷史。manifest、compose、sources 與各 source entry 的未知欄位仍會被拒絕，避免拼字錯誤造成靜默漏備份。</div>
+<pre><code>/srv/stacks/Minecraft/Advent of Ascension Plus-2026/backup.yaml</code></pre>
 <p>完整結構：</p>
 <pre><code>version: 1
-service: minecraft
+service: advent-of-ascension-plus-2026
+name: "Advent of Ascension Plus-2026"
 enabled: true
 
 schedule:
@@ -361,6 +375,10 @@ sources:
   volumes: []</code></pre>
 <div class="box warn">若服務原本依賴 Compose 自動尋找 <code>.env</code>，升級後
 必須加入 <code>compose.env_file</code>；未設定時會明確使用空環境檔。</div>
+<p>即使實際目錄含空白，CLI 仍使用穩定 ID：</p>
+<pre><code>sudo backupctl backup advent-of-ascension-plus-2026</code></pre>
+<p>人類可讀輸出會顯示：</p>
+<pre><code>Advent of Ascension Plus-2026 [advent-of-ascension-plus-2026]: backup succeeded</code></pre>
 </section>
 
 <section id="consistency">
@@ -632,7 +650,9 @@ sources:
 <pre><code>sudo backupctl validate</code></pre>
 <p>驗證內容包括：</p>
 <ul>
-<li>全域 YAML 與每個 <code>backup.yaml</code>。</li>
+<li>全域 YAML 與 <code>services_root</code> 所有安全子目錄中的 <code>backup.yaml</code>。</li>
+<li>所有啟用與停用 manifest 的 <code>service</code> ID 是否全域唯一；衝突時列出全部位置。</li>
+<li>顯示名稱、相對目錄元件、控制目錄 ownership、權限與 symlink 邊界。</li>
 <li>Compose 檔案與 <code>docker compose config</code>。</li>
 <li>required paths。</li>
 <li>Compose logical volume 與實際 Docker volume。</li>
@@ -647,9 +667,9 @@ sources:
 <section id="first-backup">
 <h2>17. 執行首次備份</h2>
 <p>先測單一服務：</p>
-<pre><code>sudo backupctl backup minecraft</code></pre>
+<pre><code>sudo backupctl backup advent-of-ascension-plus-2026</code></pre>
 <p>查看 snapshot：</p>
-<pre><code>sudo backupctl snapshots minecraft</code></pre>
+<pre><code>sudo backupctl snapshots advent-of-ascension-plus-2026</code></pre>
 <p>指定服務時，輸出會先列出 snapshot，再依該服務目前的 <code>backup.yaml</code>
 執行唯讀 retention preview；<code>Reasons</code> 欄會標示 <code>last</code>、
 <code>hourly</code>、<code>daily</code>、<code>weekly</code>、<code>monthly</code>
@@ -657,8 +677,8 @@ sources:
 此 preview 不會 forget 或 prune。若未指定服務，只列出所有 snapshot，並提示
 指定服務後才能計算 retention reasons。</p>
 <p>刪除指定 snapshot 時會先確認 ID 屬於目前 host 與指定服務。互動模式會再次確認；非互動模式必須加 <code>--yes</code>。預設未引用資料會留待下次 maintenance 回收；加 <code>--prune</code> 可立即回收：</p>
-<pre><code>sudo backupctl delete-snapshot minecraft 01234567
-sudo backupctl delete-snapshot minecraft 01234567 --prune --yes</code></pre>
+<pre><code>sudo backupctl delete-snapshot advent-of-ascension-plus-2026 01234567
+sudo backupctl delete-snapshot advent-of-ascension-plus-2026 01234567 --prune --yes</code></pre>
 <p>再測其他服務：</p>
 <pre><code>sudo backupctl backup ghost
 sudo backupctl backup palworld</code></pre>
@@ -667,7 +687,7 @@ sudo backupctl backup palworld</code></pre>
 <p>批次備份會逐 manifest 隔離錯誤；某一服務失敗時會跳過整份 manifest、清除其半成品 staging，且只有全部來源 staging 完成後才提交 Restic snapshot，因此不會產生該服務的部分備份。其餘 manifest 仍會繼續，最後統一列出失敗摘要並回傳非零狀態。</p>
 <p>來源靜止後會保守估算 path 與 Docker volume 的 staging 大小，並要求所在
 filesystem 至少保留 1 GiB。空間不足時預設中止；只有人工操作可明確使用：</p>
-<pre><code>sudo backupctl backup minecraft --allow-low-space</code></pre>
+<pre><code>sudo backupctl backup advent-of-ascension-plus-2026 --allow-low-space</code></pre>
 <div class="box warn"><code>run-due</code> 不會自動略過空間保護。即使人工放行，
 實際複製遇到 <code>ENOSPC</code> 仍會失敗並清除該服務的半成品 staging。</div>
 <p>查看排程狀態：</p>
@@ -676,7 +696,7 @@ filesystem 至少保留 1 GiB。空間不足時預設中止；只有人工操作
 
 <section id="restore-test">
 <h2>18. 還原、選取與一次還原全部服務</h2>
-<p>不指定服務名稱時，會從 Restic repository 找出所有具有 <code>service:&lt;name&gt;</code> tag 的服務，開啟互動式選單。所有項目預設勾選：</p>
+<p>不指定服務 ID 時，會從 Restic repository 找出所有具有 <code>service:&lt;service-id&gt;</code> tag 的服務，開啟互動式選單。所有項目預設勾選；選擇與 CLI 參數始終使用穩定 ID，顯示文字則可使用 manifest 的 <code>name</code>：</p>
 <pre><code>sudo backupctl restore</code></pre>
 <p>操作鍵：</p>
 <table>
@@ -696,13 +716,15 @@ filesystem 至少保留 1 GiB。空間不足時預設中止；只有人工操作
 <pre><code>sudo backupctl restore minecraft ghost --apply</code></pre>
 <p>批次還原同樣逐服務隔離錯誤；某一服務下載或套用失敗時，不會跳過後續服務，最後會列出成功結果與失敗摘要。</p>
 <p>指定歷史 snapshot ID 時只允許單一服務。程式會先用目前 host 與
-<code>service:&lt;name&gt;</code> tag 解析並驗證完整 ID，再開始下載：</p>
+<code>service:&lt;service-id&gt;</code> tag 解析並驗證完整 ID，再開始下載：</p>
 <pre><code>sudo backupctl restore minecraft --snapshot 01234567 --apply</code></pre>
 <p>下載前會以 Restic <code>restore-size</code> 估算展開大小，並要求至少保留
 1 GiB。互動模式可再次確認；非互動模式必須另外指定
 <code>--allow-low-space</code>，而 <code>--yes</code> 本身不會略過空間保護。</p>
 <h3><code>backup.yaml</code> 的還原規則</h3>
 <ul>
+<li>manifest 還原位置依序選擇：本機若已有唯一且合法的同 ID manifest，使用其目前位置；否則使用新快照 inventory 中已驗證的相對目錄；舊快照沒有相對目錄欄位時，才回退至 <code>services_root/&lt;service-id&gt;</code>。</li>
+<li>快照相對目錄必須是正規化的非絕對路徑，每層元件都符合安全命名規則，且最終位置仍位於 <code>services_root</code> 內；驗證完成前不會建立分類目錄或寫入 manifest。</li>
 <li>現有部署：本機 manifest 與所有 Compose files 都存在；snapshot inventory 必須與本機 project name、path/source declarations、volume mapping、volume 名稱及 labels 相符後才可覆寫。Compose service 清單只供診斷，新增或移除 service 不會單獨阻止舊 snapshot 還原。</li>
 <li>全新重建：manifest、Compose files、所有 present path與 named volume 都必須不存在，且 snapshot 中必須包含所有 required Compose file path source；資料完成後才發布 Compose files與 manifest。目錄 path 會先在私有暫存目錄完整準備再原子發布。若發布完成前失敗，會嘗試移除本次新建的 path 與 volume，使同一還原可以重跑；rollback 自身失敗時會保留原始錯誤並另外回報 cleanup 錯誤。若 path 在發布後被其他程序修改，或新建祖先已出現其他內容，則保留該路徑並警告，避免刪除外部寫入。</li>
 <li>只有部分設定或 target 存在、project identity 不明、或有其他 container 引用 target時，一律拒絕，不猜測身份也不覆寫。</li>
@@ -772,7 +794,7 @@ sudo backupctl snapshots</code></pre>
 <tr><td>本專案程式碼</td><td>從 <code>https://github.com/flier268/homelab-backup.git</code> 重新 clone。</td></tr>
 <tr><td><code>configs/homelab-backup-configs.zip.age</code></td><td>加密保存 Restic 密碼、rclone 設定與全域設定。</td></tr>
 <tr><td>對應 SSH 私鑰</td><td>解密設定 archive；應另外保存在 Bitwarden 或離線安全媒體。</td></tr>
-<tr><td>OneDrive Restic repository</td><td>保存服務資料、歷史 snapshots、Compose 等來源檔，以及自動保存的 <code>backup.yaml</code>。</td></tr>
+<tr><td>OneDrive Restic repository</td><td>保存服務資料、歷史 snapshots、Compose 等來源檔、自動保存的 <code>backup.yaml</code>，以及新快照中的服務相對目錄。</td></tr>
 </table>
 <p>使用 <code>sudo ./backup-configs.sh</code> 產生加密 archive；使用 <code>sudo ./restore-configs.sh</code> 貼入私鑰並放回對應系統路徑。</p>
 <div class="box ok">不需要另外備份 <code>/srv/stacks</code> 才能完成復原。用 private Git 保存 stacks 只會讓版本管理與人工查看更方便。</div>
@@ -805,9 +827,10 @@ sudo backupctl snapshots</code></pre>
 <pre><code>sudo backupctl restore --all \
   --restore-manifest --apply --start --yes</code></pre>
 <p>本機沒有 <code>backup.yaml</code> 時，只有在 manifest、所有 Compose files、present paths、named volumes 與相關 container references 全部不存在的全新重建模式下才會套用；任何混合狀態都會拒絕。</p>
+<p>新快照會依 inventory 保存的安全相對目錄重建原分類，例如 <code>/srv/stacks/Minecraft/Advent of Ascension Plus-2026</code>。舊快照沒有此欄位時會建立 <code>/srv/stacks/&lt;service-id&gt;</code>。如果重建前已手動放回同 ID 的合法 manifest，則以該 manifest 的目前位置為準。</p>
 <h3>7. 檢查服務</h3>
 <pre><code>docker ps
-cd /srv/stacks/ghost
+cd "/srv/stacks/Minecraft/Advent of Ascension Plus-2026"
 docker compose ps
 docker compose logs --tail=200</code></pre>
 <h3>8. 最後才啟用排程</h3>
