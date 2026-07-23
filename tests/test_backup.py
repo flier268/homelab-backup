@@ -255,6 +255,8 @@ class StagingLifecycleTests(unittest.TestCase):
         )
         saved = json.loads((stage / '_meta' / 'inventory.json').read_text())
         self.assertEqual(saved['paths'], inventory)
+        self.assertEqual(saved['service'], 'demo')
+        self.assertEqual(saved['service_relative_directory'], 'demo')
 
     def test_inventory_uses_final_sync_metadata_before_restart(self):
         value = manifest(self.root, consistency={'mode': 'stop'}, sources={

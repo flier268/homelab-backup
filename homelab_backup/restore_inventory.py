@@ -1,7 +1,10 @@
 import json
 from pathlib import Path
 
-from .manifest import source_path, validate_docker_volume_name
+from .manifest import (
+    source_path, valid_service_name, validate_docker_volume_name,
+    validate_service_relative_directory,
+)
 from .security import (
     lexical_absolute, paths_overlap, read_control_text, validate_payload,
 )
@@ -68,16 +71,34 @@ def load_restore_inventory(root) -> RestoreInventory:
     return data
 
 
+def restore_inventory_service_directory(inventory, service):
+    if not valid_service_name(service):
+        raise ValueError(f'invalid service ID: {service!r}')
+    if not isinstance(inventory, dict):
+        raise RuntimeError('restore inventory must be a JSON object')
+    version = inventory.get('version')
+    if type(version) is not int or version != 1:
+        raise RuntimeError('restore inventory version must be 1')
+    inventory_service = inventory.get('service')
+    if inventory_service != service:
+        raise RuntimeError(
+            f'restore inventory belongs to service {inventory_service!r}, '
+            f'expected {service!r}'
+        )
+    value = (
+        inventory['service_relative_directory']
+        if 'service_relative_directory' in inventory
+        else service
+    )
+    return validate_service_relative_directory(
+        value, 'restore inventory service directory',
+    )
+
+
 def validate_restore_inventory(
         m: ServiceManifest, inventory: RestoreInventory,
 ):
-    if inventory.get('version') != 1:
-        raise RuntimeError('restore inventory version must be 1')
-    service = inventory.get('service')
-    if service != m['service']:
-        raise RuntimeError(
-            f"restore inventory belongs to service {service!r}, expected {m['service']!r}"
-        )
+    restore_inventory_service_directory(inventory, m['service'])
     path_entries = inventory.get('paths')
     volume_entries = inventory.get('volumes')
     identity = inventory.get('compose')

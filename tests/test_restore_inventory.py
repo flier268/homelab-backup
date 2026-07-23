@@ -8,6 +8,81 @@ from tests.helpers import manifest, write_restore_inventory
 
 
 class RestoreInventoryTests(unittest.TestCase):
+    def test_service_directory_accepts_valid_relative_path(self):
+        value = restore_inventory.restore_inventory_service_directory({
+            'version': 1,
+            'service': 'advent-plus',
+            'service_relative_directory': 'Minecraft/Advent Plus',
+        }, 'advent-plus')
+
+        self.assertEqual(value, Path('Minecraft/Advent Plus'))
+
+    def test_service_directory_falls_back_to_service_id_when_field_is_missing(self):
+        value = restore_inventory.restore_inventory_service_directory({
+            'version': 1,
+            'service': 'advent-plus',
+        }, 'advent-plus')
+
+        self.assertEqual(value, Path('advent-plus'))
+
+    def test_service_directory_rejects_non_integer_version_one(self):
+        for version in (True, 1.0, '1', 2, None):
+            with self.subTest(version=version), self.assertRaisesRegex(
+                    RuntimeError, 'version must be 1',
+            ):
+                restore_inventory.restore_inventory_service_directory({
+                    'version': version,
+                    'service': 'demo',
+                }, 'demo')
+
+    def test_service_directory_rejects_wrong_service(self):
+        with self.assertRaisesRegex(RuntimeError, "expected 'demo'"):
+            restore_inventory.restore_inventory_service_directory({
+                'version': 1,
+                'service': 'other',
+            }, 'demo')
+
+    def test_service_directory_rejects_invalid_requested_service(self):
+        with self.assertRaisesRegex(ValueError, 'invalid service ID'):
+            restore_inventory.restore_inventory_service_directory({
+                'version': 1,
+                'service': '../outside',
+            }, '../outside')
+
+    def test_service_directory_rejects_unsafe_or_non_normalized_paths(self):
+        for value in (
+                None, '', '/outside', '../outside', 'Minecraft//Server',
+                'Minecraft/./Server', 'Minecraft/../Server',
+                'Minecraft/Server/', 'Minecraft/two  spaces',
+        ):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                restore_inventory.restore_inventory_service_directory({
+                    'version': 1,
+                    'service': 'demo',
+                    'service_relative_directory': value,
+                }, 'demo')
+
+    def test_service_relative_directory_is_validated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            value = manifest(Path(tmp))
+            inventory = {
+                'version': 1, 'service': 'demo',
+                'service_relative_directory': 'Minecraft/Advent Plus',
+                'paths': [], 'volumes': [],
+                'compose': {
+                    'project_name': 'demo', 'services': [],
+                    'compose_files': ['compose.yaml'], 'volumes': [],
+                },
+            }
+            restore_inventory.validate_restore_inventory(value, inventory)
+            for unsafe in (
+                None, '/outside', '../outside', 'Minecraft//Server',
+                'Minecraft/two  spaces',
+            ):
+                inventory['service_relative_directory'] = unsafe
+                with self.subTest(unsafe=unsafe), self.assertRaises(ValueError):
+                    restore_inventory.validate_restore_inventory(value, inventory)
+
     def test_capture_and_consistency_metadata_are_validated(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

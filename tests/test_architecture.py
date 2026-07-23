@@ -55,7 +55,7 @@ class ArchitectureTests(unittest.TestCase):
         dependencies = top_level_dependencies()
         self.assertEqual(
             dependencies['restore'] & RESTORE_LAYERS,
-            {'restore_apply'},
+            {'restore_apply', 'restore_inventory'},
         )
         self.assertEqual(
             dependencies['restore_apply'] & RESTORE_LAYERS,

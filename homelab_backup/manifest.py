@@ -24,6 +24,9 @@ RETENTION_FLAGS = (
     ('keep_yearly', '--keep-yearly'),
 )
 SERVICE_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]*')
+DISPLAY_NAME_RE = re.compile(
+    r'[A-Za-z0-9][A-Za-z0-9_.-]*(?: [A-Za-z0-9][A-Za-z0-9_.-]*)*'
+)
 DOCKER_VOLUME_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]*')
 
 
@@ -42,48 +45,125 @@ def validate_docker_volume_name(value, field='Docker volume name'):
     return value
 
 
-def manifests(c, include_disabled=False, on_error=None) -> list[ServiceManifest]:
-    out = []
+def valid_display_name(value):
+    return (
+        isinstance(value, str)
+        and DISPLAY_NAME_RE.fullmatch(value) is not None
+    )
+
+
+def service_label(m):
+    service = m.get('service', '<unnamed>')
+    name = m.get('name', service)
+    return service if name == service else f'{name} [{service}]'
+
+
+def validate_service_relative_directory(value, field='service directory'):
+    if not isinstance(value, str) or not value:
+        raise ValueError(f'{field} must be a non-empty relative path')
+    path = Path(value)
+    if path.is_absolute() or path.as_posix() != value or not path.parts:
+        raise ValueError(f'{field} must be a normalized relative path')
+    if any(not valid_display_name(part) for part in path.parts):
+        raise ValueError(f'{field} contains an unsupported path component')
+    return path
+
+
+def _manifest_paths(services_root):
+    # pathlib does not recurse through directory symlinks. Each discovered
+    # manifest is validated again through its complete protected parent chain.
+    return sorted(services_root.rglob('backup.yaml'))
+
+
+def _load_discovered_manifest(services_root, path):
+    relative_dir = path.parent.relative_to(services_root).as_posix()
+    validate_service_relative_directory(
+        relative_dir, f'{path} parent directory',
+    )
+    validate_control_directory(path.parent)
+    m = _load_manifest_yaml(path)
+    if not isinstance(m, dict):
+        raise ValueError(f'{path}: manifest must be a YAML mapping')
+    enabled = m.get('enabled', True)
+    if not isinstance(enabled, bool):
+        raise ValueError(f'{path}: enabled must be boolean')
+    m['_path'] = str(path)
+    m['_dir'] = str(path.parent)
+    m['_relative_dir'] = relative_dir
+    return m
+
+
+def _manifest_scan(c):
+    loaded = []
+    by_service = {}
+    invalid = []
     services_root = validate_control_directory(c['services_root'])
-    for path in sorted(services_root.glob('*/backup.yaml')):
+    for path in _manifest_paths(services_root):
         try:
-            m = _load_manifest_yaml(path)
-            if not isinstance(m, dict):
-                raise ValueError(f'{path}: manifest must be a YAML mapping')
-            enabled = m.get('enabled', True)
-            if not isinstance(enabled, bool):
-                raise ValueError(f'{path}: enabled must be boolean')
+            m = _load_discovered_manifest(services_root, path)
         except Exception as err:
-            if on_error is None:
-                raise
-            on_error(path, err)
+            invalid.append((path, err))
             continue
-        m['_path'] = str(path)
-        m['_dir'] = str(path.parent)
-        if include_disabled or enabled is not False:
-            out.append(m)
-    return out
+        loaded.append(m)
+        service = m.get('service')
+        if valid_service_name(service):
+            by_service.setdefault(service, []).append(m)
+    return loaded, by_service, invalid
+
+
+def manifests(c, include_disabled=False, on_error=None) -> list[ServiceManifest]:
+    loaded, by_service, invalid = _manifest_scan(c)
+    if invalid:
+        if on_error is None:
+            raise invalid[0][1]
+        for path, error in invalid:
+            on_error(path, error)
+    duplicates = {
+        service: values
+        for service, values in by_service.items()
+        if len(values) > 1
+    }
+    if duplicates:
+        for service, values in sorted(duplicates.items()):
+            paths = ', '.join(value['_path'] for value in values)
+            error = ValueError(
+                f'duplicate service ID {service!r}: {paths}'
+            )
+            if on_error is None:
+                raise error
+            for value in values:
+                on_error(Path(value['_path']), error)
+        duplicate_ids = set(duplicates)
+        loaded = [
+            m for m in loaded if m.get('service') not in duplicate_ids
+        ]
+    return [
+        m for m in loaded
+        if include_disabled or m.get('enabled', True) is not False
+    ]
+
+
+def find_manifest(c, name, *, include_disabled=False):
+    if not valid_service_name(name):
+        return None
+    _, by_service, _ = _manifest_scan(c)
+    matches = by_service.get(name, [])
+    if len(matches) > 1:
+        paths = ', '.join(value['_path'] for value in matches)
+        raise ValueError(f'duplicate service ID {name!r}: {paths}')
+    if not matches:
+        return None
+    found = matches[0]
+    if found.get('enabled', True) is False and not include_disabled:
+        return None
+    return found
 
 
 def manifest(c, name) -> ServiceManifest:
     if not valid_service_name(name):
         raise ValueError(f'unknown or disabled service: {name}')
-    services_root = lexical_absolute(c['services_root'])
-    path = services_root / name / 'backup.yaml'
-    if not path_contains(services_root, path):
-        raise ValueError(f'unknown or disabled service: {name}')
-    try:
-        m = _load_manifest_yaml(path)
-    except FileNotFoundError as err:
-        raise ValueError(f'unknown or disabled service: {name}') from err
-    if not isinstance(m, dict):
-        raise ValueError(f'{path}: manifest must be a YAML mapping')
-    m['_path'] = str(path)
-    m['_dir'] = str(path.parent)
-    enabled = m.get('enabled', True)
-    if not isinstance(enabled, bool):
-        raise ValueError(f'{path}: enabled must be boolean')
-    if m.get('service') != name or enabled is False:
+    m = find_manifest(c, name)
+    if m is None:
         raise ValueError(f'unknown or disabled service: {name}')
     return m
 
@@ -159,9 +239,9 @@ def _validate_manifest_header(m):
         raise ValueError('manifest must be a mapping')
     path = m.get('_path', '<manifest>')
     allowed_manifest = {
-        'version', 'service', 'enabled', 'schedule', 'retention',
+        'version', 'service', 'name', 'enabled', 'schedule', 'retention',
         'compose', 'consistency', 'actions', 'sources', '_path', '_dir',
-        '_snapshot_manifest', '_restore_manifest_requested',
+        '_relative_dir', '_snapshot_manifest', '_restore_manifest_requested',
     }
     unknown_manifest = sorted(set(m) - allowed_manifest)
     if unknown_manifest:
@@ -172,10 +252,11 @@ def _validate_manifest_header(m):
         raise ValueError(f'{path}: missing service')
     if not valid_service_name(m['service']):
         raise ValueError(f'{path}: service contains unsupported characters')
-    if m.get('_dir') and Path(m['_dir']).name != m['service']:
-        raise ValueError(
-            f"{path}: manifest directory must be named {m['service']!r}, "
-            f"not {Path(m['_dir']).name!r}"
+    if 'name' in m and not valid_display_name(m['name']):
+        raise ValueError(f'{path}: name contains unsupported characters')
+    if '_relative_dir' in m:
+        validate_service_relative_directory(
+            m['_relative_dir'], f'{path}: service directory',
         )
     if not isinstance(m.get('enabled', True), bool):
         raise ValueError(f'{path}: enabled must be boolean')
@@ -394,7 +475,7 @@ def compose_model(m):
     except CommandError as err:
         _print_command_failure(err, context=(
             f"Compose configuration validation failed for service "
-            f"'{m.get('service', '<unknown>')}' ({m['_path']})"
+            f"'{service_label(m)}' ({m['_path']})"
         ))
         print('  diagnostic hints:', file=sys.stderr)
         print('    - Check that every compose.files entry exists.', file=sys.stderr)

@@ -9,7 +9,9 @@ from .common import (
     CommandError, FailureSummary, GlobalLock, _print_command_failure, die,
     restic_env, run,
 )
-from .manifest import manifest, manifests, valid_service_name, validate_manifest
+from .manifest import (
+    manifest, manifests, service_label, valid_service_name, validate_manifest,
+)
 from .schedule import local_now
 
 
@@ -38,7 +40,10 @@ def cmd_list(c, args):
             due, reason, _ = due_status(c, m, now)
             schedule = m['schedule']
             schedule_text = f"cron {schedule['cron']}"
-            print(f"{service}: {schedule_text}; {'DUE' if due else reason}; {m['_path']}")
+            print(
+                f"{service_label(m)}: {schedule_text}; "
+                f"{'DUE' if due else reason}; {m['_path']}"
+            )
         except Exception as err:
             failures.record_exception(
                 service, err,
@@ -111,19 +116,25 @@ def cmd_run_due(c, args):
                 if os.environ.get('BACKUPCTL_DEBUG') == '1':
                     raise
                 continue
-            print(f"{m['service']}: {'DUE' if is_due else 'skip'} ({reason})")
+            print(
+                f"{service_label(m)}: "
+                f"{'DUE' if is_due else 'skip'} ({reason})"
+            )
             if is_due:
                 due.append(m)
         if not due:
             print('No backups are due.')
         for m in due:
-            print(f"\n== Scheduled backup: {m['service']} ==")
+            print(f"\n== Scheduled backup: {service_label(m)} ==")
             try:
                 backup_one(c, m)
             except Exception as err:
                 failures.record_exception(
                     m['service'], err,
-                    message=f"ERROR: scheduled backup failed for {m['service']}: {{error}}",
+                    message=(
+                        f"ERROR: scheduled backup failed for "
+                        f"{service_label(m)}: {{error}}"
+                    ),
                 )
                 if os.environ.get('BACKUPCTL_DEBUG') == '1':
                     raise
@@ -186,7 +197,7 @@ def cmd_maintenance(c, args):
                         raise
         for m in manifests(c, on_error=_manifest_error_recorder(failures)):
             service = m.get('service', '<unnamed>')
-            print(f"\n== Retention: {service} ==")
+            print(f"\n== Retention: {service_label(m)} ==")
             try:
                 service = _service_name(m)
             except Exception as err:

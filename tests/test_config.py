@@ -270,12 +270,43 @@ class ManifestValidationTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, 'overlapping path target'):
                         manifest_module.validate_manifest(value)
 
-    def test_manifest_directory_must_match_service(self):
+    def test_manifest_directory_is_independent_from_service(self):
         with tempfile.TemporaryDirectory() as tmp:
             value = manifest(Path(tmp))
             value['_dir'] = str(Path(tmp) / 'other-name')
-            with self.assertRaisesRegex(ValueError, 'directory'):
-                manifest_module.validate_manifest(value)
+            self.assertTrue(manifest_module.validate_manifest(value))
+
+    def test_optional_display_name_is_validated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name in (
+                'Advent of Ascension Plus-2026',
+                'Minecraft_Server 2.0',
+            ):
+                with self.subTest(name=name):
+                    self.assertTrue(manifest_module.validate_manifest(
+                        manifest(root, name=name),
+                    ))
+            for name in (
+                '', ' leading', 'trailing ', 'two  spaces', 'a/b', 'line\nbreak',
+            ):
+                with self.subTest(name=name), self.assertRaisesRegex(
+                    ValueError, 'name contains unsupported characters',
+                ):
+                    manifest_module.validate_manifest(manifest(root, name=name))
+
+    def test_service_label_uses_name_without_changing_service_id(self):
+        self.assertEqual(
+            manifest_module.service_label({
+                'service': 'advent-plus',
+                'name': 'Advent Plus',
+            }),
+            'Advent Plus [advent-plus]',
+        )
+        self.assertEqual(
+            manifest_module.service_label({'service': 'demo'}),
+            'demo',
+        )
 
 
 class GlobalConfigValidationTests(unittest.TestCase):

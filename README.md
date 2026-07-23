@@ -2,7 +2,8 @@
 
 Docker Compose 服務的 Restic + OneDrive 備份工具。
 
-- 每個 `/srv/stacks/<service>/backup.yaml` 自行宣告 Cron、retention、來源與一致性策略。
+- 每個 `/srv/stacks/**/backup.yaml` 自行宣告 Cron、retention、來源與一致性策略；
+  可用安全的巢狀目錄分類服務，目錄位置不等於服務 ID。
 - 支援 trusted root 下由容器 UID/GID 擁有的任意深層路徑，以及本機 rootful
   Docker named volume；中間 symlink 不會被跟隨，leaf symlink 只備份 link 本身。
 - `backup.yaml` 會自動保存到每份 snapshot 的 `_meta/backup.yaml`，不必列入 `sources.paths`。
@@ -54,6 +55,27 @@ checksum。一般 push 與 pull request 只執行 CI，不會發布。
 6. 手動備份並完成還原測試。
 7. 執行 `sudo ./backup-configs.sh`，貼入 SSH 公鑰並加密災難復原必要設定。
 8. 最後才啟用 systemd timers。
+
+服務 ID、顯示名稱與部署目錄彼此獨立。例如：
+
+```text
+/srv/stacks/
+└── Minecraft/
+    └── Advent of Ascension Plus-2026/
+        └── backup.yaml
+```
+
+```yaml
+version: 1
+service: advent-of-ascension-plus-2026
+name: "Advent of Ascension Plus-2026"
+```
+
+`service` 是用於 CLI、Restic tag 與本機 state 的穩定唯一 ID，只能包含英數、
+`.`、`_`、`-`；可選的 `name` 是顯示文字，可在單字間使用單一空白。不同分類下
+的 `service` 仍不得重複。快照會記錄 manifest 相對目錄；本機設定不存在時，
+新快照可將 manifest 還原到原分類位置，舊快照則回退到
+`/srv/stacks/<service>`。
 
 ## 解除安裝
 
@@ -190,6 +212,7 @@ sudo ./backup-configs.sh --rotate configs/homelab-backup-configs.zip.age
 
 ```bash
 sudo backupctl backup minecraft
+sudo backupctl backup advent-of-ascension-plus-2026
 ```
 
 Palworld 零停機範例可參考 `examples/palworld.backup.yaml`。若其中宣告的資料 path

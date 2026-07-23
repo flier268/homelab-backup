@@ -8,7 +8,7 @@ from unittest import mock
 
 from homelab_backup import restore as backupctl
 from homelab_backup import restore_apply, restore_plan
-from tests.helpers import manifest as make_manifest
+from tests.helpers import manifest as make_manifest, write_restore_inventory
 
 
 class RepositoryBoundaryTests(unittest.TestCase):
@@ -211,6 +211,228 @@ class RepositoryBoundaryTests(unittest.TestCase):
                 )
 
 class RestoredManifestTests(unittest.TestCase):
+    MANIFEST = (
+        'version: 1\n'
+        'service: advent-plus\n'
+        'name: "Advent Plus"\n'
+        'schedule:\n'
+        '  cron: "0 0 * * *"\n'
+        'retention:\n'
+        '  keep_last: 1\n'
+        'consistency:\n'
+        '  mode: external\n'
+        'sources:\n'
+        '  paths: []\n'
+        '  volumes: []\n'
+    )
+
+    def test_apply_rebuilds_into_recorded_nested_service_directory(self):
+        snapshot_manifest = (
+            'version: 1\n'
+            'service: advent-plus\n'
+            'name: "Advent Plus"\n'
+            'schedule:\n'
+            '  cron: "0 0 * * *"\n'
+            'retention:\n'
+            '  keep_last: 1\n'
+            'compose:\n'
+            '  files:\n'
+            '    - compose.yaml\n'
+            'consistency:\n'
+            '  mode: external\n'
+            'sources:\n'
+            '  paths:\n'
+            '    - id: compose\n'
+            '      path: compose.yaml\n'
+            '  volumes: []\n'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            services = root / 'services'
+            services.mkdir()
+            services.chmod(0o755)
+            restored = root / 'restored'
+            meta = restored / '_meta'
+            staged_compose = restored / 'paths' / 'compose' / 'compose.yaml'
+            staged_compose.parent.mkdir(parents=True)
+            staged_compose.write_text('services: {}\n', encoding='utf-8')
+            meta.mkdir(parents=True, exist_ok=True)
+            (meta / 'backup.yaml').write_text(
+                snapshot_manifest, encoding='utf-8',
+            )
+            write_restore_inventory(
+                restored,
+                service='advent-plus',
+                service_relative_directory='Minecraft/Advent Plus',
+                paths=[{
+                    'id': 'compose',
+                    'path': 'compose.yaml',
+                    'type': 'file',
+                    'present': True,
+                }],
+            )
+            value = backupctl.prepare_restored_manifest(
+                {'services_root': str(services)},
+                'advent-plus', restored, policy='restore',
+            )
+            target = services / 'Minecraft' / 'Advent Plus'
+
+            with mock.patch.object(
+                    restore_plan, 'docker_project_containers', return_value=(),
+            ), mock.patch.object(
+                    restore_plan, 'docker_mount_conflicts', return_value=(),
+            ), mock.patch.object(
+                    restore_apply, 'docker_project_containers', return_value=(),
+            ), mock.patch.object(
+                    restore_apply, 'docker_mount_conflicts', return_value=(),
+            ), mock.patch.object(restore_apply, 'sync_volumes'):
+                restore_apply.apply_one(
+                    {'trusted_data_roots': [str(services)]},
+                    value, restored,
+                )
+
+            self.assertEqual(
+                (target / 'compose.yaml').read_text(encoding='utf-8'),
+                'services: {}\n',
+            )
+            self.assertEqual(
+                (target / 'backup.yaml').read_text(encoding='utf-8'),
+                snapshot_manifest,
+            )
+            self.assertFalse((services / 'advent-plus').exists())
+
+    def test_new_snapshot_restores_manifest_to_recorded_nested_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            services = root / 'services'
+            services.mkdir()
+            services.chmod(0o755)
+            restored = root / 'restored'
+            meta = restored / '_meta'
+            meta.mkdir(parents=True)
+            (meta / 'backup.yaml').write_text(
+                self.MANIFEST, encoding='utf-8',
+            )
+            write_restore_inventory(
+                restored, service='advent-plus',
+                service_relative_directory='Minecraft/Advent Plus',
+            )
+
+            value = backupctl.prepare_restored_manifest(
+                {'services_root': str(services)},
+                'advent-plus', restored, policy='restore',
+            )
+
+        self.assertEqual(
+            value['_relative_dir'], 'Minecraft/Advent Plus',
+        )
+        self.assertEqual(
+            Path(value['_path']),
+            services / 'Minecraft' / 'Advent Plus' / 'backup.yaml',
+        )
+
+    def test_existing_local_manifest_location_takes_precedence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            services = root / 'services'
+            local_dir = services / 'Current Location' / 'Server'
+            local_dir.mkdir(parents=True)
+            services.chmod(0o755)
+            (services / 'Current Location').chmod(0o755)
+            local_dir.chmod(0o755)
+            local = local_dir / 'backup.yaml'
+            local.write_text(self.MANIFEST, encoding='utf-8')
+            local.chmod(0o600)
+            restored = root / 'restored'
+            meta = restored / '_meta'
+            meta.mkdir(parents=True)
+            (meta / 'backup.yaml').write_text(
+                self.MANIFEST, encoding='utf-8',
+            )
+            write_restore_inventory(
+                restored, service='advent-plus',
+                service_relative_directory='Old Location/Server',
+            )
+
+            value = backupctl.prepare_restored_manifest(
+                {'services_root': str(services)},
+                'advent-plus', restored, policy='keep',
+            )
+
+        self.assertEqual(
+            value['_relative_dir'], 'Current Location/Server',
+        )
+        self.assertEqual(Path(value['_path']), local)
+
+    def test_legacy_snapshot_without_relative_directory_uses_service_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            services = root / 'services'
+            services.mkdir()
+            services.chmod(0o755)
+            restored = root / 'restored'
+            meta = restored / '_meta'
+            meta.mkdir(parents=True)
+            (meta / 'backup.yaml').write_text(
+                self.MANIFEST, encoding='utf-8',
+            )
+            write_restore_inventory(restored, service='advent-plus')
+
+            value = backupctl.prepare_restored_manifest(
+                {'services_root': str(services)},
+                'advent-plus', restored, policy='restore',
+            )
+
+        self.assertEqual(value['_relative_dir'], 'advent-plus')
+
+    def test_unsafe_snapshot_relative_directory_is_rejected_before_write(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            services = root / 'services'
+            services.mkdir()
+            services.chmod(0o755)
+            restored = root / 'restored'
+            meta = restored / '_meta'
+            meta.mkdir(parents=True)
+            (meta / 'backup.yaml').write_text(
+                self.MANIFEST, encoding='utf-8',
+            )
+            write_restore_inventory(
+                restored, service='advent-plus',
+                service_relative_directory='../outside',
+            )
+
+            with self.assertRaises(ValueError):
+                backupctl.prepare_restored_manifest(
+                    {'services_root': str(services)},
+                    'advent-plus', restored, policy='restore',
+                )
+
+            self.assertFalse((root / 'outside').exists())
+            self.assertEqual(list(services.iterdir()), [])
+
+    def test_snapshot_directory_uses_shared_inventory_loader_and_validator(self):
+        inventory = {
+            'version': 1,
+            'service': 'demo',
+            'service_relative_directory': 'Category/Demo',
+        }
+        with mock.patch.object(
+                backupctl._restore_inventory,
+                'load_restore_inventory',
+                return_value=inventory,
+        ) as load, mock.patch.object(
+                backupctl._restore_inventory,
+                'restore_inventory_service_directory',
+                return_value=Path('Category/Demo'),
+        ) as validate:
+            value = backupctl._snapshot_service_relative_directory(
+                '/restore/root', 'demo',
+            )
+
+        self.assertEqual(value, Path('Category/Demo'))
+        load.assert_called_once_with('/restore/root')
+        validate.assert_called_once_with(inventory, 'demo')
 
     def test_snapshot_manifest_symlink_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -218,6 +440,10 @@ class RestoredManifestTests(unittest.TestCase):
             restored = root / 'restored'
             meta = restored / '_meta'
             meta.mkdir(parents=True)
+            services = root / 'services'
+            services.mkdir()
+            services.chmod(0o755)
+            write_restore_inventory(restored)
             outside = root / 'outside.yaml'
             outside.write_text(
                 'version: 1\nservice: demo\n', encoding='utf-8',
@@ -226,7 +452,7 @@ class RestoredManifestTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, 'regular file'):
                 backupctl.prepare_restored_manifest(
-                    {'services_root': str(root / 'services')},
+                    {'services_root': str(services)},
                     'demo', restored, policy='restore',
                 )
 
@@ -244,6 +470,10 @@ class RestoredManifestTests(unittest.TestCase):
             target = service_dir / 'backup.yaml'
             original = 'original local manifest\n'
             target.write_text(original, encoding='utf-8')
+            target.chmod(0o600)
+            (root / 'services').chmod(0o755)
+            service_dir.chmod(0o755)
+            write_restore_inventory(restored)
 
             with self.assertRaises(ValueError):
                 backupctl.prepare_restored_manifest(

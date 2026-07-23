@@ -5,7 +5,7 @@ from pathlib import Path
 
 from .btrfs_snapshot import SnapshotTransaction
 from .common import MIN_FREE_BYTES, format_bytes, run, run_cleanup
-from .manifest import compose_run
+from .manifest import compose_run, service_label
 from .storage import (
     docker_mount_conflicts, docker_writer_maps, estimate_backup_size, hooks,
     running_services, sync_paths, sync_volumes, validate_no_docker_writers,
@@ -40,7 +40,7 @@ def _check_backup_space(
         return
     shortfall = required - free
     print(
-        f"WARNING: backup for {m['service']} is estimated at "
+        f"WARNING: backup for {service_label(m)} is estimated at "
         f'{format_bytes(estimated_size)}, but only {format_bytes(free)} is free '
         f'on {stage}; the required 1.00 GiB reserve would be short by '
         f'{format_bytes(shortfall)}.',

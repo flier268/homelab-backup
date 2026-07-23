@@ -102,6 +102,9 @@ def _write_stage_metadata(context, captured, optional_action_failures):
         'version': 1,
         'service': m['service'],
         'service_directory': m['_dir'],
+        'service_relative_directory': m.get(
+            '_relative_dir', Path(m['_dir']).name,
+        ),
         'paths': captured.paths,
         'volumes': captured.volumes,
         'compose': context.identity,

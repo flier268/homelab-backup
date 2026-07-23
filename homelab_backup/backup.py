@@ -13,7 +13,8 @@ from .common import (
     restic_env, run, run_cleanup,
 )
 from .manifest import (
-    RETENTION_FLAGS, compose_model, manifest, manifests, validate_manifest,
+    RETENTION_FLAGS, compose_model, manifest, manifests, service_label,
+    validate_manifest,
 )
 from .identity import account, action_user
 from .security import (
@@ -54,6 +55,7 @@ def backup_one(
         allow_low_space=False,
 ):
     validate_manifest(m)
+    label = service_label(m)
     partial_stage = (
         Path(c['staging_root']) / m['service']
         if c.get('staging_root') else None
@@ -103,7 +105,7 @@ def backup_one(
 
             run_cleanup(
                 remove_partial_stage,
-                f"remove partial staging for {m['service']}",
+                f'remove partial staging for {label}',
             )
         finished = dt.datetime.now().astimezone()
         state.update({
@@ -114,7 +116,7 @@ def backup_one(
         })
         run_cleanup(
             lambda: save_state(c, m['service'], state),
-            f"save failed backup state for {m['service']}",
+            f'save failed backup state for {label}',
         )
         raise
 
@@ -127,7 +129,7 @@ def backup_one(
     except Exception as err:
         postcommit_error = err
         print(
-            f'ERROR: Restic snapshot for {m["service"]} was committed, but '
+            f'ERROR: Restic snapshot for {service_label(m)} was committed, but '
             f'on_success actions failed: {type(err).__name__}: {err}',
             file=sys.stderr,
         )
@@ -145,7 +147,7 @@ def backup_one(
             retention_error = None
         except Exception as err:
             context = (
-                f"Snapshot for {m['service']} succeeded, but retention failed; "
+                f"Snapshot for {service_label(m)} succeeded, but retention failed; "
                 'maintenance will retry it later'
             )
             if isinstance(err, CommandError):
@@ -225,10 +227,11 @@ def cmd_validate(c, args):
         on_error=record_manifest_error,
     )
     if not any(m.get('enabled', True) for m in ms):
-        errors.append(f"no enabled backup.yaml manifests found under {c['services_root']}/*/")
-    seen = {}
+        errors.append(
+            f"no enabled backup.yaml manifests found under {c['services_root']}/"
+        )
     for m in ms:
-        label = f"{m.get('service', '<unnamed>')} ({m['_path']})"
+        label = f"{service_label(m)} ({m['_path']})"
         print(f'\n== Validating {label} ==')
         try:
             validate_manifest(m)
@@ -250,10 +253,6 @@ def cmd_validate(c, args):
                         raise RuntimeError(
                             f'snapshot mode requires command: {executable}'
                         )
-            name = m['service']
-            if name in seen:
-                raise RuntimeError(f"duplicate service name '{name}' also used by {seen[name]}")
-            seen[name] = m['_path']
             model = compose_model(m)
             validate_runtime_sources(
                 c, m, model,
@@ -305,6 +304,7 @@ def cmd_backup(c, args):
             die('another backupctl process is running')
         for m in ms:
             service = m.get('service', '<unnamed>')
+            label = service_label(m)
             try:
                 options = {}
                 if getattr(args, 'allow_low_space', False) is True:
@@ -312,8 +312,8 @@ def cmd_backup(c, args):
                 backup_one(c, m, **options)
             except Exception as err:
                 failures.record_exception(
-                    service, err,
-                    message=f'ERROR: backup failed for {service}: {{error}}',
-                    command_context=f'Backup failed for {service}',
+                    label, err,
+                    message=f'ERROR: backup failed for {label}: {{error}}',
+                    command_context=f'Backup failed for {label}',
                 )
     failures.raise_if_any('BACKUP FAILURES')

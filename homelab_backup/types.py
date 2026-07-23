@@ -100,6 +100,7 @@ class SourcesConfig(TypedDict, total=False):
 class ServiceManifest(TypedDict, total=False):
     version: int
     service: str
+    name: str
     enabled: bool
     schedule: ScheduleConfig
     retention: RetentionConfig
@@ -109,6 +110,7 @@ class ServiceManifest(TypedDict, total=False):
     sources: SourcesConfig
     _path: str
     _dir: str
+    _relative_dir: str
     _snapshot_manifest: str
     _restore_manifest_requested: bool
 
@@ -157,6 +159,7 @@ class RestoreInventory(TypedDict, total=False):
     version: int
     service: str
     service_directory: str
+    service_relative_directory: str
     paths: list[InventoryPath]
     volumes: list[InventoryVolume]
     compose: ComposeIdentity

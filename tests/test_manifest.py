@@ -76,6 +76,138 @@ class ComposeControlTests(unittest.TestCase):
 
 
 class ManifestSelectionTests(unittest.TestCase):
+    def test_manifest_without_valid_service_remains_available_for_validation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            services = Path(tmp) / 'services'
+            target = services / 'Unindexed Service'
+            target.mkdir(parents=True)
+            services.chmod(0o755)
+            target.chmod(0o755)
+            (target / 'backup.yaml').write_text(
+                'version: 1\nname: "Unindexed Service"\n',
+                encoding='utf-8',
+            )
+            (target / 'backup.yaml').chmod(0o600)
+
+            values = manifest_module.manifests(
+                {'services_root': str(services)},
+                include_disabled=True,
+            )
+
+        self.assertEqual(len(values), 1)
+        with self.assertRaisesRegex(ValueError, 'missing service'):
+            manifest_module.validate_manifest(values[0])
+
+    def test_manifest_consumers_use_the_same_scan_helper(self):
+        loaded = [{
+            'version': 1,
+            'service': 'demo',
+            'enabled': True,
+            '_path': '/services/demo/backup.yaml',
+            '_dir': '/services/demo',
+            '_relative_dir': 'demo',
+        }]
+        scan_result = (loaded, {'demo': loaded}, [])
+        with mock.patch.object(
+                manifest_module, '_manifest_scan', return_value=scan_result,
+        ) as scan:
+            values = manifest_module.manifests({})
+            selected = manifest_module.find_manifest({}, 'demo')
+
+        self.assertEqual(values, loaded)
+        self.assertIs(selected, loaded[0])
+        self.assertEqual(scan.call_count, 2)
+
+    def test_nested_manifest_with_spaced_directories_is_discovered_by_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            services = Path(tmp) / 'services'
+            target = services / 'Minecraft' / 'Advent of Ascension Plus-2026'
+            target.mkdir(parents=True)
+            services.chmod(0o755)
+            (services / 'Minecraft').chmod(0o755)
+            target.chmod(0o755)
+            (target / 'backup.yaml').write_text(
+                'version: 1\n'
+                'service: advent-plus\n'
+                'name: "Advent of Ascension Plus-2026"\n',
+                encoding='utf-8',
+            )
+            (target / 'backup.yaml').chmod(0o600)
+
+            values = manifest_module.manifests({
+                'services_root': str(services),
+            })
+            selected = manifest_module.manifest(
+                {'services_root': str(services)}, 'advent-plus',
+            )
+
+        self.assertEqual(len(values), 1)
+        self.assertEqual(
+            selected['_relative_dir'],
+            'Minecraft/Advent of Ascension Plus-2026',
+        )
+        self.assertEqual(selected['service'], 'advent-plus')
+
+    def test_duplicate_ids_are_isolated_while_other_services_continue(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            services = Path(tmp) / 'services'
+            for relative, service, enabled in (
+                ('Games/One', 'duplicate', True),
+                ('Archive/Two', 'duplicate', False),
+                ('Other/Good', 'good', True),
+            ):
+                target = services / relative
+                target.mkdir(parents=True)
+                for parent in (target, *target.parents):
+                    if parent == Path(tmp):
+                        break
+                    parent.chmod(0o755)
+                (target / 'backup.yaml').write_text(
+                    f'version: 1\nservice: {service}\n'
+                    f'enabled: {str(enabled).lower()}\n',
+                    encoding='utf-8',
+                )
+                (target / 'backup.yaml').chmod(0o600)
+            errors = []
+
+            values = manifest_module.manifests(
+                {'services_root': str(services)},
+                on_error=lambda path, err: errors.append((path, err)),
+            )
+
+            with self.assertRaisesRegex(ValueError, 'duplicate service ID'):
+                manifest_module.manifest(
+                    {'services_root': str(services)}, 'duplicate',
+                )
+
+        self.assertEqual([value['service'] for value in values], ['good'])
+        self.assertEqual(len(errors), 2)
+        self.assertTrue(all(
+            'duplicate service ID' in str(error) for _, error in errors
+        ))
+
+    def test_directory_symlink_is_not_followed_during_discovery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            services = root / 'services'
+            outside = root / 'outside' / 'Nested'
+            outside.mkdir(parents=True)
+            services.mkdir()
+            services.chmod(0o755)
+            outside.parent.chmod(0o755)
+            outside.chmod(0o755)
+            (outside / 'backup.yaml').write_text(
+                'version: 1\nservice: outside\n', encoding='utf-8',
+            )
+            (outside / 'backup.yaml').chmod(0o600)
+            (services / 'linked').symlink_to(outside.parent, target_is_directory=True)
+
+            values = manifest_module.manifests({
+                'services_root': str(services),
+            })
+
+        self.assertEqual(values, [])
+
     def test_invalid_falsey_enabled_is_reported_instead_of_treated_as_disabled(self):
         with tempfile.TemporaryDirectory() as tmp:
             services = Path(tmp) / 'services'
@@ -148,6 +280,33 @@ class ManifestSelectionTests(unittest.TestCase):
         self.assertEqual(value['service'], 'good')
         self.assertEqual(Path(value['_path']).parent.name, 'good')
 
+    def test_explicit_manifest_ignores_broken_leaf_named_like_service_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            services = Path(tmp) / 'services'
+            broken = services / 'good'
+            target = services / 'Nested' / 'Friendly Name'
+            broken.mkdir(parents=True)
+            target.mkdir(parents=True)
+            services.chmod(0o755)
+            broken.chmod(0o755)
+            (services / 'Nested').chmod(0o755)
+            target.chmod(0o755)
+            (broken / 'backup.yaml').write_text(
+                '- malformed\n', encoding='utf-8',
+            )
+            (target / 'backup.yaml').write_text(
+                'version: 1\nservice: good\n', encoding='utf-8',
+            )
+            (broken / 'backup.yaml').chmod(0o600)
+            (target / 'backup.yaml').chmod(0o600)
+
+            value = manifest_module.manifest(
+                {'services_root': str(services)}, 'good',
+            )
+
+        self.assertEqual(value['service'], 'good')
+        self.assertEqual(value['_relative_dir'], 'Nested/Friendly Name')
+
     def test_explicit_manifest_rejects_unsafe_service_name_before_loading(self):
         with mock.patch.object(manifest_module, '_load_manifest_yaml') as load_mock, \
                 self.assertRaises(ValueError):
@@ -174,7 +333,7 @@ class ManifestSelectionTests(unittest.TestCase):
                     {'services_root': str(services)}, 'good',
                 )
 
-    def test_manifest_rejects_symlink_leaf_before_loading_yaml(self):
+    def test_batch_scan_reports_symlink_leaf_before_loading_yaml(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             services = root / 'services'
@@ -187,13 +346,18 @@ class ManifestSelectionTests(unittest.TestCase):
                 'version: 1\nservice: demo\n', encoding='utf-8',
             )
             (service / 'backup.yaml').symlink_to(outside)
+            errors = []
 
-            with self.assertRaisesRegex(ValueError, 'regular file'):
-                manifest_module.manifest(
-                    {'services_root': str(services)}, 'demo',
-                )
+            values = manifest_module.manifests(
+                {'services_root': str(services)},
+                on_error=lambda path, err: errors.append((path, err)),
+            )
 
-    def test_manifest_rejects_unprivileged_writable_control_directory(self):
+        self.assertEqual(values, [])
+        self.assertEqual(len(errors), 1)
+        self.assertIn('regular file', str(errors[0][1]))
+
+    def test_batch_scan_reports_unprivileged_writable_control_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
             services = Path(tmp) / 'services'
             service = services / 'demo'
@@ -203,14 +367,19 @@ class ManifestSelectionTests(unittest.TestCase):
                 'version: 1\nservice: demo\n', encoding='utf-8',
             )
             service.chmod(0o777)
+            errors = []
 
             try:
-                with self.assertRaisesRegex(ValueError, 'group/world writable'):
-                    manifest_module.manifest(
-                        {'services_root': str(services)}, 'demo',
-                    )
+                values = manifest_module.manifests(
+                    {'services_root': str(services)},
+                    on_error=lambda path, err: errors.append((path, err)),
+                )
             finally:
                 service.chmod(0o755)
+
+        self.assertEqual(values, [])
+        self.assertEqual(len(errors), 1)
+        self.assertIn('group/world writable', str(errors[0][1]))
 
 
 if __name__ == '__main__':

@@ -34,7 +34,10 @@ def path_inventory(source, source_type='directory'):
     }]}
 
 
-def write_restore_inventory(root, *, service='demo', paths=None, volumes=None):
+def write_restore_inventory(
+        root, *, service='demo', service_relative_directory=None,
+        paths=None, volumes=None,
+):
     paths = [dict(item) for item in (paths or [])]
     for item in paths:
         item.setdefault('present', True)
@@ -46,7 +49,7 @@ def write_restore_inventory(root, *, service='demo', paths=None, volumes=None):
         )
     meta = Path(root) / '_meta'
     meta.mkdir(parents=True, exist_ok=True)
-    (meta / 'inventory.json').write_text(json.dumps({
+    inventory = {
         'version': 1,
         'service': service,
         'paths': paths,
@@ -58,4 +61,9 @@ def write_restore_inventory(root, *, service='demo', paths=None, volumes=None):
                 'actual_name': item['actual_name'],
             } for item in volumes],
         },
-    }), encoding='utf-8')
+    }
+    if service_relative_directory is not None:
+        inventory['service_relative_directory'] = service_relative_directory
+    (meta / 'inventory.json').write_text(
+        json.dumps(inventory), encoding='utf-8',
+    )

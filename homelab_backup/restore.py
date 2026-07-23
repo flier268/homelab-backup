@@ -9,14 +9,19 @@ from pathlib import Path
 import yaml
 
 from . import restore_apply
+from . import restore_inventory as _restore_inventory
 from .common import (
     MIN_FREE_BYTES, CommandError, FailureSummary, GlobalLock,
     _print_command_failure, die, format_bytes, restic_env, run,
 )
-from .manifest import manifest, valid_service_name, validate_manifest
+from .manifest import (
+    find_manifest, manifest, service_label, valid_service_name,
+    validate_manifest,
+)
 from .security import (
     clear_control_leaf, ensure_private_directory, lexical_absolute,
-    read_control_text, validate_control_root, validate_trusted_roots,
+    path_contains, read_control_text, validate_control_root,
+    validate_trusted_roots,
 )
 from .storage import (
     validate_docker_bind_probe, validate_docker_environment,
@@ -232,11 +237,29 @@ def restored_manifest_path(root):
     return Path(root) / '_meta' / 'backup.yaml'
 
 
+def _snapshot_service_relative_directory(root, service):
+    inventory = _restore_inventory.load_restore_inventory(root)
+    return _restore_inventory.restore_inventory_service_directory(
+        inventory, service,
+    )
+
+
 def prepare_restored_manifest(c, service, root, *, policy='ask'):
     source = restored_manifest_path(root)
     if not valid_service_name(service):
         raise ValueError(f'invalid service name from repository: {service!r}')
-    service_dir = Path(c['services_root']) / service
+    local = find_manifest(c, service, include_disabled=True)
+    services_root = lexical_absolute(c['services_root'])
+    if local is not None:
+        service_dir = lexical_absolute(local['_dir'])
+        relative_dir = Path(local['_relative_dir'])
+    else:
+        relative_dir = _snapshot_service_relative_directory(root, service)
+        service_dir = lexical_absolute(services_root / relative_dir)
+    if not path_contains(services_root, service_dir):
+        raise ValueError(
+            f'restored service directory escapes services_root: {service_dir}'
+        )
     target = service_dir / 'backup.yaml'
     restore_it = not target.exists()
     if target.exists():
@@ -265,6 +288,7 @@ def prepare_restored_manifest(c, service, root, *, policy='ask'):
         raise ValueError(f'{manifest_source}: manifest must be a mapping')
     m['_path'] = str(target)
     m['_dir'] = str(service_dir)
+    m['_relative_dir'] = relative_dir.as_posix()
     if m.get('service') != service:
         raise ValueError(
             f'{target}: service is {m.get("service")!r}, expected {service!r}'
@@ -296,7 +320,7 @@ def restore_one(
         '--tag', f'service:{service}', '--target', str(root),
     ], env=restic_env(c))
     m = prepare_restored_manifest(c, service, root, policy=manifest_policy)
-    print(f'Restored snapshot for {service}: {root}')
+    print(f'Restored snapshot for {service_label(m)}: {root}')
     return m, root
 
 
@@ -432,31 +456,32 @@ def cmd_restore(c, args):
                 m, root = restore_one(
                     c, service, snapshot, policy, **restore_options,
                 )
+                label = service_label(m) if isinstance(m, dict) else service
                 if args.apply:
                     restore_apply.apply_one(c, m, root, start_services=args.start)
                     try:
                         clear_control_leaf(root)
                     except Exception as cleanup_error:
                         failures.record_exception(
-                            f'{service} cleanup', cleanup_error,
+                            f'{label} cleanup', cleanup_error,
                             message=(
-                                f'ERROR: {service} was applied, but its temporary '
+                                f'ERROR: {label} was applied, but its temporary '
                                 'restore could not be removed: {error}'
                             ),
                         )
                         restored.append((
-                            service,
+                            label,
                             f'applied; cleanup failed; retained at {root}',
                         ))
                     else:
                         print(
-                            f'Applied restore for {service}; temporary restore removed'
+                            f'Applied restore for {label}; temporary restore removed'
                         )
                         restored.append((
-                            service, 'applied; temporary restore removed',
+                            label, 'applied; temporary restore removed',
                         ))
                 else:
-                    restored.append((service, str(root)))
+                    restored.append((label, str(root)))
             except Exception as err:
                 failures.record_exception(
                     service, err,
