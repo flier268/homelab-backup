@@ -17,7 +17,7 @@ pre{background:var(--dark);color:#e5e7eb;padding:17px 19px;border-radius:9px;ove
 table{width:100%;border-collapse:collapse;margin:16px 0}th,td{border:1px solid var(--line);padding:10px 11px;text-align:left;vertical-align:top}th{background:#f2f4f7}
 .box{border-left:5px solid var(--blue);background:#eff6ff;padding:14px 17px;border-radius:8px;margin:17px 0}.ok{border-color:var(--green);background:#ecfdf5}.warn{border-color:var(--amber);background:#fffbeb}
 .flow{white-space:pre-wrap;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:#f8fafc;border:1px dashed #94a3b8;padding:17px;border-radius:9px}
-.small{color:var(--muted);font-size:14px}.step{display:inline-block;background:var(--blue);color:white;border-radius:999px;padding:2px 9px;font-weight:700;font-size:13px;margin-right:7px}
+.step{display:inline-block;background:var(--blue);color:white;border-radius:999px;padding:2px 9px;font-weight:700;font-size:13px;margin-right:7px}
 @media(max-width:900px){.layout{display:block}nav{position:static;height:auto}main{padding:20px 12px 60px}.hero,section{padding:22px 18px}.hero h1{font-size:28px}}
 </style>
 </head>
@@ -442,8 +442,8 @@ sources:
 <div class="box warn">Restic 已成功後，required on-success action 失敗仍會觸發 on-failure 並讓命令回傳失敗；但已提交的 snapshot 不可能撤回，因此 state 仍記錄該次備份成功，排程不會把它當成可重試的備份失敗。</div>
 <p>HTTP GET／POST 可把 <code>curl</code> 與每個參數分別放入 command 陣列。密碼與 token 不要放進 argv 或 manifest；使用 root-only curl config、Docker secret 或 RCON 工具的密碼檔。</p>
 <div class="box warn"><code>none</code> 已移除；原本需要拒絕 writer 的設定改用 <code>external</code>，明確接受線上 fuzzy copy 才使用 <code>live</code>。</div>
-<p><code>snapshot</code> 的暫存唯讀 subvolume 固定位於來源所屬 trusted root 的 <code>.homelab-backup-snapshots</code> root-only 0700 workspace，並與來源位於同一 filesystem。建立前會以 FD 釘住來源，因此 container-owned parent 隨後被 rename 或替換不會改變實際 snapshot 來源。內部 journal 以 <code>creating</code>、<code>ready</code>、<code>deleting</code> 記錄 filesystem UUID、source UUID／subvolume ID、snapshot UUID／subvolume ID、parent UUID 與 path；每次備份的 action 前及非 dry-run maintenance 都會自動接管 crash 遺留項目，包含已停用或已移除服務。live source 已消失、rename 或重建時，舊 snapshot 仍依自身完整 identity 回收；任一 identity 不吻合則拒絕自動刪除。來源含 nested subvolume 時必須拆成各自的 source。多個獨立 subvolume 會依序完成全部 snapshot 後才開始 staging，但不宣稱它們具有跨 subvolume 的同時點原子性。</p>
-<p>Inventory 的每個 path／volume 會記錄 <code>capture_method</code>；頂層 <code>consistency</code> 則記錄實際 mode、整體 <code>guarantee</code>、staging 前後的 optional action failures 與偵測到的 writer container IDs。Restic 結果之後才執行的 success／failure action 不會回寫已提交的 snapshot inventory。命令輸出、敏感 argv 與暫存 snapshot path 不會寫入 inventory。</p>
+<p><code>snapshot</code> 的唯讀暫存 subvolume 會建立在來源所屬 trusted root 的 root-only workspace，並由 journal 安全追蹤；後續備份或 maintenance 會自動回收 crash 遺留項目。來源含 nested subvolume 時必須拆成獨立 source。多個 subvolume 依序建立 snapshot，不保證跨 subvolume 的同一時間點原子性。</p>
+<p>Inventory 會記錄各來源的 capture method、實際一致性保證、optional action failures 與偵測到的 writer；不會記錄命令輸出、敏感 argv 或暫存 snapshot 路徑。</p>
 <div class="box warn">不確定時先使用 <code>stop</code>。它較保守，也比較容易實際驗證還原結果。</div>
 </section>
 
@@ -563,83 +563,14 @@ volumes:
 
 <section id="examples">
 <h2>15. 服務範例</h2>
-<h3>Minecraft</h3>
-<pre><code>version: 1
-service: minecraft
-enabled: true
-
-schedule:
-  cron: "0 2,8,14,20 * * *"
-  retry_after: 30m
-  max_lateness: 2h
-
-retention:
-  keep_last: 8
-  keep_daily: 14
-  keep_weekly: 8
-  keep_monthly: 12
-
-compose:
-  files: [compose.yaml]
-  env_file: .env
-
-consistency:
-  mode: stop
-  timeout: 120
-  before: []
-  after: []
-
-sources:
-  paths:
-    - id: compose
-      path: compose.yaml
-    - id: env
-      path: .env
-      required: false
-    - id: data
-      path: ./data
-      exclude:
-        - logs/**
-        - crash-reports/**
-  volumes: []</code></pre>
-<h3>Ghost + MySQL named volume</h3>
-<pre><code>version: 1
-service: ghost
-enabled: true
-
-schedule:
-  cron: "0 3,15 * * *"
-  retry_after: 30m
-  max_lateness: 3h
-
-retention:
-  keep_last: 4
-  keep_daily: 14
-  keep_weekly: 8
-  keep_monthly: 12
-
-compose:
-  files: [compose.yaml]
-  env_file: .env
-
-consistency:
-  mode: stop
-  timeout: 180
-
-sources:
-  paths:
-    - id: compose
-      path: compose.yaml
-    - id: env
-      path: .env
-      required: false
-    - id: content
-      path: ./content
-
-  volumes:
-    - id: mysql-data
-      compose_volume: db-data</code></pre>
-<div class="box warn">資料庫較成熟的做法是使用 <code>hooks</code> 產生 SQL logical dump，再備份 dump。直接備份 raw MySQL volume 時，還原環境應維持相同資料庫產品與 major version。</div>
+<p>專案提供三份可直接改寫的完整 manifest：</p>
+<table>
+<tr><th>檔案</th><th>重點</th></tr>
+<tr><td><code>examples/minecraft.backup.yaml</code></td><td>停止服務後備份 bind mount。</td></tr>
+<tr><td><code>examples/ghost.backup.yaml</code></td><td>同時備份 bind mount 與 MySQL named volume。</td></tr>
+<tr><td><code>examples/palworld.backup.yaml</code></td><td>以 Btrfs snapshot 與 action 實作零停機備份。</td></tr>
+</table>
+<div class="box warn">資料庫較成熟的做法是使用 <code>hooks</code> 產生 SQL logical dump。若直接備份 raw MySQL volume，還原環境應使用相同資料庫產品與 major version。</div>
 </section>
 
 <section id="validate">
@@ -723,15 +654,14 @@ filesystem 至少保留 1 GiB。空間不足時預設中止；只有人工操作
 <code>--allow-low-space</code>，而 <code>--yes</code> 本身不會略過空間保護。</p>
 <h3><code>backup.yaml</code> 的還原規則</h3>
 <ul>
-<li>manifest 還原位置依序選擇：本機若已有唯一且合法的同 ID manifest，使用其目前位置；否則使用新快照 inventory 中已驗證的相對目錄；舊快照沒有相對目錄欄位時，才回退至 <code>services_root/&lt;service-id&gt;</code>。</li>
-<li>快照相對目錄必須是正規化的非絕對路徑，每層元件都符合安全命名規則，且最終位置仍位於 <code>services_root</code> 內；驗證完成前不會建立分類目錄或寫入 manifest。</li>
-<li>現有部署：本機 manifest 與所有 Compose files 都存在；snapshot inventory 必須與本機 project name、path/source declarations、volume mapping、volume 名稱及 labels 相符後才可覆寫。Compose service 清單只供診斷，新增或移除 service 不會單獨阻止舊 snapshot 還原。</li>
-<li>全新重建：manifest、Compose files、所有 present path與 named volume 都必須不存在，且 snapshot 中必須包含所有 required Compose file path source；資料完成後才發布 Compose files與 manifest。目錄 path 會先在私有暫存目錄完整準備再原子發布。若發布完成前失敗，會嘗試移除本次新建的 path 與 volume，使同一還原可以重跑；rollback 自身失敗時會保留原始錯誤並另外回報 cleanup 錯誤。若 path 在發布後被其他程序修改，或新建祖先已出現其他內容，則保留該路徑並警告，避免刪除外部寫入。</li>
-<li>只有部分設定或 target 存在、project identity 不明、或有其他 container 引用 target時，一律拒絕，不猜測身份也不覆寫。</li>
+<li><strong>現有部署：</strong>本機 manifest 與 Compose files 必須齊全，且 snapshot inventory 與本機的 project、來源及 volume mapping 相符，才允許覆寫。</li>
+<li><strong>全新重建：</strong>manifest、Compose files、present paths、named volumes 與相關 container references 必須全部不存在；資料準備完成後才發布 Compose files 與 manifest。</li>
+<li><strong>混合狀態：</strong>只有部分設定或 target 存在時一律拒絕，不猜測身分或覆寫。</li>
+<li>還原位置優先使用本機同 ID manifest；否則使用 snapshot 中驗證過的相對目錄，舊 snapshot 才回退至 <code>services_root/&lt;service-id&gt;</code>。</li>
 <li><code>--restore-manifest</code> 只允許更新與本機安全投影一致的 snapshot manifest。</li>
 <li>可用 <code>--keep-manifest</code> 強制保留本機 manifest。</li>
 </ul>
-<div class="box warn">資料還原期間不要關機。一般錯誤會在目前程序內嘗試 rollback；斷電不在交易保證內。重新開機後可再次執行還原；全新重建若留下 partial target，先依錯誤列出的 path／volume 確認並移除，再重跑。</div>
+<div class="box warn">資料還原期間不要關機。一般錯誤會嘗試 rollback；斷電後若留下 partial target，請依錯誤訊息確認並移除，再重新執行還原。</div>
 <p>單純下載 snapshot 時，資料放在：</p>
 <pre><code>/var/lib/homelab-backup/restores/&lt;service&gt;/&lt;timestamp&gt;</code></pre>
 <p><code>restore --apply</code> 成功後會自動刪除該次下載副本；套用失敗或只下載時會保留。可手動刪除一個、多個，或批量刪除全部保留副本：</p>
@@ -752,7 +682,8 @@ sudo backupctl cleanup-restores --all --yes</code></pre>
 <li><code>validate</code> 通過。</li>
 <li>每個服務至少成功備份一次。</li>
 <li>至少一個服務完成實際還原測試。</li>
-<li>Restic 密碼已另外保存。</li>
+<li>加密設定 archive 與對應私鑰可從主機外取得。</li>
+<li>Restic 密碼、repository 設定與 OneDrive 授權資料已有安全副本。</li>
 </ul>
 <pre><code>sudo systemctl enable --now homelab-backup.timer
 sudo systemctl enable --now homelab-backup-maintenance.timer</code></pre>
@@ -796,7 +727,6 @@ sudo backupctl snapshots</code></pre>
 <tr><td>對應 SSH 私鑰</td><td>解密設定 archive；應另外保存在 Bitwarden 或離線安全媒體。</td></tr>
 <tr><td>OneDrive Restic repository</td><td>保存服務資料、歷史 snapshots、Compose 等來源檔、自動保存的 <code>backup.yaml</code>，以及新快照中的服務相對目錄。</td></tr>
 </table>
-<p>使用 <code>sudo ./backup-configs.sh</code> 產生加密 archive；使用 <code>sudo ./restore-configs.sh</code> 貼入私鑰並放回對應系統路徑。</p>
 <div class="box ok">不需要另外備份 <code>/srv/stacks</code> 才能完成復原。用 private Git 保存 stacks 只會讓版本管理與人工查看更方便。</div>
 <div class="box warn">如果遺失 Restic 密碼，即使 OneDrive repository 還在，也無法解密資料。</div>
 </section>
@@ -838,19 +768,6 @@ docker compose logs --tail=200</code></pre>
 sudo systemctl enable --now homelab-backup-maintenance.timer</code></pre>
 </section>
 
-<section>
-<h2>部署完成條件</h2>
-<ul>
-<li>兩台主機各自使用獨立 repository。</li>
-<li>所有 manifests 通過驗證。</li>
-<li>所有重要服務有成功 snapshot。</li>
-<li>至少完成一次實際 restore + apply。</li>
-<li><code>configs/</code> 三個必要檔案已有安全的外部副本。</li>
-<li>Restic 密碼、repository 設定與 OneDrive 授權資料可在主機外取得。</li>
-<li>systemd timers 正常執行且 journal 無錯誤。</li>
-</ul>
-<p class="small">本文件按首次部署流程編排。</p>
-</section>
 </main>
 </div>
 </body>

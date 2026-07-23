@@ -147,37 +147,14 @@ timestamped 密文。
 
 ## 支援與安全邊界
 
-- 僅支援 Linux、root coordinator、本機 `ext4`／`xfs`／`btrfs` 與本機 rootful
-  Docker。trusted root 本身可以是核准 mount 或 Btrfs subvolume，其下不允許
-  其他 mount、bind mount或 nested Btrfs subvolume。
-- `sources.paths[].path` 必須嚴格位於唯一的 trusted root 之下，不能等於 trusted
-  root。trusted root 與其控制路徑必須是 root-owned、不可 group/world write 的
-  真實目錄；其下的完整資料樹可由容器 UID/GID 擁有，並可選取其中任意深層路徑。
-  程式從 trusted root 的固定 descriptor 逐層開啟來源，中間 symlink 會被拒絕；
-  還原也透過固定 descriptor 寫入，不會因可寫祖先被換名或換成 symlink 而越界。
-- 備份會自動在 snapshot inventory 記錄所選路徑祖先的數字 UID/GID 與 mode。
-  全新 rebuild 缺少資料祖先時會依此重建，因此不會把容器資料目錄猜成
-  `root:root` 或 `1000:1000`；manifest 不需增加任何欄位。沒有這項 metadata 的
-  舊快照仍可還原到祖先已存在的部署，但不會在全新 rebuild 時猜測權限。
-- payload 支援普通檔案、目錄、symlink、ACL、xattr 與 payload 內 hardlink；
-  FIFO、socket、device node會被拒絕。`snapshot` 模式只對來源本身就是 Btrfs
-  subvolume 的 path 建立唯讀 snapshot；來源內若有 nested subvolume 會拒絕，
-  必須拆成獨立 source。Restic 不保存 subvolume identity、snapshot 關係、reflink、
-  compression或 CoW 屬性。
-- `stop`、`hooks`、`external` 不允許已知 Compose/Docker writer；`live` 與
-  `snapshot` 對未受 filesystem snapshot 保護的普通 path／named volume 顯示警告，
-  並在 inventory 標成 `best-effort`。唯讀 Docker mount 不視為 writer；共用 UID
-  程序、排程與其他 privileged process 仍是 operator obligation。
-- 多個獨立 Btrfs subvolume 會先依序建立全部 snapshot，再開始 staging；這不代表
-  多個 subvolume 之間具有同一時間點的原子性。Inventory 會在每個來源記錄
-  `capture_method`，並在 `consistency` 記錄實際 mode、整體 `guarantee`、staging
-  前後的 optional action failures 與偵測到的 writer container IDs。
-- Btrfs 暫存 snapshot 固定建立在來源所屬 trusted root 的
-  `.homelab-backup-snapshots`（root-only 0700）中。建立時來源會先以 FD 釘住，
-  container-owned parent 隨後被 rename／替換也不會改變 snapshot 來源。內部
-  journal 以 `creating`、`ready`、`deleting` 保存完整 identity；每次備份執行
-  action 前及非 dry-run maintenance 都會自動回收 crash 遺留項目，包含已停用或
-  已移除服務。live source 消失或重建不會阻止舊 snapshot 精確回收。
+- 僅支援 Linux、本機 rootful Docker，以及 `ext4`、`xfs`、`btrfs`。
+- 備份 path 必須位於唯一 trusted root 之下；控制路徑由 root 管理且不可經過
+  symlink、跨 mount 或 nested Btrfs subvolume。資料樹可由容器 UID/GID 擁有。
+- 支援普通檔案、目錄、symlink、ACL、xattr 與 payload 內 hardlink；拒絕 FIFO、
+  socket 與 device node。還原會保留原始數字 UID/GID 與 mode。
+- `stop`、`hooks`、`external` 會拒絕已知 writer；`live` 與未完整受 Btrfs
+  snapshot 保護的來源只提供 `best-effort` 一致性。
+- 不支援 remote/rootless Docker、跨 mount、ZFS、ext2/3、FUSE、NFS 或 autofs。
 - 所有 Compose YAML、`compose.env_file`、Restic 密碼與 rclone 設定必須是
   root-owned、不可 group/world write 的普通檔案，且不可為 symlink。Compose
   不載入隱含 `.env` 或外部 `COMPOSE_*` 設定；需要插值時必須在 manifest 明確設定：
@@ -187,30 +164,8 @@ timestamped 密文。
     files: [compose.yaml]
     env_file: compose.env
   ```
-- staging copy、Docker named volume copy、Restic 備份與 retention 固定以 root
-  執行，以完整保存來源的數字 UID/GID、mode、ACL、xattr 與 hardlink。還原也以
-  root 套用 snapshot 內的原始 metadata；完成後的資料不會一律變成 root:root，
-  因此原本以指定 UID/GID 執行的容器仍可存取。
-- `hooks.before` 可以建立或更新 `sources.paths` 的 payload artifact；所有 required
-  Docker named volumes 必須在靜態 preflight 前已存在，不支援由 hook 動態建立。
-- `actions.before[]` 與 `actions.finally[]` 都是不經 shell 的 argv；相對 executable
-  會被拒絕。每個 action 都必須明確設定 `run_as`，可使用帳號名稱或加引號的
-  Docker 風格 `"UID:GID"`。`run_as: root` 或 `run_as: "0:0"` 的 executable 與全部父目錄必須由
-  root 擁有、不可 group/world write，且 executable 不可為 symlink。預設 timeout
-  30 秒且 `required: true`。Finally 會在模式本身的重啟、hook 恢復或 snapshot
-  清理之後執行，即使 before／staging 失敗也會嘗試執行。HTTP 可使用 `curl`，
-  RCON 可使用既有 CLI 或 `docker compose exec`。敏感值應放在 root-only 工具設定
-  或 secret，不要放入 argv。
-- `actions.on_success[]` 在 Restic snapshot 成功提交後執行；
-  `actions.on_failure[]` 在 staging、Restic、on-success 或 state 失敗時執行。
-  Failure action 會收到 `BACKUPCTL_FAILURE_PHASE`、`BACKUPCTL_FAILURE_TYPE`、
-  `BACKUPCTL_FAILURE_REASON`、`BACKUPCTL_FAILURE_SERVICE` 與
-  `BACKUPCTL_FAILURE_SECONDARY`。這些環境變數不包含命令輸出
-  或 argv；若 failure action 使用 `docker exec`，必須自行明確轉交需要的變數給容器。
-- Snapshot 中的 Compose service 清單僅供診斷；現有部署的授權比對使用 project
-  name、path/source declarations 與 logical-to-actual volume mapping。
-- 不支援 remote/rootless Docker、跨 mount、ZFS、
-  ext2/3、FUSE、NFS、autofs，或未經本機 manifest 授權就覆寫既有 volume。
+- Actions 不經 shell，必須指定 `run_as`，且不可把密碼或 token 放入 argv。
+  完整欄位、writer 判定與 Btrfs 限制請見 `GUIDE.html`。
 
 從預設加密檔放回系統，依提示貼入 SSH 私鑰並解密：
 
@@ -268,59 +223,11 @@ sudo backupctl restore --all \
   --restore-manifest --apply --start --yes
 ```
 
-查詢指定服務的 snapshot：
-
-```bash
-sudo backupctl snapshots minecraft
-```
-
-指定服務的 snapshot 清單會追加唯讀 retention preview，顯示每份 snapshot
-目前符合的保留原因（例如 last、daily、weekly）以及 policy 將移除的項目；
-preview 不會執行 forget 或 prune。
-
-指定歷史 snapshot ID 時只允許單一服務；程式會先確認該 ID 屬於目前
-host 與指定的 service tag，再開始下載：
-
-```bash
-sudo backupctl restore minecraft --snapshot 01234567 --apply
-```
-
-刪除指定 snapshot 時也會先驗證目前 host 與 service tag。互動模式會再次
-確認；非互動模式必須指定 `--yes`。預設只移除 snapshot metadata，未被引用的
-repository 資料會在下次 maintenance 回收；需要立即回收可加 `--prune`：
-
-```bash
-sudo backupctl delete-snapshot minecraft 01234567
-sudo backupctl delete-snapshot minecraft 01234567 --prune --yes
-```
-
 安全政策：只要 stdin 不是 TTY，所有 `restore`（包含只下載、不加
 `--apply`）都必須明確指定 `--yes`。
 
-下載每個 service 前，程式會以 Restic 的 `restore-size` 估算 snapshot 展開後的
-大小，並確認 `restore_root` 所在檔案系統完成下載後至少還有 1 GiB 可用空間。
-空間不足時會顯示估算值與缺口：互動模式可再次確認後繼續；非互動模式必須另外
-明確指定 `--allow-low-space`。`--yes` 本身不會略過磁碟空間保護。
-
-`restore --apply` 成功後會自動刪除該次下載的暫存副本；套用失敗或單純下載
-則保留，方便檢查或稍後手動套用。手動刪除指定副本或批量刪除全部副本：
-
-```bash
-sudo backupctl cleanup-restores minecraft/20260717-120000-000000001 --yes
-sudo backupctl cleanup-restores \
-  minecraft/20260717-120000-000000001 \
-  ghost/20260717-120500-000000002 --yes
-sudo backupctl cleanup-restores --all --yes
-```
-
-全新重建若在發布 Compose／manifest 前失敗，會嘗試移除本次新建的
-path 與 Docker volume，讓相同還原可安全重跑；任何 rollback 失敗會保留
-原始錯誤並另外列出 cleanup 錯誤。若 path 在發布後被其他程序修改，或本次
-建立的祖先目錄已出現其他內容，rollback 會保留該路徑並警告，不會把外部
-寫入視為本次還原所擁有的資料。
-
-安裝、設定還原與資料還原期間均不要關機。一般錯誤會在目前程序內回滾；
-斷電不在原子性保證內。重新開機後可重新執行相同命令；全新重建若留下
-partial target，先依錯誤訊息確認並移除該 path／volume，再重跑。
+還原前會檢查 snapshot 身分與可用空間；`--yes` 不會略過空間保護。現有部署
+必須通過 manifest 交叉驗證，全新重建則要求所有 target 都不存在；混合狀態
+一律拒絕。歷史 snapshot、刪除與 restore workspace 清理方式請見 `GUIDE.html`。
 
 完整說明請開啟 `GUIDE.html`。
