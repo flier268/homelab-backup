@@ -42,6 +42,10 @@ sudo ./install.sh
 會在 CI 全數通過時自動建立 Release、產生 release notes，並附上 archive 與
 checksum。一般 push 與 pull request 只執行 CI，不會發布。
 
+升版時只需修改 `homelab_backup/__init__.py` 的 `VERSION`，不必全域取代測試
+內容。提交並確認 CI 通過後，建立完全相同版本的 `vX.Y.Z` tag 並推送；
+Release workflow 會拒絕 tag 與 `VERSION` 不一致的發布。
+
 安裝期間不要關機；若因斷電中止，重新執行同一個 `install.sh` 讓完整 release
 重新發布。安裝器不維護跨斷電 transaction journal。
 

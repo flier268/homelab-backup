@@ -10,6 +10,7 @@ from unittest import mock
 import cronsim
 import yaml
 
+from homelab_backup import VERSION
 from homelab_backup import cli
 from homelab_backup import common
 
@@ -160,7 +161,9 @@ class LauncherTests(unittest.TestCase):
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
                 if argument == '--version':
-                    self.assertEqual(result.stdout.strip(), 'backupctl 1.0.5')
+                    self.assertEqual(
+                        result.stdout.strip(), f'backupctl {VERSION}',
+                    )
 
     def test_installed_layout_launcher_supports_help_and_version(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -213,7 +216,9 @@ class LauncherTests(unittest.TestCase):
                     )
                     self.assertEqual(result.returncode, 0, result.stderr)
                     if argument == '--version':
-                        self.assertEqual(result.stdout.strip(), 'backupctl 1.0.5')
+                        self.assertEqual(
+                            result.stdout.strip(), f'backupctl {VERSION}',
+                        )
 
 
 if __name__ == '__main__':

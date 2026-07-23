@@ -12,6 +12,15 @@ from urllib.error import URLError
 from homelab_backup import upgrade
 
 
+CURRENT_VERSION = upgrade.VERSION
+CURRENT_VERSION_PARTS = tuple(
+    int(part) for part in CURRENT_VERSION.split('.')
+)
+NEXT_VERSION = '.'.join(str(part) for part in (
+    *CURRENT_VERSION_PARTS[:2], CURRENT_VERSION_PARTS[2] + 1,
+))
+
+
 class DownloadResponse(io.BytesIO):
     def __init__(self, content, *, content_length=None):
         super().__init__(content)
@@ -27,7 +36,7 @@ class DownloadResponse(io.BytesIO):
 
 
 def release_archive(
-    version='1.0.6', extra=(), *, include_installer=True,
+    version=NEXT_VERSION, extra=(), *, include_installer=True,
     installer_mode=0o755,
 ):
     output = io.BytesIO()
@@ -79,7 +88,7 @@ class InstalledLayout:
 
 
 class UpgradeTests(unittest.TestCase):
-    def checksum(self, archive, version='1.0.6'):
+    def checksum(self, archive, version=NEXT_VERSION):
         name = f'homelab-backup-{version}.tar.gz'
         digest = hashlib.sha256(archive).hexdigest()
         return f'{digest}  {name}\n'.encode('ascii')
@@ -96,7 +105,8 @@ class UpgradeTests(unittest.TestCase):
 
     def test_same_version_is_a_noop_without_archive_download(self):
         checksum = (
-            b'0' * 64 + b'  homelab-backup-1.0.5.tar.gz\n'
+            b'0' * 64
+            + f'  homelab-backup-{CURRENT_VERSION}.tar.gz\n'.encode('ascii')
         )
         with tempfile.TemporaryDirectory() as tmp, InstalledLayout(tmp), \
                 mock.patch.object(
@@ -170,9 +180,11 @@ class UpgradeTests(unittest.TestCase):
 
     def test_older_latest_release_is_rejected_without_archive_download(self):
         checksum = (
-            b'0' * 64 + b'  homelab-backup-1.0.4.tar.gz\n'
+            b'0' * 64
+            + f'  homelab-backup-{CURRENT_VERSION}.tar.gz\n'.encode('ascii')
         )
         with tempfile.TemporaryDirectory() as tmp, InstalledLayout(tmp), \
+                mock.patch.object(upgrade, 'VERSION', NEXT_VERSION), \
                 mock.patch.object(
                     upgrade, 'urlopen',
                     return_value=DownloadResponse(checksum),
@@ -186,7 +198,10 @@ class UpgradeTests(unittest.TestCase):
         installer.assert_not_called()
 
     def test_checksum_download_rejects_network_and_content_errors(self):
-        valid = b'0' * 64 + b'  homelab-backup-1.0.6.tar.gz\n'
+        valid = (
+            b'0' * 64
+            + f'  homelab-backup-{NEXT_VERSION}.tar.gz\n'.encode('ascii')
+        )
         cases = (
             ('network', URLError('offline'), 'checksum download failed'),
             (
@@ -246,13 +261,13 @@ class UpgradeTests(unittest.TestCase):
                 destination = Path(tmp) / 'release.tar.gz'
                 with self.assertRaisesRegex(upgrade.UpgradeError, message):
                     upgrade._download_archive(
-                        'homelab-backup-1.0.6.tar.gz',
+                        f'homelab-backup-{NEXT_VERSION}.tar.gz',
                         digest,
                         destination,
                     )
 
     def test_archive_validation_rejects_unsafe_members(self):
-        root = 'homelab-backup-1.0.6'
+        root = f'homelab-backup-{NEXT_VERSION}'
         cases = []
         traversal = tarfile.TarInfo(f'{root}/../escape')
         traversal.mode = 0o644
@@ -274,7 +289,10 @@ class UpgradeTests(unittest.TestCase):
         fifo = tarfile.TarInfo(f'{root}/fifo')
         fifo.type = tarfile.FIFOTYPE
         cases.append(('fifo', ((fifo, None),), True, 'unsupported member'))
-        wrong_version = tarfile.TarInfo('homelab-backup-1.0.7/file')
+        wrong_version = tarfile.TarInfo(
+            f'homelab-backup-{CURRENT_VERSION_PARTS[0]}.'
+            f'{CURRENT_VERSION_PARTS[1]}.{CURRENT_VERSION_PARTS[2] + 2}/file'
+        )
         wrong_version.mode = 0o644
         cases.append(
             ('wrong-version', ((wrong_version, b'x'),), True, 'outside'),
@@ -293,7 +311,7 @@ class UpgradeTests(unittest.TestCase):
                 destination.mkdir()
                 with self.assertRaisesRegex(upgrade.UpgradeError, message):
                     upgrade._extract_archive(
-                        archive_path, destination, '1.0.6',
+                        archive_path, destination, NEXT_VERSION,
                     )
 
     def test_archive_validation_rejects_unsafe_installer_permissions(self):
@@ -307,7 +325,7 @@ class UpgradeTests(unittest.TestCase):
                     upgrade.UpgradeError, 'invalid install.sh',
                 ):
                     upgrade._extract_archive(
-                        archive_path, destination, '1.0.6',
+                        archive_path, destination, NEXT_VERSION,
                     )
 
     def test_installer_runs_bash_in_release_root_and_propagates_failure(self):
