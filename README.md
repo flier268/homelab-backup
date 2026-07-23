@@ -45,6 +45,28 @@ checksum。一般 push 與 pull request 只執行 CI，不會發布。
 安裝期間不要關機；若因斷電中止，重新執行同一個 `install.sh` 讓完整 release
 重新發布。安裝器不維護跨斷電 transaction journal。
 
+## 升級
+
+已安裝的版本可直接升級至 GitHub Releases 的最新穩定版：
+
+```bash
+sudo backupctl upgrade
+```
+
+此指令只允許從 `/usr/local/sbin/backupctl` 的 installed layout 執行，不支援從
+Git checkout 啟動。它會先下載最新 Release 的 `SHA256SUMS`，確認版本高於目前
+版本後才下載對應的 `homelab-backup-X.Y.Z.tar.gz`；若已是最新版則直接成功結束，
+不下載 archive，也不允許降版或安裝 prerelease。
+
+archive 必須完整符合 Release 內的 SHA-256，且封裝只能包含預期的單一版本目錄、
+一般檔案與目錄，通過路徑及 `install.sh` 驗證後才會交給既有安裝器。checksum
+與 archive 都透過 GitHub HTTPS 下載；此校驗沿用 Release 的 `SHA256SUMS`，
+不另外提供獨立簽章信任根。
+
+下載、校驗、解壓或安裝任一步驟失敗時，暫存內容都會清除。既有安裝器只有在
+Python runtime、鎖定依賴、Docker helper、launcher 與 systemd units 全部準備
+完成後才原子切換 `current`；失敗時目前版本仍維持啟用。
+
 接著：
 
 1. 設定 OneDrive rclone remote。

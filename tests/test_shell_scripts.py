@@ -322,6 +322,21 @@ class RestoreConfigsTests(unittest.TestCase):
 
 
 class DeploymentScriptTests(unittest.TestCase):
+    def test_release_archive_uses_permissions_accepted_by_upgrader(self):
+        workflow = (
+            ROOT / '.github' / 'workflows' / 'ci-release.yml'
+        ).read_text(encoding='utf-8')
+        attributes = (
+            ROOT / '.gitattributes'
+        ).read_text(encoding='utf-8').splitlines()
+
+        self.assertIn('git -c tar.umask=0022 archive', workflow)
+        self.assertEqual(attributes, [
+            '/.codegraph export-ignore',
+            '/.github export-ignore',
+            '/.gitignore export-ignore',
+        ])
+
     def test_git_archive_commit_failure_restores_file_and_exact_index(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

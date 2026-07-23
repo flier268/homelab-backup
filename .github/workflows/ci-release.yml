@@ -113,7 +113,7 @@ jobs:
           version="${RELEASE_TAG#v}"
           archive="homelab-backup-${version}.tar"
           mkdir -p dist
-          git archive \
+          git -c tar.umask=0022 archive \
             --format=tar \
             --prefix="homelab-backup-${version}/" \
             --output="dist/$archive" \

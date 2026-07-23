@@ -17,6 +17,7 @@ from .maintenance import (
 from .restore import (
     cmd_apply, cmd_cleanup_restores, cmd_delete_snapshot, cmd_restore,
 )
+from .upgrade import UpgradeError, cmd_upgrade
 
 
 COMMANDS = {
@@ -116,6 +117,7 @@ def build_parser():
     command = sub.add_parser('check')
     command.add_argument('--no-wait', action='store_true')
     sub.add_parser('unlock')
+    sub.add_parser('upgrade')
     return parser
 
 
@@ -125,6 +127,9 @@ def main(argv=None):
         print('ERROR: backupctl must run as root', file=sys.stderr)
         raise SystemExit(1)
     try:
+        if args.cmd == 'upgrade':
+            cmd_upgrade(args)
+            return
         while True:
             selected_lock = config_lock_file()
             with GlobalLock(
@@ -139,6 +144,9 @@ def main(argv=None):
                     continue
                 COMMANDS[args.cmd](config, args)
                 break
+    except UpgradeError as err:
+        print(f'ERROR: {err}', file=sys.stderr)
+        raise SystemExit(1)
     except CommandError as err:
         if not err.reported:
             _print_command_failure(err)
