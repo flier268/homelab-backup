@@ -344,6 +344,23 @@ class ManifestValidationTests(unittest.TestCase):
 
 
 class GlobalConfigValidationTests(unittest.TestCase):
+    def test_secure_config_read_error_includes_suggested_fix(self):
+        error = ValueError('control file is group/world writable')
+        error.suggested_command = (
+            'sudo', 'chmod', 'go-w', '--', '/etc/homelab-backup/config.yaml',
+        )
+        output = StringIO()
+
+        with mock.patch.object(config, 'load_yaml', side_effect=error), \
+                redirect_stderr(output), self.assertRaises(SystemExit):
+            config._load_config()
+
+        self.assertIn(
+            'suggested fix: sudo chmod go-w -- '
+            '/etc/homelab-backup/config.yaml',
+            output.getvalue(),
+        )
+
     @staticmethod
     def config_data(root):
         return {

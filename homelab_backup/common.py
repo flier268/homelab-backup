@@ -20,6 +20,18 @@ def format_bytes(value):
         amount /= 1024
 
 
+def format_remediable_error(context, error):
+    message = f'{context}: {error}'
+    command = getattr(error, 'suggested_command', None)
+    if command:
+        message += f'\n    suggested fix: {shlex.join(command)}'
+    else:
+        action = getattr(error, 'suggested_action', None)
+        if action:
+            message += f'\n    suggested action: {action}'
+    return message
+
+
 def die(msg):
     print(f'ERROR: {msg}', file=sys.stderr)
     raise SystemExit(1)

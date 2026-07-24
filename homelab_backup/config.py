@@ -3,7 +3,7 @@ from pathlib import Path
 
 import yaml
 
-from .common import die, load_yaml
+from .common import die, format_remediable_error, load_yaml
 from .security import lexical_absolute, paths_overlap
 from .types import GlobalConfig
 
@@ -16,7 +16,7 @@ def _load_config():
     except FileNotFoundError:
         die(f'missing {CFG}')
     except (OSError, UnicodeError, ValueError, yaml.YAMLError) as err:
-        die(f'cannot securely read {CFG}: {err}')
+        die(format_remediable_error(f'cannot securely read {CFG}', err))
 
 
 def _validate_config_header(c):

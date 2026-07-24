@@ -34,6 +34,41 @@ class MountRecord:
     source: str
 
 
+class RemediableValidationError(ValueError):
+    def __init__(
+            self, message, *, suggested_command=None, suggested_action=None,
+    ):
+        super().__init__(message)
+        if (suggested_command is None) == (suggested_action is None):
+            raise ValueError(
+                'a remediable validation error needs exactly one suggestion'
+            )
+        self.suggested_command = (
+            None if suggested_command is None
+            else tuple(str(item) for item in suggested_command)
+        )
+        self.suggested_action = suggested_action
+
+
+def _permission_error(
+        message, operation, path, *, owner_uid=0, command_allowed=True,
+):
+    if not command_allowed:
+        return RemediableValidationError(
+            message,
+            suggested_action=(
+                'review this directory manually or relocate the configured '
+                f'path; do not automatically modify directory permissions: {path}'
+            ),
+        )
+    if operation == 'chown':
+        owner = 'root' if owner_uid == 0 else str(owner_uid)
+        command = ('sudo', 'chown', owner, '--', str(path))
+    else:
+        command = ('sudo', 'chmod', 'go-w', '--', str(path))
+    return RemediableValidationError(message, suggested_command=command)
+
+
 def mount_records(path=None):
     path = MOUNTINFO_PATH if path is None else path
     try:
@@ -109,14 +144,21 @@ def validate_control_directory(path, *, allow_missing=False, owner_uid=None):
         if not stat.S_ISDIR(metadata.st_mode):
             raise ValueError(f'control path component is not a real directory: {component}')
         if metadata.st_uid not in allowed_owners:
-            raise ValueError(f'control directory is not owned by root: {component}')
+            raise _permission_error(
+                f'control directory is not owned by root: {component}',
+                'chown', component, owner_uid=owner_uid,
+                command_allowed=False,
+            )
         if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
             if not (
                 effective_uid != 0
                 and metadata.st_uid == 0
                 and metadata.st_mode & stat.S_ISVTX
             ):
-                raise ValueError(f'control directory is group/world writable: {component}')
+                raise _permission_error(
+                    f'control directory is group/world writable: {component}',
+                    'chmod', component, command_allowed=False,
+                )
     return path
 
 
@@ -149,9 +191,15 @@ def read_control_text(path, *, encoding='utf-8', require_protected=True):
             if os.geteuid() != 0:
                 allowed_owners.add(os.geteuid())
             if metadata.st_uid not in allowed_owners:
-                raise ValueError(f'control file is not owned by root: {path}')
+                raise _permission_error(
+                    f'control file is not owned by root: {path}',
+                    'chown', path,
+                )
             if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-                raise ValueError(f'control file is group/world writable: {path}')
+                raise _permission_error(
+                    f'control file is group/world writable: {path}',
+                    'chmod', path,
+                )
         with io.TextIOWrapper(os.fdopen(fd, 'rb', closefd=False), encoding=encoding) as source:
             return source.read()
     finally:
@@ -189,10 +237,14 @@ def validate_control_file(path, *, require_protected=True):
             if os.geteuid() != 0:
                 allowed_owners.add(os.geteuid())
             if metadata.st_uid not in allowed_owners:
-                raise ValueError(f'control file is not owned by root: {path}')
+                raise _permission_error(
+                    f'control file is not owned by root: {path}',
+                    'chown', path,
+                )
             if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-                raise ValueError(
-                    f'control file is group/world writable: {path}'
+                raise _permission_error(
+                    f'control file is group/world writable: {path}',
+                    'chmod', path,
                 )
         return path
     finally:

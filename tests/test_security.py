@@ -52,6 +52,85 @@ class MountPolicyTests(unittest.TestCase):
                 security.validate_control_root(root, records=nested)
 
 
+class ControlPathPermissionTests(unittest.TestCase):
+    def test_writable_shared_ancestor_does_not_suggest_chmod(self):
+        shared = Path('/tmp')
+        target = shared / 'homelab-backup'
+        metadata = SimpleNamespace(
+            st_mode=security.stat.S_IFDIR | 0o1777,
+            st_uid=0,
+        )
+
+        with mock.patch.object(
+            security, '_components', return_value=(shared, target),
+        ), mock.patch.object(
+            security.os, 'lstat', return_value=metadata,
+        ), mock.patch.object(
+            security.os, 'geteuid', return_value=0,
+        ), self.assertRaises(ValueError) as caught:
+            security.validate_control_directory(target)
+
+        self.assertIsNone(
+            getattr(caught.exception, 'suggested_command', None),
+        )
+        self.assertIn(str(shared), caught.exception.suggested_action)
+
+    def test_user_owned_shared_ancestor_does_not_suggest_chown(self):
+        shared = Path('/home/alice')
+        target = shared / 'homelab-backup'
+        metadata = SimpleNamespace(
+            st_mode=security.stat.S_IFDIR | 0o755,
+            st_uid=1000,
+        )
+
+        with mock.patch.object(
+            security, '_components', return_value=(shared, target),
+        ), mock.patch.object(
+            security.os, 'lstat', return_value=metadata,
+        ), mock.patch.object(
+            security.os, 'geteuid', return_value=0,
+        ), self.assertRaises(ValueError) as caught:
+            security.validate_control_directory(target)
+
+        self.assertIsNone(
+            getattr(caught.exception, 'suggested_command', None),
+        )
+        self.assertIn(str(shared), caught.exception.suggested_action)
+
+    def test_writable_control_file_provides_a_safe_chmod_command(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'secret with spaces'
+            path.write_text('secret', encoding='utf-8')
+            path.chmod(0o666)
+
+            with mock.patch.object(security, 'validate_control_directory'), \
+                    self.assertRaises(ValueError) as caught:
+                security.validate_control_file(path)
+
+            self.assertEqual(
+                caught.exception.suggested_command,
+                ('sudo', 'chmod', 'go-w', '--', str(path)),
+            )
+
+    def test_writable_control_directory_requires_manual_review(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'writable'
+            path.mkdir()
+            path.chmod(0o777)
+            try:
+                with mock.patch.object(
+                    security, '_components', return_value=(path,),
+                ), self.assertRaises(ValueError) as caught:
+                    security.validate_control_directory(path)
+            finally:
+                path.chmod(0o755)
+
+            self.assertIsNone(caught.exception.suggested_command)
+            self.assertIn(
+                str(path), caught.exception.suggested_action,
+            )
+
+
 class PayloadPolicyTests(unittest.TestCase):
     def test_btrfs_nested_subvolume_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:

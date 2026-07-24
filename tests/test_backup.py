@@ -105,6 +105,34 @@ class GhostHookExampleTests(unittest.TestCase):
             self.assertFalse(any('compose stop' in item for item in commands))
             self.assertFalse(any('compose start' in item for item in commands))
 
+
+class ValidationDiagnosticTests(unittest.TestCase):
+    def test_manual_remediation_is_rendered_without_a_command(self):
+        error = ValueError('shared ancestor is writable')
+        error.suggested_action = (
+            'relocate the configured path; do not modify /tmp automatically'
+        )
+
+        self.assertEqual(
+            common.format_remediable_error('unsafe control path', error),
+            'unsafe control path: shared ancestor is writable\n'
+            '    suggested action: relocate the configured path; '
+            'do not modify /tmp automatically',
+        )
+
+    def test_permission_error_includes_shell_quoted_suggested_command(self):
+        error = ValueError('control file is group/world writable')
+        error.suggested_command = (
+            'sudo', 'chmod', 'go-w', '--', '/etc/example path/config',
+        )
+
+        self.assertEqual(
+            common.format_remediable_error('unsafe config file', error),
+            'unsafe config file: control file is group/world writable\n'
+            "    suggested fix: sudo chmod go-w -- '/etc/example path/config'",
+        )
+
+
 class StagingLifecycleTests(unittest.TestCase):
     def test_hook_may_create_a_required_path_before_dynamic_validation(self):
         value = manifest(self.root, consistency={'mode': 'hooks'}, sources={

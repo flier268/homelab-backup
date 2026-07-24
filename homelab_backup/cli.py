@@ -8,7 +8,9 @@ from .backup import (
     cmd_init,
     cmd_validate,
 )
-from .common import CommandError, GlobalLock, _print_command_failure
+from .common import (
+    CommandError, GlobalLock, _print_command_failure, format_remediable_error,
+)
 from .config import cfg, config_lock_file
 from .maintenance import (
     cmd_check, cmd_list, cmd_maintenance, cmd_run_due, cmd_snapshots,
@@ -157,7 +159,10 @@ def main(argv=None):
     except SystemExit:
         raise
     except Exception as err:
-        print(f'ERROR: {type(err).__name__}: {err}', file=sys.stderr)
+        print(
+            f'ERROR: {format_remediable_error(type(err).__name__, err)}',
+            file=sys.stderr,
+        )
         print('Run with BACKUPCTL_DEBUG=1 to display a Python traceback.', file=sys.stderr)
         if os.environ.get('BACKUPCTL_DEBUG') == '1':
             raise

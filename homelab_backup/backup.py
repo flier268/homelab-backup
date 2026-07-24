@@ -12,7 +12,7 @@ from .actions import (
 from .backup_state import load_state, save_state
 from .common import (
     CommandError, FailureSummary, GlobalLock, _print_command_failure, die,
-    restic_env, run, run_cleanup,
+    format_remediable_error, restic_env, run, run_cleanup,
 )
 from .manifest import (
     RETENTION_FLAGS, compose_model, manifest, manifests, service_label,
@@ -333,12 +333,16 @@ def cmd_validate(c, args):
     try:
         validate_trusted_roots(c['trusted_data_roots'])
     except (OSError, ValueError, RuntimeError) as err:
-        errors.append(f'trusted_data_roots are unsupported: {err}')
+        errors.append(format_remediable_error(
+            'trusted_data_roots are unsupported', err,
+        ))
     for key in ('staging_root', 'restore_root'):
         try:
             validate_control_root(c[key])
         except (OSError, ValueError, RuntimeError) as err:
-            errors.append(f'{key} is unsupported: {err}')
+            errors.append(format_remediable_error(
+                f'{key} is unsupported', err,
+            ))
     for command in ['docker', 'restic', 'rclone', 'rsync']:
         if not shutil.which(command):
             errors.append(f'missing command: {command}')
@@ -347,7 +351,9 @@ def cmd_validate(c, args):
             validate_docker_environment()
             validate_docker_bind_probe(c)
         except (CommandError, OSError, ValueError, RuntimeError) as err:
-            errors.append(f'Docker environment is unsupported: {err}')
+            errors.append(format_remediable_error(
+                'Docker environment is unsupported', err,
+            ))
         try:
             run(['docker', 'compose', 'version'])
         except CommandError as err:
@@ -361,10 +367,13 @@ def cmd_validate(c, args):
         try:
             validate_control_file(c[key])
         except (OSError, ValueError) as err:
-            errors.append(f'unsafe config file {c[key]}: {err}')
+            errors.append(format_remediable_error(
+                f'unsafe config file {c[key]}', err,
+            ))
     def record_manifest_error(path, err):
-        print(f'ERROR: {path}: {err}', file=sys.stderr)
-        errors.append(f'{path}: {err}')
+        message = format_remediable_error(str(path), err)
+        print(f'ERROR: {message}', file=sys.stderr)
+        errors.append(message)
 
     ms = manifests(
         c,
@@ -407,8 +416,9 @@ def cmd_validate(c, args):
         except CommandError:
             errors.append(f'{label}: Docker Compose configuration failed')
         except (OSError, ValueError, RuntimeError, KeyError, TypeError) as err:
-            print(f'ERROR: {label}: {err}', file=sys.stderr)
-            errors.append(f'{label}: {err}')
+            message = format_remediable_error(label, err)
+            print(f'ERROR: {message}', file=sys.stderr)
+            errors.append(message)
     if errors:
         print('\nVALIDATION FAILED', file=sys.stderr)
         for item in errors:
