@@ -2,6 +2,7 @@ import datetime as dt
 import json
 import math
 import os
+import re
 import stat
 from pathlib import Path
 
@@ -53,6 +54,16 @@ def save_state(c: GlobalConfig, service: str, state: BackupState):
     atomic_write_json(path, state)
 
 
+def invalidate_snapshot_fingerprint(c: GlobalConfig, service: str):
+    state = load_state(c, service)
+    changed = False
+    for field in ('last_snapshot_fingerprint', 'last_snapshot_context'):
+        if state.pop(field, None) is not None:
+            changed = True
+    if changed:
+        save_state(c, service, state)
+
+
 def parse_iso(value):
     if not isinstance(value, str) or not value:
         return None
@@ -71,7 +82,8 @@ def validate_state(data, *, service, source='backup state') -> BackupState:
     allowed = {
         'service', 'first_seen_at', 'last_result', 'last_success_at',
         'last_attempt_at', 'last_finished_at', 'last_duration_seconds',
-        'last_error', 'last_retention_error',
+        'last_error', 'last_retention_error', 'last_snapshot_fingerprint',
+        'last_snapshot_context',
     }
     unknown = sorted(set(data) - allowed)
     if unknown:
@@ -93,9 +105,20 @@ def validate_state(data, *, service, source='backup state') -> BackupState:
         if isinstance(duration, bool) or not isinstance(duration, (int, float)) \
                 or not math.isfinite(duration) or duration < 0:
             raise ValueError(f'{source}: last_duration_seconds must be non-negative')
-    for field in ('last_error', 'last_retention_error'):
+    for field in (
+            'last_error', 'last_retention_error', 'last_snapshot_fingerprint',
+            'last_snapshot_context',
+    ):
         if field in data and data[field] is not None and not isinstance(data[field], str):
             raise ValueError(f'{source}: {field} must be a string or null')
+    for field in ('last_snapshot_fingerprint', 'last_snapshot_context'):
+        fingerprint = data.get(field)
+        if fingerprint is not None and not re.fullmatch(
+                r'sha256:[0-9a-f]{64}', fingerprint,
+        ):
+            raise ValueError(
+                f'{source}: {field} must be a SHA-256 fingerprint'
+            )
     return data
 
 

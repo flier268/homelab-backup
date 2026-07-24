@@ -103,6 +103,7 @@ class ServiceManifest(TypedDict, total=False):
     service: str
     name: str
     enabled: bool
+    create_snapshot_if_unchanged: bool
     schedule: ScheduleConfig
     retention: RetentionConfig
     compose: ComposeConfig
@@ -126,3 +127,5 @@ class BackupState(TypedDict, total=False):
     last_duration_seconds: float
     last_error: Optional[str]
     last_retention_error: Optional[str]
+    last_snapshot_fingerprint: str
+    last_snapshot_context: str

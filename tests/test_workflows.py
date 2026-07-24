@@ -1,13 +1,16 @@
 import datetime as dt
 import io
+import json
 import os
 import tempfile
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 from homelab_backup import backup, restore, restore_apply
+from homelab_backup.fingerprint import snapshot_context_fingerprint
 from tests.helpers import manifest
 
 
@@ -31,6 +34,7 @@ class WorkflowDependencyTests(unittest.TestCase):
             value = manifest(Path(tmp))
             config = {
                 'host_id': 'host',
+                'repository': 'repo-one',
                 'staging_root': str(Path(tmp) / 'stage-root'),
             }
             stage = Path(tmp) / 'stage'
@@ -55,6 +59,8 @@ class WorkflowDependencyTests(unittest.TestCase):
                 cleanup=lambda callback, _label: callback(),
                 remove_stage=lambda _path: events.append('remove-stage'),
                 print_command_failure=lambda *_args, **_kwargs: None,
+                fingerprint=lambda _stage: 'sha256:' + '1' * 64,
+                repository_id=lambda _c: 'a' * 64,
             )
 
             result = backup.BackupWorkflow(
@@ -71,12 +77,17 @@ class WorkflowDependencyTests(unittest.TestCase):
             )
             self.assertEqual(saved[0]['last_result'], 'running')
             self.assertEqual(saved[-1]['last_result'], 'success')
+            self.assertEqual(
+                saved[-1]['last_snapshot_fingerprint'],
+                'sha256:' + '1' * 64,
+            )
 
     def test_backup_cleanup_failure_is_postcommit_and_preserves_first_error(self):
         with tempfile.TemporaryDirectory() as tmp:
             value = manifest(Path(tmp))
             config = {
                 'host_id': 'host',
+                'repository': 'repo-one',
                 'staging_root': str(Path(tmp) / 'stage-root'),
             }
             stage = Path(tmp) / 'stage'
@@ -121,6 +132,8 @@ class WorkflowDependencyTests(unittest.TestCase):
                 cleanup=lambda callback, _label: callback(),
                 remove_stage=remove_stage,
                 print_command_failure=lambda *_args, **_kwargs: None,
+                fingerprint=lambda _stage: 'sha256:' + '1' * 64,
+                repository_id=lambda _c: 'a' * 64,
             )
 
             with redirect_stderr(stderr), self.assertRaises(OSError) as caught:
@@ -152,6 +165,224 @@ class WorkflowDependencyTests(unittest.TestCase):
                 'OSError: state filesystem unavailable',
                 stderr.getvalue(),
             )
+
+    def test_unchanged_backup_skips_snapshot_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            value = manifest(Path(tmp))
+            fingerprint = 'sha256:' + '1' * 64
+            config = {
+                'host_id': 'host',
+                'repository': 'repo-one',
+                'staging_root': str(Path(tmp) / 'stage-root'),
+            }
+            repository_id = 'a' * 64
+            commands = []
+            stage = Path(tmp) / 'stage'
+            moments = iter((
+                dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc),
+                dt.datetime(2026, 1, 1, 0, 0, 5, tzinfo=dt.timezone.utc),
+            ))
+            dependencies = backup.BackupDependencies(
+                now=lambda: next(moments),
+                load_state=lambda _c, _service: {
+                    'last_snapshot_fingerprint': fingerprint,
+                    'last_snapshot_context':
+                        snapshot_context_fingerprint(config, repository_id),
+                },
+                save_state=lambda *_args: None,
+                stage=lambda _c, _m: stage,
+                check_space=lambda *_args, **_kwargs: None,
+                run_command=lambda command, **_kwargs:
+                commands.append(command),
+                restic_environment=lambda _c: {},
+                success_actions=lambda _m: None,
+                failure_actions=lambda *_args, **_kwargs: None,
+                cleanup=lambda callback, _label: callback(),
+                remove_stage=lambda _path: None,
+                print_command_failure=lambda *_args, **_kwargs: None,
+                fingerprint=lambda _stage: fingerprint,
+                repository_id=lambda _c: repository_id,
+            )
+
+            backup.BackupWorkflow(
+                config,
+                value,
+                dependencies=dependencies,
+            ).execute()
+
+            self.assertFalse(any(
+                command[:2] == ['restic', 'backup']
+                for command in commands
+            ))
+            self.assertTrue(any(
+                command[:2] == ['restic', 'forget']
+                for command in commands
+            ))
+
+    def test_setting_can_create_snapshot_when_content_is_unchanged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            value = manifest(
+                Path(tmp), create_snapshot_if_unchanged=True,
+            )
+            fingerprint = 'sha256:' + '1' * 64
+            config = {
+                'host_id': 'host',
+                'repository': 'repo-one',
+                'staging_root': str(Path(tmp) / 'stage-root'),
+            }
+            repository_id = 'a' * 64
+            commands = []
+            stage = Path(tmp) / 'stage'
+            moments = iter((
+                dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc),
+                dt.datetime(2026, 1, 1, 0, 0, 5, tzinfo=dt.timezone.utc),
+            ))
+            dependencies = backup.BackupDependencies(
+                now=lambda: next(moments),
+                load_state=lambda _c, _service: {
+                    'last_snapshot_fingerprint': fingerprint,
+                    'last_snapshot_context':
+                        snapshot_context_fingerprint(config, repository_id),
+                },
+                save_state=lambda *_args: None,
+                stage=lambda _c, _m: stage,
+                check_space=lambda *_args, **_kwargs: None,
+                run_command=lambda command, **_kwargs:
+                commands.append(command),
+                restic_environment=lambda _c: {},
+                success_actions=lambda _m: None,
+                failure_actions=lambda *_args, **_kwargs: None,
+                cleanup=lambda callback, _label: callback(),
+                remove_stage=lambda _path: None,
+                print_command_failure=lambda *_args, **_kwargs: None,
+                fingerprint=lambda _stage: fingerprint,
+                repository_id=lambda _c: repository_id,
+            )
+
+            backup.BackupWorkflow(
+                config,
+                value,
+                dependencies=dependencies,
+            ).execute()
+
+            self.assertTrue(any(
+                command[:2] == ['restic', 'backup']
+                for command in commands
+            ))
+
+    def test_repository_replacement_at_same_address_does_not_skip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            value = manifest(Path(tmp))
+            fingerprint = 'sha256:' + '1' * 64
+            config = {
+                'host_id': 'host',
+                'repository': 'repo-one',
+                'staging_root': str(Path(tmp) / 'stage-root'),
+            }
+            commands = []
+            stage = Path(tmp) / 'stage'
+            moments = iter((
+                dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc),
+                dt.datetime(2026, 1, 1, 0, 0, 5, tzinfo=dt.timezone.utc),
+            ))
+            dependencies = backup.BackupDependencies(
+                now=lambda: next(moments),
+                load_state=lambda _c, _service: {
+                    'last_snapshot_fingerprint': fingerprint,
+                    'last_snapshot_context':
+                        snapshot_context_fingerprint(config, 'a' * 64),
+                },
+                save_state=lambda *_args: None,
+                stage=lambda _c, _m: stage,
+                check_space=lambda *_args, **_kwargs: None,
+                run_command=lambda command, **_kwargs:
+                commands.append(command),
+                restic_environment=lambda _c: {},
+                success_actions=lambda _m: None,
+                failure_actions=lambda *_args, **_kwargs: None,
+                cleanup=lambda callback, _label: callback(),
+                remove_stage=lambda _path: None,
+                print_command_failure=lambda *_args, **_kwargs: None,
+                fingerprint=lambda _stage: fingerprint,
+                repository_id=lambda _c: 'b' * 64,
+            )
+
+            backup.BackupWorkflow(
+                config, value, dependencies=dependencies,
+            ).execute()
+
+            self.assertTrue(any(
+                command[:2] == ['restic', 'backup']
+                for command in commands
+            ))
+
+    def test_fingerprint_failure_is_reported_as_staging(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            value = manifest(Path(tmp))
+            failure = OSError('cannot read xattr')
+            phases = []
+            stage = Path(tmp) / 'stage'
+            moments = iter((
+                dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc),
+                dt.datetime(2026, 1, 1, 0, 0, 5, tzinfo=dt.timezone.utc),
+            ))
+            dependencies = backup.BackupDependencies(
+                now=lambda: next(moments),
+                load_state=lambda _c, _service: {},
+                save_state=lambda *_args: None,
+                stage=lambda _c, _m: stage,
+                check_space=lambda *_args, **_kwargs: None,
+                run_command=lambda *_args, **_kwargs:
+                self.fail('Restic must not run after fingerprint failure'),
+                restic_environment=lambda _c: {},
+                success_actions=lambda _m: None,
+                failure_actions=lambda _m, *, error, phase:
+                phases.append((error, phase)),
+                cleanup=lambda callback, _label: callback(),
+                remove_stage=lambda _path: None,
+                print_command_failure=lambda *_args, **_kwargs: None,
+                fingerprint=lambda _stage: (_ for _ in ()).throw(failure),
+                repository_id=lambda _c: 'a' * 64,
+            )
+
+            with self.assertRaises(OSError) as caught:
+                backup.BackupWorkflow(
+                    {
+                        'host_id': 'host',
+                        'repository': 'repo-one',
+                        'staging_root': str(Path(tmp) / 'stage-root'),
+                    },
+                    value,
+                    dependencies=dependencies,
+                ).execute()
+
+            self.assertIs(caught.exception, failure)
+            self.assertEqual(phases, [(failure, 'staging')])
+
+    def test_repository_id_is_loaded_from_restic_config(self):
+        config = {'repository': 'repo'}
+        result = SimpleNamespace(stdout=json.dumps({'id': 'a' * 64}))
+        with mock.patch.object(
+            backup, 'restic_env', return_value={'RESTIC_REPOSITORY': 'repo'},
+        ), mock.patch.object(
+            backup, 'run', return_value=result,
+        ) as run_mock:
+            self.assertEqual(backup.restic_repository_id(config), 'a' * 64)
+
+        run_mock.assert_called_once_with(
+            ['restic', 'cat', 'config'],
+            env={'RESTIC_REPOSITORY': 'repo'},
+            capture=True,
+        )
+
+    def test_invalid_repository_config_id_is_rejected(self):
+        with mock.patch.object(
+            backup, 'restic_env', return_value={},
+        ), mock.patch.object(
+            backup, 'run',
+            return_value=SimpleNamespace(stdout='{"id": "invalid"}'),
+        ), self.assertRaisesRegex(RuntimeError, 'repository ID'):
+            backup.restic_repository_id({})
 
     def test_restore_download_workflow_uses_deterministic_workspace(self):
         events = []

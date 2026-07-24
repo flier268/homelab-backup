@@ -232,6 +232,10 @@ def validate_retention(m):
             found = True
     if not found:
         raise ValueError(f'{path}: retention must define at least one keep_* rule')
+    if not any(retention.get(key, 0) > 0 for key, _ in RETENTION_FLAGS):
+        raise ValueError(
+            f'{path}: retention must keep at least one snapshot'
+        )
 
 
 def _validate_manifest_header(m):
@@ -240,7 +244,8 @@ def _validate_manifest_header(m):
     path = m.get('_path', '<manifest>')
     allowed_manifest = {
         'version', 'service', 'name', 'enabled', 'schedule', 'retention',
-        'compose', 'consistency', 'actions', 'sources', '_path', '_dir',
+        'create_snapshot_if_unchanged', 'compose', 'consistency', 'actions',
+        'sources', '_path', '_dir',
         '_relative_dir', '_snapshot_manifest', '_restore_manifest_requested',
     }
     unknown_manifest = sorted(set(m) - allowed_manifest)
@@ -260,6 +265,10 @@ def _validate_manifest_header(m):
         )
     if not isinstance(m.get('enabled', True), bool):
         raise ValueError(f'{path}: enabled must be boolean')
+    if not isinstance(m.get('create_snapshot_if_unchanged', False), bool):
+        raise ValueError(
+            f'{path}: create_snapshot_if_unchanged must be boolean'
+        )
     return path
 
 

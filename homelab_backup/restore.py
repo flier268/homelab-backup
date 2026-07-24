@@ -12,6 +12,7 @@ import yaml
 
 from . import restore_apply
 from . import restore_inventory as _restore_inventory
+from .backup_state import invalidate_snapshot_fingerprint
 from .common import (
     MIN_FREE_BYTES, CommandError, FailureSummary, GlobalLock,
     _print_command_failure, die, format_bytes, restic_env, run,
@@ -100,6 +101,8 @@ def cmd_delete_snapshot(c, args):
             return
 
     env = restic_env(c)
+    if c.get('state_root'):
+        invalidate_snapshot_fingerprint(c, args.service)
     run(['restic', 'forget', snapshot], env=env)
     print(f'Deleted snapshot {snapshot} for {args.service}.')
     if not args.prune:

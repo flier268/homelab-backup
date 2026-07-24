@@ -104,6 +104,10 @@ name: "Advent of Ascension Plus-2026"
 新快照可將 manifest 還原到原分類位置，舊快照則回退到
 `/srv/stacks/<service>`。
 
+備份完成 staging 後會比較上次成功快照的內容指紋；內容未變時預設不建立新的
+Restic snapshot。若某個服務需要每次排程都留下時間點版本，可在
+`backup.yaml` 設定 `create_snapshot_if_unchanged: true`。
+
 ## 解除安裝
 
 停止並停用 timers、移除 systemd units、`backupctl`、已安裝 releases 與其

@@ -12,6 +12,46 @@ from tests.helpers import manifest
 
 
 class BackupStateTests(unittest.TestCase):
+    def setUp(self):
+        self.repository_id_patch = mock.patch.object(
+            backup, 'restic_repository_id', return_value='a' * 64,
+        )
+        self.repository_id_patch.start()
+
+    def tearDown(self):
+        self.repository_id_patch.stop()
+
+    def test_snapshot_fingerprint_can_be_invalidated_after_deletion(self):
+        state = {
+            'last_result': 'success',
+            'last_snapshot_fingerprint': 'sha256:' + '1' * 64,
+            'last_snapshot_context': 'sha256:' + '2' * 64,
+        }
+        with mock.patch.object(
+            backup_state, 'load_state', return_value=state,
+        ), mock.patch.object(backup_state, 'save_state') as save_mock:
+            backup_state.invalidate_snapshot_fingerprint(
+                {'state_root': '/state'}, 'demo',
+            )
+
+        save_mock.assert_called_once_with(
+            {'state_root': '/state'}, 'demo', {'last_result': 'success'},
+        )
+
+    def test_snapshot_fingerprint_must_be_valid_sha256(self):
+        with self.assertRaisesRegex(ValueError, 'SHA-256 fingerprint'):
+            backup_state.validate_state(
+                {'last_snapshot_fingerprint': 'not-a-fingerprint'},
+                service='demo',
+            )
+
+    def test_snapshot_context_must_be_valid_sha256(self):
+        with self.assertRaisesRegex(ValueError, 'SHA-256 fingerprint'):
+            backup_state.validate_state(
+                {'last_snapshot_context': 'not-a-fingerprint'},
+                service='demo',
+            )
+
     def test_state_path_rejects_unsafe_service_name(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

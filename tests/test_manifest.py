@@ -9,6 +9,25 @@ from tests.helpers import manifest
 
 
 class ComposeControlTests(unittest.TestCase):
+    def test_retention_must_keep_at_least_one_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            value = manifest(Path(tmp), retention={'keep_last': 0})
+            with self.assertRaisesRegex(
+                    ValueError, 'must keep at least one snapshot',
+            ):
+                manifest_module.validate_manifest(value)
+
+    def test_create_snapshot_if_unchanged_must_be_boolean(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            value = manifest(
+                Path(tmp), create_snapshot_if_unchanged='yes',
+            )
+            with self.assertRaisesRegex(
+                    ValueError,
+                    'create_snapshot_if_unchanged must be boolean',
+            ):
+                manifest_module.validate_manifest(value)
+
     def test_compose_run_uses_only_explicit_protected_controls(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

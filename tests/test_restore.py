@@ -72,6 +72,24 @@ class RepositoryBoundaryTests(unittest.TestCase):
             ['restic', 'forget', 'a' * 64], env={'RESTIC': 'env'},
         )
 
+    def test_delete_snapshot_invalidates_saved_content_fingerprint(self):
+        args = mock.Mock(
+            service='demo', snapshot='aaaaaaaa', prune=False, yes=True,
+        )
+        config_data = {'host_id': 'host', 'state_root': '/state'}
+        with mock.patch.object(
+            backupctl, 'resolve_explicit_snapshot', return_value='a' * 64,
+        ), mock.patch.object(
+            backupctl, 'restic_env', return_value={},
+        ), mock.patch.object(
+            backupctl, 'run',
+        ), mock.patch.object(
+            backupctl, 'invalidate_snapshot_fingerprint',
+        ) as invalidate_mock:
+            backupctl.cmd_delete_snapshot(config_data, args)
+
+        invalidate_mock.assert_called_once_with(config_data, 'demo')
+
     def test_delete_snapshot_rejects_invalid_service_before_repository_access(self):
         args = mock.Mock(
             service='../other', snapshot='aaaaaaaa', prune=False, yes=True,

@@ -1,4 +1,6 @@
 import datetime as dt
+import json
+import re
 import shutil
 import sys
 from dataclasses import dataclass
@@ -14,6 +16,7 @@ from .common import (
     CommandError, FailureSummary, GlobalLock, _print_command_failure, die,
     format_remediable_error, restic_env, run, run_cleanup,
 )
+from .fingerprint import snapshot_context_fingerprint, stage_fingerprint
 from .manifest import (
     RETENTION_FLAGS, compose_model, manifest, manifests, service_label,
     validate_manifest,
@@ -29,6 +32,31 @@ from .storage import (
 )
 from .staging import _check_backup_space, stage_service
 from .types import GlobalConfig, ServiceManifest
+
+
+_RESTIC_REPOSITORY_ID_RE = re.compile(r'[0-9a-fA-F]{64}')
+
+
+def restic_repository_id(c):
+    result = run(
+        ['restic', 'cat', 'config'],
+        env=restic_env(c),
+        capture=True,
+    )
+    try:
+        repository_config = json.loads(result.stdout)
+    except (TypeError, json.JSONDecodeError) as err:
+        raise RuntimeError(
+            'Restic returned an invalid repository config'
+        ) from err
+    repository_id = (
+        repository_config.get('id')
+        if isinstance(repository_config, dict) else None
+    )
+    if not isinstance(repository_id, str) or not \
+            _RESTIC_REPOSITORY_ID_RE.fullmatch(repository_id):
+        raise RuntimeError('Restic repository config has an invalid repository ID')
+    return repository_id.lower()
 
 
 def due_status(c, m, now=None):
@@ -66,6 +94,8 @@ class BackupDependencies:
     cleanup: Callable
     remove_stage: Callable
     print_command_failure: Callable
+    fingerprint: Callable
+    repository_id: Callable
 
     @classmethod
     def production(cls):
@@ -84,6 +114,8 @@ class BackupDependencies:
             cleanup=run_cleanup,
             remove_stage=clear_control_leaf,
             print_command_failure=_print_command_failure,
+            fingerprint=stage_fingerprint,
+            repository_id=restic_repository_id,
         )
 
 
@@ -106,12 +138,12 @@ class BackupWorkflow:
         validate_manifest(self.m)
         self._mark_running()
         try:
-            stage = self._prepare_stage()
+            stage, fingerprint = self._prepare_stage()
         except Exception as err:
             self._record_precommit_failure(err, 'staging')
             raise
         try:
-            self._commit_snapshot(stage)
+            self._commit_snapshot(stage, fingerprint)
         except Exception as err:
             self._record_precommit_failure(err, 'restic')
             raise
@@ -163,14 +195,29 @@ class BackupWorkflow:
             self.c, self.m, stage, 0,
             allow_low_space=self.allow_low_space,
         )
-        return stage
+        return stage, deps.fingerprint(stage)
 
-    def _commit_snapshot(self, stage):
+    def _commit_snapshot(self, stage, fingerprint):
         deps = self.dependencies
+        snapshot_context = snapshot_context_fingerprint(
+            self.c, deps.repository_id(self.c),
+        )
+        unchanged = (
+            self.state.get('last_snapshot_fingerprint') == fingerprint
+            and self.state.get('last_snapshot_context') == snapshot_context
+        )
+        if unchanged and not self.m.get(
+                'create_snapshot_if_unchanged', False,
+        ):
+            print(f'SKIP: Backup content is unchanged for {self.label}')
+            return False
         deps.run_command([
             'restic', 'backup', '.', '--host', self.c['host_id'],
             '--tag', f"service:{self.m['service']}",
         ], cwd=stage, env=deps.restic_environment(self.c))
+        self.state['last_snapshot_fingerprint'] = fingerprint
+        self.state['last_snapshot_context'] = snapshot_context
+        return True
 
     def _record_precommit_failure(self, err, failure_phase):
         deps = self.dependencies
@@ -215,7 +262,7 @@ class BackupWorkflow:
             deps.remove_stage(stage)
         except Exception as err:
             print(
-                f'ERROR: Restic snapshot for {self.label} was committed, but '
+                f'ERROR: Restic backup for {self.label} completed, but '
                 f'staging cleanup failed: {type(err).__name__}: {err}',
                 file=sys.stderr,
             )
@@ -234,7 +281,7 @@ class BackupWorkflow:
             deps.success_actions(self.m)
         except Exception as err:
             print(
-                f'ERROR: Restic snapshot for {self.label} was committed, but '
+                f'ERROR: Restic backup for {self.label} completed, but '
                 f'on_success actions failed: {type(err).__name__}: {err}',
                 file=sys.stderr,
             )
@@ -260,7 +307,7 @@ class BackupWorkflow:
             return None
         except Exception as err:
             context = (
-                f"Snapshot for {self.label} succeeded, but retention failed; "
+                f"Backup for {self.label} completed, but retention failed; "
                 'maintenance will retry it later'
             )
             if isinstance(err, CommandError):
@@ -291,7 +338,7 @@ class BackupWorkflow:
             deps.save_state(self.c, self.m['service'], self.state)
         except Exception as err:
             print(
-                f'ERROR: Restic snapshot for {self.label} was committed, but '
+                f'ERROR: Restic backup for {self.label} completed, but '
                 f'state update failed: {type(err).__name__}: {err}',
                 file=sys.stderr,
             )
