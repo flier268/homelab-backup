@@ -1,7 +1,9 @@
 import datetime as dt
+import io
 import os
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -64,11 +66,92 @@ class WorkflowDependencyTests(unittest.TestCase):
                 events,
                 [
                     'stage', 'space', ('restic', 'backup'),
-                    'success-actions', ('restic', 'forget'),
+                    'remove-stage', 'success-actions', ('restic', 'forget'),
                 ],
             )
             self.assertEqual(saved[0]['last_result'], 'running')
             self.assertEqual(saved[-1]['last_result'], 'success')
+
+    def test_backup_cleanup_failure_is_postcommit_and_preserves_first_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            value = manifest(Path(tmp))
+            config = {
+                'host_id': 'host',
+                'staging_root': str(Path(tmp) / 'stage-root'),
+            }
+            stage = Path(tmp) / 'stage'
+            cleanup_failure = OSError('staging filesystem unavailable')
+            action_failure = RuntimeError('notification failed')
+            state_failure = OSError('state filesystem unavailable')
+            moments = iter((
+                dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc),
+                dt.datetime(2026, 1, 1, 0, 0, 5, tzinfo=dt.timezone.utc),
+            ))
+            events = []
+            saved = []
+            stderr = io.StringIO()
+
+            def failure_actions(_manifest, *, error, phase):
+                events.append(('failure-actions', phase, error))
+
+            def save_state(_config, _service, state):
+                saved.append(dict(state))
+                if len(saved) == 2:
+                    raise state_failure
+
+            def remove_stage(_path):
+                raise cleanup_failure
+
+            def success_actions(_manifest):
+                raise action_failure
+
+            def run_command(command, **_kwargs):
+                events.append(tuple(command[:2]))
+
+            dependencies = backup.BackupDependencies(
+                now=lambda: next(moments),
+                load_state=lambda _c, _service: {},
+                save_state=save_state,
+                stage=lambda _c, _m: stage,
+                check_space=lambda *_args, **_kwargs: None,
+                run_command=run_command,
+                restic_environment=lambda _c: {},
+                success_actions=success_actions,
+                failure_actions=failure_actions,
+                cleanup=lambda callback, _label: callback(),
+                remove_stage=remove_stage,
+                print_command_failure=lambda *_args, **_kwargs: None,
+            )
+
+            with redirect_stderr(stderr), self.assertRaises(OSError) as caught:
+                backup.BackupWorkflow(
+                    config, value, dependencies=dependencies,
+                ).execute()
+
+            self.assertIs(caught.exception, cleanup_failure)
+            self.assertEqual(saved[-1]['last_result'], 'success')
+            self.assertEqual(
+                events,
+                [
+                    ('restic', 'backup'),
+                    ('failure-actions', 'cleanup', cleanup_failure),
+                    ('failure-actions', 'on_success', action_failure),
+                    ('restic', 'forget'),
+                    ('failure-actions', 'state', state_failure),
+                ],
+            )
+            notes = getattr(caught.exception, '__notes__', ())
+            self.assertTrue(any(
+                'RuntimeError: notification failed' in note for note in notes
+            ))
+            self.assertTrue(any(
+                'OSError: state filesystem unavailable' in note for note in notes
+            ))
+            self.assertIn(
+                'state update failed: '
+                'OSError: state filesystem unavailable',
+                stderr.getvalue(),
+            )
 
     def test_restore_download_workflow_uses_deterministic_workspace(self):
         events = []

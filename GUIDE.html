@@ -429,7 +429,7 @@ sources:
       required: true
       run_as: root</code></pre>
 <p>每個 action 都必須明確設定 <code>run_as</code>，可使用本機帳號名稱或加引號的 Docker 風格 <code>"UID:GID"</code>；數字身分不需要 passwd entry。相對 executable 會被拒絕。<code>run_as: root</code> 或 <code>run_as: "0:0"</code> 的 executable 與父目錄必須由 root 擁有且不可由 group/other 寫入，也不可為 symlink。Docker socket 權限實質接近 root，能直接使用 HTTP/RCON endpoint 時不要把低權限帳號加入 docker group。</p>
-<p><code>actions.on_success</code> 在 Restic snapshot 成功提交後執行；<code>actions.on_failure</code> 在 staging、Restic、on-success 或 state 失敗時執行。Failure action 會收到 <code>BACKUPCTL_FAILURE_PHASE</code>、<code>BACKUPCTL_FAILURE_TYPE</code>、<code>BACKUPCTL_FAILURE_REASON</code>、<code>BACKUPCTL_FAILURE_SERVICE</code> 與 <code>BACKUPCTL_FAILURE_SECONDARY</code>。不會提供命令輸出或 argv；若命令使用 <code>docker exec</code>，需自行明確把需要的環境變數轉交給容器。</p>
+<p><code>actions.on_success</code> 在 Restic snapshot 成功提交後執行；<code>actions.on_failure</code> 在 staging、Restic、staging cleanup、on-success 或 state 失敗時執行，其中 staging cleanup 的 <code>BACKUPCTL_FAILURE_PHASE</code> 為 <code>cleanup</code>。Failure action 會收到 <code>BACKUPCTL_FAILURE_PHASE</code>、<code>BACKUPCTL_FAILURE_TYPE</code>、<code>BACKUPCTL_FAILURE_REASON</code>、<code>BACKUPCTL_FAILURE_SERVICE</code> 與 <code>BACKUPCTL_FAILURE_SECONDARY</code>。不會提供命令輸出或 argv；若命令使用 <code>docker exec</code>，需自行明確把需要的環境變數轉交給容器。</p>
 <pre><code>actions:
   on_success:
     - name: notify-success

@@ -115,11 +115,20 @@ class BackupWorkflow:
         except Exception as err:
             self._record_precommit_failure(err, 'restic')
             raise
-        postcommit_error = self._run_success_actions()
+        postcommit_errors = []
+        cleanup_error = self._remove_committed_stage(stage)
+        if cleanup_error is not None:
+            postcommit_errors.append(cleanup_error)
+        success_action_error = self._run_success_actions()
+        if success_action_error is not None:
+            postcommit_errors.append(success_action_error)
         retention_error = self._apply_retention()
-        self._mark_success(retention_error)
-        if postcommit_error is not None:
-            raise postcommit_error
+        try:
+            self._mark_success(retention_error)
+        except Exception as err:
+            postcommit_errors.append(err)
+        if postcommit_errors:
+            self._raise_postcommit_errors(postcommit_errors)
         return True
 
     def _mark_running(self):
@@ -200,6 +209,25 @@ class BackupWorkflow:
             f'save failed backup state for {self.label}',
         )
 
+    def _remove_committed_stage(self, stage):
+        deps = self.dependencies
+        try:
+            deps.remove_stage(stage)
+        except Exception as err:
+            print(
+                f'ERROR: Restic snapshot for {self.label} was committed, but '
+                f'staging cleanup failed: {type(err).__name__}: {err}',
+                file=sys.stderr,
+            )
+            deps.cleanup(
+                lambda: deps.failure_actions(
+                    self.m, error=err, phase='cleanup',
+                ),
+                'on_failure actions',
+            )
+            return err
+        return None
+
     def _run_success_actions(self):
         deps = self.dependencies
         try:
@@ -262,6 +290,11 @@ class BackupWorkflow:
         try:
             deps.save_state(self.c, self.m['service'], self.state)
         except Exception as err:
+            print(
+                f'ERROR: Restic snapshot for {self.label} was committed, but '
+                f'state update failed: {type(err).__name__}: {err}',
+                file=sys.stderr,
+            )
             deps.cleanup(
                 lambda: deps.failure_actions(
                     self.m, error=err, phase='state',
@@ -269,6 +302,17 @@ class BackupWorkflow:
                 'on_failure actions',
             )
             raise
+
+    @staticmethod
+    def _raise_postcommit_errors(errors):
+        primary = errors[0]
+        if hasattr(primary, 'add_note'):
+            for secondary in errors[1:]:
+                primary.add_note(
+                    'Additional post-commit failure: '
+                    f'{type(secondary).__name__}: {secondary}'
+                )
+        raise primary
 
 
 def backup_one(

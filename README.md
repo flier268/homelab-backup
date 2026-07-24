@@ -13,7 +13,8 @@ Docker Compose 服務的 Restic + OneDrive 備份工具。
   統一列出失敗摘要並回傳非零狀態。
 - 備份以單份 manifest 為交易邊界；所有來源 staging 完成後才提交 Restic
   snapshot。任一來源失敗會跳過整份 manifest、清除半成品 staging，不產生
-  該服務的部分備份。
+  該服務的部分備份；Restic 成功提交後也會立即清除 staging，不在本機保留
+  完整副本。
 - 一致性策略支援停服、hook、外部靜止、live best-effort 與 Btrfs subvolume
   snapshot；所有模式都可先執行具 timeout／required 政策的 argv action。
 - 支援本機部署交叉驗證後覆寫，以及所有 target 均不存在的全新重建；混合

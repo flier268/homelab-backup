@@ -302,7 +302,7 @@ class BackupStateTests(unittest.TestCase):
 
             self.assertIsNone(saved[-1]['last_retention_error'])
 
-    def test_final_state_save_failure_does_not_mark_snapshot_failed_or_remove_stage(self):
+    def test_final_state_save_failure_does_not_preserve_committed_stage(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             value = manifest(root)
@@ -336,7 +336,7 @@ class BackupStateTests(unittest.TestCase):
 
             self.assertEqual(save_mock.call_count, 2)
             self.assertEqual(saved[-1]['last_result'], 'success')
-            self.assertTrue(marker.exists())
+            self.assertFalse(marker.exists())
 
     def test_source_race_records_failed_state_instead_of_running(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -419,6 +419,10 @@ class BackupStateTests(unittest.TestCase):
                     mock.patch.object(backup, 'restic_env', return_value={}), \
                     mock.patch.object(backup, 'run', side_effect=fake_run), \
                     mock.patch.object(
+                        backup, 'clear_control_leaf',
+                        side_effect=lambda _path: events.append('cleanup'),
+                    ), \
+                    mock.patch.object(
                         backup, 'run_success_actions',
                         side_effect=lambda _m: events.append('on_success') or [],
                     ):
@@ -426,7 +430,7 @@ class BackupStateTests(unittest.TestCase):
                     {'host_id': 'host'}, value, apply_retention=False,
                 ))
 
-            self.assertEqual(events, ['restic', 'on_success'])
+            self.assertEqual(events, ['restic', 'cleanup', 'on_success'])
 
     def test_staging_failure_passes_reason_to_failure_action(self):
         with tempfile.TemporaryDirectory() as tmp:
