@@ -1,0 +1,45 @@
+version: 1
+service: editor-test
+name: Editor Test
+enabled: true
+create_snapshot_if_unchanged: false
+schedule:
+  cron: "0 */6 * * *"
+  retry_after: 30m
+  max_lateness: 2h
+retention:
+  keep_last: 8
+  keep_daily: 14
+compose:
+  files:
+    - compose.yaml
+  env_file: .env
+consistency:
+  mode: stop
+  timeout: 120
+  before: []
+  after: []
+actions:
+  before:
+    - name: prepare
+      command:
+        - /usr/bin/true
+      timeout: 30
+      required: true
+      run_as: root
+  finally: []
+  on_success: []
+  on_failure: []
+sources:
+  paths:
+    - id: data
+      path: data
+      required: true
+      include:
+        - world/**
+      exclude:
+        - cache/**
+  volumes:
+    - id: database
+      compose_volume: db-data
+      required: true

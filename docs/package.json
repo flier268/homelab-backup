@@ -1,0 +1,33 @@
+{
+  "name": "homelab-backup-docs",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "packageManager": "pnpm@11.9.0",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "dev": "vite",
+    "typecheck": "vue-tsc -b",
+    "test": "vitest run",
+    "build": "vue-tsc -b && vite build && node scripts/verify-single-file.mjs",
+    "check": "pnpm run typecheck && pnpm run test && pnpm run build"
+  },
+  "dependencies": {
+    "cron-parser": "5.6.2",
+    "element-plus": "2.14.3",
+    "vue": "3.5.40",
+    "yaml": "2.9.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "6.0.8",
+    "@vue/test-utils": "2.4.6",
+    "happy-dom": "^20.11.1",
+    "typescript": "5.9.3",
+    "vite": "8.1.5",
+    "vite-plugin-singlefile": "2.3.3",
+    "vitest": "4.1.10",
+    "vue-tsc": "3.3.8"
+  }
+}

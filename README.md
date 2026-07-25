@@ -20,6 +20,38 @@ Docker Compose 服務的 Restic + OneDrive 備份工具。
 - 支援本機部署交叉驗證後覆寫，以及所有 target 均不存在的全新重建；混合
   狀態一律拒絕。
 
+## 設定檔編輯器
+
+專案提供 Vue 3 + Element Plus 的離線設定檔編輯器，可建立或匯入全域
+`config.yaml` 與服務 `backup.yaml`。服務編輯器包含 Cron、retention、五種
+一致性模式、path／volume sources、hooks，以及 before、finally、on-success、
+on-failure actions 的欄位與安全說明。
+
+編輯器會產生一段可在服務根目錄執行的 `python3` 清單命令。命令輸出版本化
+JSON Lines，不依賴 `ls` 的語系格式，並可安全表示空白、Unicode、tab 與換行；
+將結果貼入或匯入編輯器後，即可把檔案標成備份、排除或不納入，再整理成多個
+source 群組。清單不含檔案內容，也不會由瀏覽器上傳。
+
+Release archive 根目錄包含可直接雙擊開啟的 `GUIDE.html`。
+指南與編輯器由同一套 Vue 原始碼編譯成單一離線頁面；預設開啟設定編輯器，
+可在頁面內切換完整指南，編輯器各區也會連到對應說明章節。本機開發與產生
+離線 HTML：
+
+```bash
+cd docs
+pnpm install
+pnpm run dev
+pnpm run check
+```
+
+建置會產生 repository 根目錄的 `GUIDE.html`，並保留
+`docs/dist/GUIDE.html`。兩者皆已加入 `.gitignore`，不由 Git 追蹤。
+編輯器只做靜態 schema 驗證；部署設定後仍必須在目標主機執行：
+
+```bash
+sudo backupctl validate
+```
+
 ## 全新安裝
 
 ```bash
@@ -233,6 +265,7 @@ sudo backupctl restore --all \
 
 還原前會檢查 snapshot 身分與可用空間；`--yes` 不會略過空間保護。現有部署
 必須通過 manifest 交叉驗證，全新重建則要求所有 target 都不存在；混合狀態
-一律拒絕。歷史 snapshot、刪除與 restore workspace 清理方式請見 `GUIDE.html`。
+一律拒絕。歷史 snapshot、刪除與 restore workspace 清理方式請見
+`GUIDE.html`。
 
 完整說明請開啟 `GUIDE.html`。

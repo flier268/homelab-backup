@@ -10,3 +10,9 @@ homelab-backup-configs-*.zip.age
 configs/restic-password
 configs/rclone.conf
 configs/config.yaml
+
+GUIDE.html
+docs/node_modules/
+docs/dist/
+docs/coverage/
+docs/*.tsbuildinfo

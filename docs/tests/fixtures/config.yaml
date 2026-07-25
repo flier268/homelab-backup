@@ -1,0 +1,19 @@
+version: 1
+host_id: editor-test
+services_root: /srv/stacks
+trusted_data_roots:
+  - /srv/stacks
+  - /srv/data
+repository: rclone:remote:Backups/restic/editor-test
+password_file: /etc/homelab-backup/restic-password
+rclone_config: /etc/homelab-backup/rclone/rclone.conf
+staging_root: /var/lib/homelab-backup/staging
+restore_root: /var/lib/homelab-backup/restores
+state_root: /var/lib/homelab-backup/state
+cache_root: /var/cache/homelab-backup/restic
+lock_file: /run/homelab-backup/backupctl.lock
+volume_helper_image: homelab/volume-rsync:1
+rclone:
+  bwlimit: ""
+check:
+  read_data_subset: 5%
