@@ -52,6 +52,13 @@ const modes: {
     description: 'Btrfs subvolume 使用唯讀 snapshot，其餘來源直接複製。',
     suitable: '已正確規劃為 Btrfs subvolume 的檔案型服務。',
   },
+  {
+    id: 'files',
+    title: '純檔案',
+    badge: '無 Docker',
+    description: '只備份 path sources，不載入 Compose、volume 或 container 狀態。',
+    suitable: '主機設定、一般目錄，以及由 Actions 協調的非 Docker 服務。',
+  },
 ]
 
 const phases: { id: ActionPhase; title: string; description: string }[] = [
@@ -97,6 +104,20 @@ ensureSections()
 const mode = computed({
   get: () => model.value.consistency!.mode,
   set: (value: ConsistencyMode) => {
+    const previous = model.value.consistency!.mode
+    if (value === 'files' && previous !== 'files') {
+      const hasDockerSettings = model.value.compose !== undefined
+        || (model.value.sources?.volumes.length ?? 0) > 0
+      if (hasDockerSettings && !window.confirm(
+        '切換到純檔案模式會移除 Compose 與 Docker volume 設定。確定要繼續嗎？',
+      )) {
+        return
+      }
+      delete model.value.compose
+      if (model.value.sources) model.value.sources.volumes = []
+    } else if (previous === 'files' && value !== 'files') {
+      model.value.compose ??= { files: ['compose.yaml'] }
+    }
     model.value.consistency!.mode = value
     if (value !== 'hooks') {
       model.value.consistency!.before = []
@@ -117,7 +138,7 @@ const actions = computed(() => model.value.actions!)
           <p class="eyebrow">CONSISTENCY</p>
           <h2>選擇一致性模式</h2>
         </div>
-        <el-form-item label="逾時秒數">
+        <el-form-item v-if="mode !== 'files'" label="逾時秒數">
           <el-input-number
             v-model="consistency.timeout"
             :min="1"
@@ -126,6 +147,13 @@ const actions = computed(() => model.value.actions!)
           />
         </el-form-item>
       </div>
+      <el-alert
+        v-if="mode === 'files'"
+        title="純檔案模式不會偵測 writer，也不會呼叫 Docker。若來源正在寫入，請用 before/finally Actions 自行協調。"
+        type="warning"
+        :closable="false"
+        show-icon
+      />
       <div class="mode-grid">
         <button
           v-for="item in modes"

@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Callable
 
 from .common import run, run_cleanup
-from .manifest import compose_run, source_path
+from .manifest import compose_run, requires_docker, source_path
 from .restore_plan import (
     RestorePlan,
     compose_authorization_projection,
@@ -275,27 +275,31 @@ def _stop_running_services(plan):
 
 
 def _dynamic_preflight(c, plan):
+    files_mode = not requires_docker(plan.manifest)
     path_targets = [
         source_path(plan.manifest, source)
         for source in (plan.manifest.get('sources') or {}).get('paths', [])
     ]
-    conflicts = docker_mount_conflicts(
-        path_targets,
-        plan.all_volume_names if plan.mode == 'rebuild'
-        else [name for _source, name in plan.volumes],
-        include_stopped=plan.mode == 'rebuild',
-        writable_only=False,
-    )
-    if conflicts:
-        raise RuntimeError(f'restore targets are used by containers: {", ".join(conflicts)}')
-    remaining = docker_project_containers(
-        plan.project_name, include_stopped=plan.mode == 'rebuild',
-    )
-    if remaining:
-        raise RuntimeError(
-            'Compose project still has running containers after stop: '
-            + ', '.join(remaining)
+    if not files_mode:
+        conflicts = docker_mount_conflicts(
+            path_targets,
+            plan.all_volume_names if plan.mode == 'rebuild'
+            else [name for _source, name in plan.volumes],
+            include_stopped=plan.mode == 'rebuild',
+            writable_only=False,
         )
+        if conflicts:
+            raise RuntimeError(
+                f'restore targets are used by containers: {", ".join(conflicts)}'
+            )
+        remaining = docker_project_containers(
+            plan.project_name, include_stopped=plan.mode == 'rebuild',
+        )
+        if remaining:
+            raise RuntimeError(
+                'Compose project still has running containers after stop: '
+                + ', '.join(remaining)
+            )
     for source in (plan.manifest.get('sources') or {}).get('paths', []):
         target = source_path(plan.manifest, source)
         trusted_roots = c.get('trusted_data_roots') or [str(Path(target).parent)]
@@ -314,7 +318,7 @@ def _dynamic_preflight(c, plan):
                 raise RuntimeError(f'rebuild target appeared during preflight: {target}')
         elif present and not exists:
             raise RuntimeError(f'existing target disappeared during preflight: {target}')
-    if plan.mode == 'rebuild':
+    if plan.mode == 'rebuild' and not files_mode:
         for name in plan.all_volume_names:
             if docker_volume_exists(name):
                 raise RuntimeError(f'rebuild volume appeared during preflight: {name}')
@@ -331,7 +335,11 @@ def _dynamic_preflight(c, plan):
         manifest_target = Path(plan.manifest.get(
             '_path', Path(plan.manifest['_dir']) / 'backup.yaml',
         ))
-        controls = (manifest_target, *compose_targets(plan.manifest))
+        controls = (
+            (manifest_target,)
+            if files_mode
+            else (manifest_target, *compose_targets(plan.manifest))
+        )
         if any(path.exists() or path.is_symlink() for path in controls):
             raise RuntimeError('rebuild control target appeared during preflight')
 
@@ -633,9 +641,10 @@ def _restore_data(c, plan, changes, operation_id):
         live_mutations.extend(
             f'volume:{name}' for _source, name in plan.volumes
         )
-    sync_volumes(
-        c, plan.manifest, plan.root, restore=True, resolved=plan.volumes,
-    )
+    if requires_docker(plan.manifest):
+        sync_volumes(
+            c, plan.manifest, plan.root, restore=True, resolved=plan.volumes,
+        )
 
 
 def _rollback_rebuild(ledger):
@@ -688,6 +697,10 @@ def _publish_controls(c, requested_manifest, plan, changes):
 
 
 def _restart_services(plan, targets, start_services):
+    if not requires_docker(plan.manifest):
+        if start_services:
+            raise ValueError('--start is not supported for files mode')
+        return
     if start_services:
         if not compose_files_exist(plan.manifest):
             raise RuntimeError(
@@ -732,6 +745,8 @@ class RestoreApplyWorkflow:
     def apply(self, c, m, root, *, start_services=False):
         deps = self.dependencies
         plan = deps.prepare_plan(c, m, root)
+        if start_services and not requires_docker(plan.manifest):
+            raise ValueError('--start is not supported for files mode')
         targets = list(plan.running_services)
         try:
             deps.stop_services(plan)
@@ -771,11 +786,11 @@ class RestoreApplyWorkflow:
                     file=sys.stderr,
                 )
             elif mutation_started:
-                print(
-                    'ERROR: restore failed after live mutation; services remain '
-                    'stopped',
-                    file=sys.stderr,
-                )
+                files_mode = not requires_docker(plan.manifest)
+                message = 'ERROR: restore failed after live mutation'
+                if not files_mode:
+                    message += '; services remain stopped'
+                print(message, file=sys.stderr)
                 for target in dict.fromkeys(changes.live_mutations):
                     print(
                         f'  - possibly modified: {target}',

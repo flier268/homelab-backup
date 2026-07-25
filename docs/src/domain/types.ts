@@ -1,5 +1,5 @@
 export type DocumentKind = 'global' | 'service'
-export type ConsistencyMode = 'stop' | 'hooks' | 'external' | 'live' | 'snapshot'
+export type ConsistencyMode = 'stop' | 'hooks' | 'external' | 'live' | 'snapshot' | 'files'
 export type ActionPhase = 'before' | 'finally' | 'on_success' | 'on_failure'
 export type InventoryEntryType = 'file' | 'directory' | 'symlink'
 export type SelectionState = 'unassigned' | 'include' | 'exclude'

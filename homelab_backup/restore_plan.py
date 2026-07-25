@@ -5,7 +5,7 @@ import yaml
 
 from .inventory_models import ComposeIdentityModel, RestoreInventoryModel
 from .manifest import (
-    compose_model, manifest, source_path, validate_manifest,
+    compose_model, manifest, requires_docker, source_path, validate_manifest,
 )
 from .restore_inventory import (
     load_restore_inventory, restored_path_details, validate_restore_inventory,
@@ -152,6 +152,12 @@ def _load_and_validate_restore_input(m, root):
 
 def _deployment_mode(m):
     manifest_target = Path(m.get('_path', Path(m['_dir']) / 'backup.yaml'))
+    if not requires_docker(m):
+        if manifest_target.is_file() and not manifest_target.is_symlink():
+            return 'existing', ()
+        if not manifest_target.exists() and not manifest_target.is_symlink():
+            return 'rebuild', ()
+        raise RuntimeError('unsupported local manifest state')
     compose_file_targets = compose_targets(m)
     manifest_exists = manifest_target.is_file() and not manifest_target.is_symlink()
     compose_exists = [path.is_file() and not path.is_symlink() for path in compose_file_targets]
@@ -250,6 +256,24 @@ def _authorize_rebuild_restore(m, inventory, restored_volumes):
     return m, identity, ()
 
 
+def _authorize_existing_files_restore(c, m, inventory):
+    local_m = manifest(c, m['service']) if c.get('services_root') else m
+    validate_manifest(local_m)
+    validate_restore_inventory(local_m, inventory)
+    snapshot_m = _snapshot_manifest(m)
+    if restore_filter_projection(snapshot_m) != restore_filter_projection(local_m):
+        raise RuntimeError(
+            'snapshot path filters differ from local authorization'
+        )
+    if m.get('_restore_manifest_requested') and \
+            restore_authorization_projection(m) != \
+            restore_authorization_projection(local_m):
+        raise RuntimeError(
+            'snapshot manifest security settings differ from local authorization'
+        )
+    return local_m
+
+
 def _identity_project_name(identity):
     return (
         identity.project_name
@@ -273,10 +297,24 @@ def prepare_restore_plan(
         c: GlobalConfig, m: ServiceManifest, root,
 ) -> RestorePlan:
     root, inventory = _load_and_validate_restore_input(m, root)
+    files_mode = not requires_docker(m)
     mode, compose_file_targets = _deployment_mode(m)
-    deferred = _validate_rebuild_compose_sources(m, mode, compose_file_targets)
+    deferred = (
+        ()
+        if files_mode
+        else _validate_rebuild_compose_sources(m, mode, compose_file_targets)
+    )
     restored_volumes = inventory_volumes(m, inventory)
     targets = _validate_path_targets(c, m, inventory, mode)
+    if files_mode:
+        authorized_manifest = (
+            _authorize_existing_files_restore(c, m, inventory)
+            if mode == 'existing'
+            else m
+        )
+        return RestorePlan(
+            root, inventory, authorized_manifest, mode, (), (), (), (), '',
+        )
     if mode == 'existing':
         authorized_manifest, identity, running = _authorize_existing_restore(
             c, m, inventory, restored_volumes,

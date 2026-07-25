@@ -184,13 +184,14 @@ timestamped 密文。
 
 ## 支援與安全邊界
 
-- 僅支援 Linux、本機 rootful Docker，以及 `ext4`、`xfs`、`btrfs`。
+- 僅支援 Linux，以及 `ext4`、`xfs`、`btrfs`。Compose／volume 模式需要
+  本機 rootful Docker；`files` 純檔案模式不需要 Docker。
 - 備份 path 必須位於唯一 trusted root 之下；控制路徑由 root 管理且不可經過
   symlink、跨 mount 或 nested Btrfs subvolume。資料樹可由容器 UID/GID 擁有。
 - 支援普通檔案、目錄、symlink、ACL、xattr 與 payload 內 hardlink；拒絕 FIFO、
   socket 與 device node。還原會保留原始數字 UID/GID 與 mode。
-- `stop`、`hooks`、`external` 會拒絕已知 writer；`live` 與未完整受 Btrfs
-  snapshot 保護的來源只提供 `best-effort` 一致性。
+- `stop`、`hooks`、`external` 會拒絕已知 Docker writer；`live`、`files`
+  與未完整受 Btrfs snapshot 保護的來源只提供 `best-effort` 一致性。
 - 不支援 remote/rootless Docker、跨 mount、ZFS、ext2/3、FUSE、NFS 或 autofs。
 - 所有 Compose YAML、`compose.env_file`、Restic 密碼與 rclone 設定必須是
   root-owned、不可 group/world write 的普通檔案，且不可為 symlink。Compose
@@ -236,6 +237,41 @@ sudo backupctl backup advent-of-ascension-plus-2026
 Palworld 零停機範例可參考 `examples/palworld.backup.yaml`。若其中宣告的資料 path
 本身是 Btrfs subvolume，`snapshot` 會從唯讀 filesystem snapshot staging；若只是
 普通目錄，仍會直接 staging，偵測到 writer 時整份備份會標為 `best-effort`。
+
+非 Docker 服務或一般主機檔案可使用明確的純檔案模式；完整範例見
+`examples/files.backup.yaml`：
+
+```yaml
+consistency:
+  mode: files
+
+actions:
+  before:
+    - name: quiesce-service
+      command: [/usr/local/sbin/example-backup-quiesce]
+      timeout: 60
+      required: true
+      run_as: root
+  finally:
+    - name: resume-service
+      command: [/usr/local/sbin/example-backup-resume]
+      timeout: 60
+      required: true
+      run_as: root
+
+sources:
+  paths:
+    - id: data
+      path: /srv/example
+  volumes: []
+```
+
+`files` 禁止 `compose` 與 Docker volume，不執行 Docker writer 偵測。Actions
+仍依一般備份生命週期執行，但 inventory 一律保守標示為 `best-effort`。還原只處理
+path，不會執行 Actions 或啟停外部服務，且不可搭配 `--start`。若 Actions
+用於暫停外部服務，協調命令應記錄服務原始狀態，並只恢復備份前原本運行的服務。
+安裝程序仍會使用 Docker 建置 volume helper image；完成安裝後，只有 `files`
+manifests 的備份、驗證、排程與還原不需要 Docker daemon。
 
 備份會在來源靜止後保守估算 path 與 Docker volume 的 staging 大小，並要求
 staging filesystem 至少保留 1 GiB。空間不足時預設中止；只有人工操作可明確

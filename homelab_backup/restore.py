@@ -18,7 +18,7 @@ from .common import (
     _print_command_failure, die, format_bytes, restic_env, run,
 )
 from .manifest import (
-    find_manifest, manifest, service_label, valid_service_name,
+    find_manifest, manifest, requires_docker, service_label, valid_service_name,
     validate_manifest,
 )
 from .security import (
@@ -487,8 +487,6 @@ def cmd_restore(c, args):
     if snapshot != 'latest':
         snapshot = resolve_explicit_snapshot(c, selected[0], snapshot)
     if args.apply:
-        validate_docker_environment()
-        validate_docker_bind_probe(c)
         validate_trusted_roots(c['trusted_data_roots'])
 
     policy = 'restore' if args.restore_manifest else 'keep' if args.keep_manifest else 'ask'
@@ -497,6 +495,7 @@ def cmd_restore(c, args):
         restore_options['allow_low_space'] = True
     restored = []
     failures = FailureSummary()
+    docker_preflight_complete = False
     with GlobalLock(c['lock_file']) as acquired:
         if not acquired:
             die('another backupctl process is running')
@@ -508,6 +507,10 @@ def cmd_restore(c, args):
                 )
                 label = service_label(m) if isinstance(m, dict) else service
                 if args.apply:
+                    if requires_docker(m) and not docker_preflight_complete:
+                        validate_docker_environment()
+                        validate_docker_bind_probe(c)
+                        docker_preflight_complete = True
                     restore_apply.apply_one(c, m, root, start_services=args.start)
                     try:
                         clear_control_leaf(root)
@@ -570,12 +573,13 @@ def _validated_apply_workspace(c, service, value):
 def cmd_apply(c, args):
     if not args.yes:
         die('apply requires --yes')
-    validate_docker_environment()
-    validate_docker_bind_probe(c)
     with GlobalLock(c['lock_file']) as acquired:
         if not acquired:
             die('another backupctl process is running')
         validate_trusted_roots(c['trusted_data_roots'])
         root = _validated_apply_workspace(c, args.service, args.restore_dir)
         m = manifest(c, args.service)
+        if requires_docker(m):
+            validate_docker_environment()
+            validate_docker_bind_probe(c)
         restore_apply.apply_one(c, m, root, start_services=args.start)

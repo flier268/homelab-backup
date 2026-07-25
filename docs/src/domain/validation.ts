@@ -280,7 +280,10 @@ function validateService(service: ServiceManifest): ValidationIssue[] {
     })
     if (!positive) issues.push(issue('retention', '至少一項保留數量必須大於 0'))
   }
-  if (service.compose) {
+  const consistency = service.consistency ?? { mode: 'stop' as const }
+  if (consistency.mode === 'files' && service.compose !== undefined) {
+    issues.push(issue('compose', '純檔案模式不可設定 Docker Compose'))
+  } else if (service.compose) {
     if (!Array.isArray(service.compose.files) || !service.compose.files.length
         || service.compose.files.some((file) => typeof file !== 'string' || !file)) {
       issues.push(issue('compose.files', '至少需要一個非空 Compose 檔名'))
@@ -289,8 +292,7 @@ function validateService(service: ServiceManifest): ValidationIssue[] {
       requiredString(issues, service.compose.env_file, 'compose.env_file')
     }
   }
-  const consistency = service.consistency ?? { mode: 'stop' as const }
-  if (!['stop', 'hooks', 'external', 'live', 'snapshot'].includes(consistency.mode)) {
+  if (!['stop', 'hooks', 'external', 'live', 'snapshot', 'files'].includes(consistency.mode)) {
     issues.push(issue('consistency.mode', '不支援的備份模式'))
   }
   if (consistency.timeout !== undefined
@@ -321,6 +323,9 @@ function validateService(service: ServiceManifest): ValidationIssue[] {
   }
   const allIds = new Set<string>()
   validatePathSources(service, service.sources?.paths ?? [], issues, allIds)
+  if (consistency.mode === 'files' && (service.sources?.volumes.length ?? 0) > 0) {
+    issues.push(issue('sources.volumes', '純檔案模式不可設定 Docker volumes'))
+  }
   const volumeTargets = new Set<string>()
   ;(service.sources?.volumes ?? []).forEach((source, index) => {
     const path = `sources.volumes[${index}]`

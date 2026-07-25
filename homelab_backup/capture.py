@@ -5,7 +5,7 @@ from pathlib import Path
 
 from .btrfs_snapshot import SnapshotTransaction
 from .common import MIN_FREE_BYTES, format_bytes, run, run_cleanup
-from .manifest import compose_run, service_label
+from .manifest import compose_run, requires_docker, service_label
 from .storage import (
     docker_mount_conflicts, docker_writer_maps, estimate_backup_size, hooks,
     running_services, sync_paths, sync_volumes, validate_no_docker_writers,
@@ -21,7 +21,7 @@ class _StageContext:
     stage: Path
     mode: str
     resolved_volumes: list
-    identity: dict
+    identity: dict | None
     allow_low_space: bool
 
 
@@ -90,12 +90,14 @@ def _sync_stage(
     _check_backup_space(
         c, m, stage, 0, allow_low_space=context.allow_low_space,
     )
-    volume_result = list(sync_volumes(
-        c, m, stage, resolved=context.resolved_volumes,
-        before_copy=before_copy,
-        capture_methods=volume_methods,
-        writer_map=volume_writers,
-    ) or [])
+    volume_result = []
+    if requires_docker(context.manifest):
+        volume_result = list(sync_volumes(
+            c, m, stage, resolved=context.resolved_volumes,
+            before_copy=before_copy,
+            capture_methods=volume_methods,
+            writer_map=volume_writers,
+        ) or [])
     _check_backup_space(
         c, m, stage, 0, allow_low_space=context.allow_low_space,
     )
@@ -168,6 +170,15 @@ def _capture_quiesced(context, *, project_must_be_stopped):
         path_methods=path_methods,
         volume_methods=volume_methods,
     )
+
+
+def _capture_files(context):
+    validate_path_payloads(context.config, context.manifest)
+    path_methods = {
+        source['id']: 'best-effort'
+        for source in (context.manifest.get('sources') or {}).get('paths', [])
+    }
+    return _sync_stage(context, path_methods=path_methods)
 
 
 def _capture_hooks(context):
@@ -269,6 +280,7 @@ def _capture_snapshot(context):
 
 
 _MODE_HANDLERS = {
+    'files': _capture_files,
     'hooks': _capture_hooks,
     'stop': _capture_stop,
     'external': _capture_external,

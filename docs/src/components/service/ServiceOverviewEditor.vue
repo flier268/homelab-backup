@@ -103,7 +103,10 @@ function ensureCompose(): void {
       </div>
     </section>
 
-    <section class="panel">
+    <section
+      v-if="model.consistency?.mode !== 'files'"
+      class="panel"
+    >
       <div class="section-heading">
         <div>
           <p class="eyebrow">COMPOSE</p>
@@ -127,5 +130,12 @@ function ensureCompose(): void {
         加入 Compose 設定
       </el-button>
     </section>
+    <el-alert
+      v-else
+      title="純檔案模式沒有 Docker Compose 設定。"
+      type="info"
+      :closable="false"
+      show-icon
+    />
   </div>
 </template>

@@ -125,7 +125,10 @@ function applyInventory(pathSources: PathSource[]): void {
       </div>
     </section>
 
-    <section class="panel">
+    <section
+      v-if="model.consistency?.mode !== 'files'"
+      class="panel"
+    >
       <div class="section-heading">
         <div>
           <p class="eyebrow">DOCKER VOLUMES</p>

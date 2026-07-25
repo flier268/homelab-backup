@@ -5,8 +5,8 @@ from pydantic import ValidationError
 
 from .inventory_models import RestoreInventoryModel
 from .manifest import (
-    source_path, valid_service_name, validate_docker_volume_name,
-    validate_service_relative_directory,
+    requires_docker, source_path, valid_service_name,
+    validate_docker_volume_name, validate_service_relative_directory,
 )
 from .security import (
     lexical_absolute, paths_overlap, read_control_text, validate_payload,
@@ -123,6 +123,17 @@ def authorize_inventory_against_manifest(
             raise RuntimeError(f'restore inventory path differs for source {source_id!r}')
         if source.get('required', True) and not entry.present:
             raise RuntimeError(f'required path is marked absent: {source_id!r}')
+    files_mode = not requires_docker(m)
+    if files_mode:
+        if inventory.volumes:
+            raise RuntimeError('files restore inventory must not contain volumes')
+        if inventory.compose is not None:
+            raise RuntimeError('files restore inventory must not contain Compose identity')
+        if inventory.consistency is None or inventory.consistency.mode != 'files':
+            raise RuntimeError('files restore inventory consistency mode is invalid')
+        return inventory
+    if inventory.compose is None:
+        raise RuntimeError('restore inventory has no Compose identity')
     by_identity_id = inventory.compose_volumes_by_id
     if set(by_identity_id) != set(declared_volumes):
         raise RuntimeError('restore inventory Compose volume mapping differs from sources')

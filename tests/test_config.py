@@ -12,6 +12,53 @@ from tests.helpers import manifest
 
 
 class ManifestValidationTests(unittest.TestCase):
+    def test_only_files_mode_avoids_docker_capability(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for mode in ('stop', 'hooks', 'external', 'live', 'snapshot'):
+                with self.subTest(mode=mode):
+                    self.assertTrue(manifest_module.requires_docker(
+                        manifest(root, consistency={'mode': mode}),
+                    ))
+            self.assertFalse(manifest_module.requires_docker(
+                manifest(root, consistency={'mode': 'files'}, sources={
+                    'paths': [], 'volumes': [],
+                }),
+            ))
+
+    def test_files_mode_accepts_paths_and_rejects_docker_sections(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            value = manifest(root, consistency={'mode': 'files'}, sources={
+                'paths': [{'id': 'data', 'path': 'data'}],
+                'volumes': [],
+            })
+            self.assertTrue(manifest_module.validate_manifest(value))
+
+            with self.assertRaisesRegex(ValueError, 'compose is not supported'):
+                manifest_module.validate_manifest({
+                    **value, 'compose': {'files': ['compose.yaml']},
+                })
+            with self.assertRaisesRegex(ValueError, 'compose is not supported'):
+                manifest_module.validate_manifest({
+                    **value, 'compose': None,
+                })
+            with self.assertRaisesRegex(ValueError, 'volumes is not supported'):
+                manifest_module.validate_manifest({
+                    **value,
+                    'sources': {
+                        'paths': [],
+                        'volumes': [{'id': 'data', 'name': 'demo_data'}],
+                    },
+                })
+            with self.assertRaisesRegex(ValueError, 'only valid with mode hooks'):
+                manifest_module.validate_manifest({
+                    **value,
+                    'consistency': {
+                        'mode': 'files', 'before': ['systemctl stop demo'],
+                    },
+                })
+
     def test_validation_precedence_keeps_consistency_before_compose(self):
         with tempfile.TemporaryDirectory() as tmp:
             value = manifest(Path(tmp))

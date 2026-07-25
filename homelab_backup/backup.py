@@ -20,7 +20,7 @@ from .common import (
 from .fingerprint import snapshot_context_fingerprint, stage_fingerprint
 from .manifest import (
     RETENTION_FLAGS, compose_model, manifest, manifests, service_label,
-    validate_manifest,
+    requires_docker, validate_manifest,
 )
 from .identity import account, action_user
 from .security import (
@@ -378,6 +378,17 @@ def backup_one(
 
 def cmd_validate(c, args):
     errors = []
+
+    def record_manifest_error(path, err):
+        message = format_remediable_error(str(path), err)
+        print(f'ERROR: {message}', file=sys.stderr)
+        errors.append(message)
+
+    ms = manifests(
+        c,
+        include_disabled=True,
+        on_error=record_manifest_error,
+    )
     try:
         validate_trusted_roots(c['trusted_data_roots'])
     except (OSError, ValueError, RuntimeError) as err:
@@ -391,10 +402,45 @@ def cmd_validate(c, args):
             errors.append(format_remediable_error(
                 f'{key} is unsupported', err,
             ))
-    for command in ['docker', 'restic', 'rclone', 'rsync']:
+    schema_valid = []
+    runtime_ready = []
+    for m in ms:
+        label = f"{service_label(m)} ({m['_path']})"
+        print(f'\n== Validating {label} ==')
+        try:
+            validate_manifest(m)
+            schema_valid.append(m)
+            for phase in ('before', 'finally', 'on_success', 'on_failure'):
+                for action in (m.get('actions') or {}).get(phase, []):
+                    executable = action['command'][0]
+                    run_as = action_user(action)
+                    account(run_as)
+                    if action_executable(
+                            action['command'], run_as=run_as,
+                    ) is None:
+                        raise RuntimeError(
+                            f'action {action["name"]!r} executable is missing: '
+                            f'{executable}'
+                        )
+            if (m.get('consistency') or {}).get('mode') == 'snapshot':
+                for executable in ('btrfs', 'findmnt'):
+                    if shutil.which(executable) is None:
+                        raise RuntimeError(
+                            f'snapshot mode requires command: {executable}'
+                        )
+            runtime_ready.append((m, label))
+        except (OSError, ValueError, RuntimeError, KeyError, TypeError) as err:
+            message = format_remediable_error(label, err)
+            print(f'ERROR: {message}', file=sys.stderr)
+            errors.append(message)
+    needs_docker = any(requires_docker(m) for m in schema_valid)
+    required_commands = ['restic', 'rclone', 'rsync']
+    if needs_docker:
+        required_commands.insert(0, 'docker')
+    for command in required_commands:
         if not shutil.which(command):
             errors.append(f'missing command: {command}')
-    if shutil.which('docker'):
+    if needs_docker and shutil.which('docker'):
         try:
             validate_docker_environment()
             validate_docker_bind_probe(c)
@@ -418,44 +464,13 @@ def cmd_validate(c, args):
             errors.append(format_remediable_error(
                 f'unsafe config file {c[key]}', err,
             ))
-    def record_manifest_error(path, err):
-        message = format_remediable_error(str(path), err)
-        print(f'ERROR: {message}', file=sys.stderr)
-        errors.append(message)
-
-    ms = manifests(
-        c,
-        include_disabled=True,
-        on_error=record_manifest_error,
-    )
     if not any(m.get('enabled', True) for m in ms):
         errors.append(
             f"no enabled backup.yaml manifests found under {c['services_root']}/"
         )
-    for m in ms:
-        label = f"{service_label(m)} ({m['_path']})"
-        print(f'\n== Validating {label} ==')
+    for m, label in runtime_ready:
         try:
-            validate_manifest(m)
-            for phase in ('before', 'finally', 'on_success', 'on_failure'):
-                for action in (m.get('actions') or {}).get(phase, []):
-                    executable = action['command'][0]
-                    run_as = action_user(action)
-                    account(run_as)
-                    if action_executable(
-                            action['command'], run_as=run_as,
-                    ) is None:
-                        raise RuntimeError(
-                            f'action {action["name"]!r} executable is missing: '
-                            f'{executable}'
-                        )
-            if (m.get('consistency') or {}).get('mode') == 'snapshot':
-                for executable in ('btrfs', 'findmnt'):
-                    if shutil.which(executable) is None:
-                        raise RuntimeError(
-                            f'snapshot mode requires command: {executable}'
-                        )
-            model = compose_model(m)
+            model = compose_model(m) if requires_docker(m) else None
             validate_runtime_sources(
                 c, m, model,
                 allow_missing_paths=(m.get('consistency') or {}).get('mode') == 'hooks',

@@ -283,7 +283,7 @@ def _validate_consistency(m, path):
     if unknown_consistency:
         raise ValueError(f'{path}: unsupported consistency fields: {unknown_consistency}')
     mode = consistency.get('mode', 'stop')
-    modes = ('stop', 'hooks', 'external', 'live', 'snapshot')
+    modes = ('stop', 'hooks', 'external', 'live', 'snapshot', 'files')
     if mode not in modes:
         raise ValueError(
             f'{path}: invalid consistency.mode {mode!r}; expected '
@@ -360,6 +360,8 @@ def _validate_actions(m, path):
 
 def _validate_compose(m, path):
     compose = m.get('compose')
+    if not requires_docker(m) and 'compose' in m:
+        raise ValueError(f'{path}: compose is not supported with consistency.mode files')
     if compose is None:
         compose = {}
     if not isinstance(compose, dict):
@@ -466,6 +468,10 @@ def _validate_sources(m, path):
         entries = sources.get(kind, [])
         if not isinstance(entries, list):
             raise ValueError(f'{path}: sources.{kind} must be a list')
+        if kind == 'volumes' and entries and not requires_docker(m):
+            raise ValueError(
+                f'{path}: sources.volumes is not supported with consistency.mode files'
+            )
         for index, source in enumerate(entries):
             if not isinstance(source, dict):
                 raise ValueError(f'{path}: sources.{kind}[{index}] must be a mapping')
@@ -485,6 +491,13 @@ def validate_manifest(m: ServiceManifest):
     validate_retention(m)
     _validate_sources(m, path)
     return True
+
+
+def requires_docker(m: ServiceManifest):
+    consistency = m.get('consistency')
+    if not isinstance(consistency, dict):
+        return True
+    return consistency.get('mode', 'stop') != 'files'
 
 
 def compose_model(m):

@@ -123,7 +123,7 @@ class OptionalActionFailureModel(_SnapshotModel):
 
 
 class ConsistencyMetadataModel(_SnapshotModel):
-    mode: Literal['stop', 'hooks', 'external', 'live', 'snapshot']
+    mode: Literal['stop', 'hooks', 'external', 'live', 'snapshot', 'files']
     guarantee: CaptureMethod
     optional_action_failures: tuple[OptionalActionFailureModel, ...]
     writers: tuple[str, ...]
@@ -144,7 +144,7 @@ class RestoreInventoryModel(_SnapshotModel):
     service_relative_directory: str | None = None
     paths: tuple[InventoryPathModel, ...]
     volumes: tuple[InventoryVolumeModel, ...]
-    compose: ComposeIdentityModel
+    compose: ComposeIdentityModel | None = None
     consistency: ConsistencyMetadataModel | None = None
 
     @field_validator('version', mode='before')
@@ -172,6 +172,8 @@ class RestoreInventoryModel(_SnapshotModel):
 
     @property
     def compose_volumes_by_id(self):
+        if self.compose is None:
+            return {}
         return {item.id: item for item in self.compose.volumes}
 
     @classmethod

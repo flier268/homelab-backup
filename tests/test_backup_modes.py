@@ -215,7 +215,7 @@ class CaptureModeTests(unittest.TestCase):
         self.assertEqual(events[:2], ['cleanup', 'before'])
 
     def test_each_consistency_mode_dispatches_to_exactly_one_handler(self):
-        expected = {'hooks', 'stop', 'external', 'live', 'snapshot'}
+        expected = {'hooks', 'stop', 'external', 'live', 'snapshot', 'files'}
         self.assertEqual(set(capture._MODE_HANDLERS), expected)
         for mode in sorted(expected):
             result = capture._CaptureResult([], [])

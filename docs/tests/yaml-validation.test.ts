@@ -98,6 +98,29 @@ sources: null
     })
   })
 
+  it('preserves an explicit files mode without adding Compose defaults', () => {
+    const parsed = parseEditorDocument(`
+version: 1
+service: host-files
+schedule:
+  enabled: false
+retention:
+  keep_last: 1
+consistency:
+  mode: files
+sources:
+  paths:
+    - id: data
+      path: /srv/data
+  volumes: []
+`)
+
+    expect(parsed.kind).toBe('service')
+    if (parsed.kind !== 'service') throw new Error('expected service manifest')
+    expect(parsed.value.compose).toBeUndefined()
+    expect(validateDocument(parsed)).toEqual([])
+  })
+
   it('rejects nested values whose types would crash an editor control', () => {
     expect(() => parseEditorDocument(`
 version: 1
@@ -150,6 +173,27 @@ describe('schema validation', () => {
       kind: 'service',
       value: createServiceManifest(),
     })).toEqual([])
+  })
+
+  it('accepts files mode and rejects Docker-only sections', () => {
+    const value = createServiceManifest()
+    value.consistency = { mode: 'files', before: [], after: [] }
+    delete value.compose
+    value.sources = {
+      paths: [{ id: 'data', path: '/srv/data', required: true }],
+      volumes: [],
+    }
+    expect(validateDocument({ kind: 'service', value })).toEqual([])
+
+    value.compose = { files: ['compose.yaml'] }
+    expect(validateDocument({ kind: 'service', value })).toContainEqual(
+      expect.objectContaining({ path: 'compose' }),
+    )
+    delete value.compose
+    value.sources.volumes = [{ id: 'data-volume', name: 'demo_data' }]
+    expect(validateDocument({ kind: 'service', value })).toContainEqual(
+      expect.objectContaining({ path: 'sources.volumes' }),
+    )
   })
 
   it('rejects overlapping path sources and duplicate action names', () => {

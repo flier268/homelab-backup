@@ -7,7 +7,9 @@ from .btrfs_snapshot import cleanup_snapshot_state
 from .capture import _check_backup_space
 from .common import run_cleanup
 from .inventory_models import RestoreInventoryModel
-from .manifest import compose_model, source_path, validate_manifest
+from .manifest import (
+    compose_model, requires_docker, source_path, validate_manifest,
+)
 from .security import (
     atomic_copy_file, atomic_write_json, ensure_private_directory,
     paths_overlap, validate_trusted_roots,
@@ -43,6 +45,17 @@ def _prepare_stage(c, m):
 
 
 def _build_stage_context(c, m, stage, mode, allow_low_space):
+    if not requires_docker(m):
+        validate_runtime_sources(c, m, None)
+        return _capture._StageContext(
+            config=c,
+            manifest=m,
+            stage=stage,
+            mode=mode,
+            resolved_volumes=[],
+            identity=None,
+            allow_low_space=allow_low_space,
+        )
     validate_docker_environment()
     validate_docker_bind_probe(c)
     model = compose_model(m)
@@ -80,7 +93,8 @@ def _write_stage_metadata(context, captured, optional_action_failures):
         item.get('capture_method', 'quiesced-copy')
         for item in source_entries
     ]
-    if optional_action_failures or 'best-effort' in capture_methods:
+    if context.mode == 'files' or optional_action_failures \
+            or 'best-effort' in capture_methods:
         overall_capture = 'best-effort'
     elif capture_methods and all(
             item == 'btrfs-snapshot' for item in capture_methods
@@ -99,7 +113,7 @@ def _write_stage_metadata(context, captured, optional_action_failures):
     # backup.yaml is always included as recovery metadata, even when it is not
     # listed in sources.paths.
     atomic_copy_file(m['_path'], meta / 'backup.yaml')
-    inventory = RestoreInventoryModel.from_snapshot_data({
+    inventory_data = {
         'version': 1,
         'service': m['service'],
         'service_directory': m['_dir'],
@@ -108,14 +122,16 @@ def _write_stage_metadata(context, captured, optional_action_failures):
         ),
         'paths': captured.paths,
         'volumes': captured.volumes,
-        'compose': context.identity,
         'consistency': {
             'mode': context.mode,
             'guarantee': overall_capture,
             'optional_action_failures': optional_action_failures,
             'writers': all_writers,
         },
-    })
+    }
+    if context.identity is not None:
+        inventory_data['compose'] = context.identity
+    inventory = RestoreInventoryModel.from_snapshot_data(inventory_data)
     atomic_write_json(meta / 'inventory.json', inventory.to_snapshot_dict())
     return context.stage
 

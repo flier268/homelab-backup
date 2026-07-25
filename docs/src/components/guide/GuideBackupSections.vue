@@ -9,6 +9,7 @@
         <tr><td><code>external</code></td><td>不控制服務，要求 writer 已由外部停止。</td><td>外部編排器已靜止的服務、唯讀資料。</td></tr>
         <tr><td><code>live</code></td><td>直接同步；偵測到 writer 時標成 <code>best-effort</code>。</td><td>可接受 fuzzy copy 的可重建內容。</td></tr>
         <tr><td><code>snapshot</code></td><td>對 Btrfs subvolume 建唯讀 snapshot，其餘來源直接同步。</td><td>需要低停機時間的檔案型服務。</td></tr>
+        <tr><td><code>files</code></td><td>只同步 path sources，不呼叫 Docker；inventory 保守標為 <code>best-effort</code>。</td><td>主機檔案與由 Actions 協調的非 Docker 服務。</td></tr>
       </tbody>
     </table>
     <div class="box warn">不確定時先使用 <code>stop</code>。它最保守，也最容易實際驗證還原結果。</div>
@@ -23,6 +24,20 @@ consistency:
   before:
     - ./scripts/dump-database.sh
   after: []</code></pre>
+    <h3>純檔案模式</h3>
+    <pre v-pre><code>consistency:
+  mode: files
+
+sources:
+  paths:
+    - id: data
+      path: /srv/example
+  volumes: []</code></pre>
+    <p>
+      <code>files</code> 不允許 <code>compose</code> 或 Docker volume，也不偵測 writer。
+      可使用 before/finally Actions 協調外部服務；還原只處理 path，不執行 Actions
+      或 <code>--start</code>。
+    </p>
     <h3>備份交易 actions</h3>
     <p>
       <code>actions.before</code> 與 <code>actions.finally</code> 適用所有模式；
@@ -194,6 +209,7 @@ sources:
         <tr><td><code>examples/minecraft.backup.yaml</code></td><td>停止服務後備份 bind mount。</td></tr>
         <tr><td><code>examples/ghost.backup.yaml</code></td><td>同時備份 bind mount 與 MySQL named volume。</td></tr>
         <tr><td><code>examples/palworld.backup.yaml</code></td><td>以 Btrfs snapshot 與 action 實作低停機備份。</td></tr>
+        <tr><td><code>examples/files.backup.yaml</code></td><td>不依賴 Docker、使用 Actions 協調外部服務的純檔案備份。</td></tr>
       </tbody>
     </table>
     <div class="box warn">資料庫建議用 <code>hooks</code> 產生 logical dump；若備份 raw volume，還原環境應使用相同產品與 major version。</div>

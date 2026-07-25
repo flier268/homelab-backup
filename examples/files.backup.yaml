@@ -1,0 +1,58 @@
+version: 1
+service: host-files
+name: Host Files
+enabled: true
+
+schedule:
+  cron: "30 3 * * *"
+  retry_after: 30m
+  max_lateness: 2h
+
+retention:
+  keep_last: 8
+  keep_daily: 14
+  keep_weekly: 8
+  keep_monthly: 12
+
+consistency:
+  mode: files
+
+actions:
+  before:
+    # These operator-provided commands should record whether the service was
+    # active and only resume it when it was active before the backup.
+    - name: quiesce-example
+      command: [/usr/local/sbin/example-backup-quiesce]
+      timeout: 60
+      required: true
+      run_as: root
+  finally:
+    - name: resume-example
+      command: [/usr/local/sbin/example-backup-resume]
+      timeout: 60
+      required: true
+      run_as: root
+  on_success:
+    - name: report-success
+      command: [/usr/local/sbin/report-backup, host-files, success]
+      timeout: 30
+      required: false
+      run_as: root
+  on_failure:
+    - name: report-failure
+      command: [/usr/local/sbin/report-backup, host-files, failure]
+      timeout: 30
+      required: false
+      run_as: root
+
+sources:
+  paths:
+    - id: application
+      path: /srv/example
+      required: true
+      exclude:
+        - cache/**
+    - id: configuration
+      path: /etc/example
+      required: true
+  volumes: []
