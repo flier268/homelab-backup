@@ -159,6 +159,7 @@ def _validated_members(archive, version):
     seen = set()
     total_size = 0
     install_member = None
+    guide_member = None
     for member in members:
         path = _member_path(member, expected_root)
         normalized = path.as_posix()
@@ -188,8 +189,18 @@ def _validated_members(archive, version):
             ):
                 raise UpgradeError('release archive contains an invalid install.sh')
             install_member = member
+        if normalized == f'{expected_root}/GUIDE.html':
+            if (
+                not member.isreg()
+                or member.size == 0
+                or member.mode & 0o022
+            ):
+                raise UpgradeError('release archive contains an invalid GUIDE.html')
+            guide_member = member
     if install_member is None:
         raise UpgradeError('release archive is missing install.sh')
+    if guide_member is None:
+        raise UpgradeError('release archive is missing GUIDE.html')
     return expected_root, members
 
 

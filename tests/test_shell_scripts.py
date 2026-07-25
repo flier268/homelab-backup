@@ -595,6 +595,10 @@ class DeploymentScriptTests(unittest.TestCase):
             'homelab_backup/*.py "$RELEASE_NEXT/app/homelab_backup/"',
             script,
         )
+        self.assertIn(
+            'install -m 0644 GUIDE.html "$RELEASE_NEXT/GUIDE.html"',
+            script,
+        )
         self.assertIn('homelab_backup.config_ops', script)
 
     def test_installer_atomically_publishes_app_and_venv_as_one_release(self):
@@ -602,6 +606,9 @@ class DeploymentScriptTests(unittest.TestCase):
         venv = script.index('python3 -m venv "$RELEASE_NEXT/venv"')
         app = script.index(
             'homelab_backup/*.py "$RELEASE_NEXT/app/homelab_backup/"',
+        )
+        guide = script.index(
+            'install -m 0644 GUIDE.html "$RELEASE_NEXT/GUIDE.html"',
         )
         helper = script.index(
             'docker build -t "$HELPER_IMAGE" -f Dockerfile.volume-rsync .',
@@ -613,6 +620,7 @@ class DeploymentScriptTests(unittest.TestCase):
         )
         self.assertLess(venv, publish)
         self.assertLess(app, publish)
+        self.assertLess(guide, publish)
         self.assertLess(helper, publish)
         self.assertLess(units, publish)
         self.assertLess(publish_launcher, publish)

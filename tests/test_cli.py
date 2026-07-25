@@ -24,6 +24,24 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class LauncherTests(unittest.TestCase):
+    def test_docs_parser_accepts_no_options(self):
+        args = cli.build_parser().parse_args(['docs'])
+
+        self.assertEqual(args.cmd, 'docs')
+
+    def test_docs_runs_without_root_config_or_backup_lock(self):
+        with mock.patch.object(cli.os, 'geteuid', return_value=1000), \
+                mock.patch.object(cli, 'cmd_docs') as command, \
+                mock.patch.object(cli, 'config_lock_file') as lock_file, \
+                mock.patch.object(cli, 'cfg') as cfg_mock, \
+                mock.patch.object(cli, 'GlobalLock') as global_lock:
+            cli.main(['docs'])
+
+        command.assert_called_once()
+        lock_file.assert_not_called()
+        cfg_mock.assert_not_called()
+        global_lock.assert_not_called()
+
     def test_upgrade_parser_accepts_no_options(self):
         args = cli.build_parser().parse_args(['upgrade'])
 

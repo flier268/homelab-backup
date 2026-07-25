@@ -155,6 +155,9 @@ python3 -m venv "$RELEASE_NEXT/venv"
   -r requirements.txt
 install -d -m 0755 "$RELEASE_NEXT/app/homelab_backup"
 install -m 0644 homelab_backup/*.py "$RELEASE_NEXT/app/homelab_backup/"
+if [[ -f GUIDE.html ]]; then
+  install -m 0644 GUIDE.html "$RELEASE_NEXT/GUIDE.html"
+fi
 (
   cd -- "$RELEASE_NEXT"
   PYTHONPATH="$RELEASE_NEXT/app" \

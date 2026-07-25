@@ -37,7 +37,7 @@ class DownloadResponse(io.BytesIO):
 
 def release_archive(
     version=NEXT_VERSION, extra=(), *, include_installer=True,
-    installer_mode=0o755,
+    installer_mode=0o755, include_guide=True, guide_mode=0o644,
 ):
     output = io.BytesIO()
     root = f'homelab-backup-{version}'
@@ -52,6 +52,12 @@ def release_archive(
             installer_info.mode = installer_mode
             installer_info.size = len(installer)
             archive.addfile(installer_info, io.BytesIO(installer))
+        if include_guide:
+            guide = b'<!doctype html><title>Guide</title>\n'
+            guide_info = tarfile.TarInfo(f'{root}/GUIDE.html')
+            guide_info.mode = guide_mode
+            guide_info.size = len(guide)
+            archive.addfile(guide_info, io.BytesIO(guide))
         for info, content in extra:
             if content is not None:
                 info.size = len(content)
@@ -135,6 +141,10 @@ class UpgradeTests(unittest.TestCase):
             nonlocal installer_root
             installer_root = source_root
             self.assertTrue((source_root / 'install.sh').is_file())
+            self.assertEqual(
+                (source_root / 'GUIDE.html').read_bytes(),
+                b'<!doctype html><title>Guide</title>\n',
+            )
 
         with tempfile.TemporaryDirectory() as tmp, InstalledLayout(tmp) as layout, \
                 mock.patch.object(
@@ -271,40 +281,53 @@ class UpgradeTests(unittest.TestCase):
         cases = []
         traversal = tarfile.TarInfo(f'{root}/../escape')
         traversal.mode = 0o644
-        cases.append(('traversal', ((traversal, b'x'),), True, 'unsafe path'))
+        cases.append(
+            ('traversal', ((traversal, b'x'),), True, True, 'unsafe path'),
+        )
         outside = tarfile.TarInfo('another-root/file')
         outside.mode = 0o644
-        cases.append(('outside', ((outside, b'x'),), True, 'outside'))
+        cases.append(('outside', ((outside, b'x'),), True, True, 'outside'))
         symlink = tarfile.TarInfo(f'{root}/link')
         symlink.type = tarfile.SYMTYPE
         symlink.linkname = '/etc/passwd'
-        cases.append(('symlink', ((symlink, None),), True, 'unsupported member'))
+        cases.append(
+            ('symlink', ((symlink, None),), True, True, 'unsupported member'),
+        )
         hardlink = tarfile.TarInfo(f'{root}/hardlink')
         hardlink.type = tarfile.LNKTYPE
         hardlink.linkname = f'{root}/install.sh'
-        cases.append(('hardlink', ((hardlink, None),), True, 'unsupported member'))
+        cases.append(
+            ('hardlink', ((hardlink, None),), True, True, 'unsupported member'),
+        )
         device = tarfile.TarInfo(f'{root}/device')
         device.type = tarfile.CHRTYPE
-        cases.append(('device', ((device, None),), True, 'unsupported member'))
+        cases.append(
+            ('device', ((device, None),), True, True, 'unsupported member'),
+        )
         fifo = tarfile.TarInfo(f'{root}/fifo')
         fifo.type = tarfile.FIFOTYPE
-        cases.append(('fifo', ((fifo, None),), True, 'unsupported member'))
+        cases.append(
+            ('fifo', ((fifo, None),), True, True, 'unsupported member'),
+        )
         wrong_version = tarfile.TarInfo(
             f'homelab-backup-{CURRENT_VERSION_PARTS[0]}.'
             f'{CURRENT_VERSION_PARTS[1]}.{CURRENT_VERSION_PARTS[2] + 2}/file'
         )
         wrong_version.mode = 0o644
         cases.append(
-            ('wrong-version', ((wrong_version, b'x'),), True, 'outside'),
+            ('wrong-version', ((wrong_version, b'x'),), True, True, 'outside'),
         )
-        cases.append(('missing-installer', (), False, 'missing install.sh'))
+        cases.append(('missing-installer', (), False, True, 'missing install.sh'))
+        cases.append(('missing-guide', (), True, False, 'missing GUIDE.html'))
 
-        for label, extra, include_installer, message in cases:
+        for label, extra, include_installer, include_guide, message in cases:
             with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
                 archive_path = Path(tmp) / 'release.tar.gz'
                 archive_path.write_bytes(
                     release_archive(
-                        extra=extra, include_installer=include_installer,
+                        extra=extra,
+                        include_installer=include_installer,
+                        include_guide=include_guide,
                     )
                 )
                 destination = Path(tmp) / 'source'
@@ -327,6 +350,19 @@ class UpgradeTests(unittest.TestCase):
                     upgrade._extract_archive(
                         archive_path, destination, NEXT_VERSION,
                     )
+
+    def test_archive_validation_rejects_unsafe_guide_permissions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            archive_path = Path(tmp) / 'release.tar.gz'
+            archive_path.write_bytes(release_archive(guide_mode=0o666))
+            destination = Path(tmp) / 'source'
+            destination.mkdir()
+            with self.assertRaisesRegex(
+                upgrade.UpgradeError, 'invalid GUIDE.html',
+            ):
+                upgrade._extract_archive(
+                    archive_path, destination, NEXT_VERSION,
+                )
 
     def test_installer_runs_bash_in_release_root_and_propagates_failure(self):
         source_root = Path('/tmp/source')

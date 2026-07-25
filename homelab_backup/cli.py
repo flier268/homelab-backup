@@ -12,6 +12,7 @@ from .common import (
     CommandError, GlobalLock, _print_command_failure, format_remediable_error,
 )
 from .config import cfg, config_lock_file
+from .docs import DocsError, cmd_docs
 from .maintenance import (
     cmd_check, cmd_list, cmd_maintenance, cmd_run_due, cmd_snapshots,
     cmd_status, cmd_unlock,
@@ -119,16 +120,20 @@ def build_parser():
     command = sub.add_parser('check')
     command.add_argument('--no-wait', action='store_true')
     sub.add_parser('unlock')
+    sub.add_parser('docs')
     sub.add_parser('upgrade')
     return parser
 
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
-    if os.geteuid() != 0:
-        print('ERROR: backupctl must run as root', file=sys.stderr)
-        raise SystemExit(1)
     try:
+        if args.cmd == 'docs':
+            cmd_docs(args)
+            return
+        if os.geteuid() != 0:
+            print('ERROR: backupctl must run as root', file=sys.stderr)
+            raise SystemExit(1)
         if args.cmd == 'upgrade':
             cmd_upgrade(args)
             return
@@ -146,7 +151,7 @@ def main(argv=None):
                     continue
                 COMMANDS[args.cmd](config, args)
                 break
-    except UpgradeError as err:
+    except (DocsError, UpgradeError) as err:
         print(f'ERROR: {err}', file=sys.stderr)
         raise SystemExit(1)
     except CommandError as err:

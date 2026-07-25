@@ -90,8 +90,14 @@ Release workflow 會拒絕 tag 與 `VERSION` 不一致的發布。
 sudo backupctl upgrade
 ```
 
-此指令只允許從 `/usr/local/sbin/backupctl` 的 installed layout 執行，不支援從
-Git checkout 啟動。它會先下載最新 Release 的 `SHA256SUMS`，確認版本高於目前
+升級後可由桌面使用者開啟目前版本隨附的離線指南與設定檔編輯器：
+
+```bash
+backupctl docs
+```
+
+`upgrade` 指令只允許從 `/usr/local/sbin/backupctl` 的 installed layout 執行，
+不支援從 Git checkout 啟動。它會先下載最新 Release 的 `SHA256SUMS`，確認版本高於目前
 版本後才下載對應的 `homelab-backup-X.Y.Z.tar.gz`；若已是最新版則直接成功結束，
 不下載 archive，也不允許降版或安裝 prerelease。
 
