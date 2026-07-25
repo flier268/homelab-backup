@@ -11,6 +11,37 @@ from homelab_backup import backup, capture, common, staging, storage
 from tests.helpers import manifest
 
 
+class ExceptionNoteCompatibilityTests(unittest.TestCase):
+    def test_legacy_exception_preserves_notes_without_add_note(self):
+        class LegacyError(Exception):
+            add_note = None
+
+        error = LegacyError('primary')
+        common.add_exception_note(error, 'secondary failure')
+
+        self.assertEqual(error.__notes__, ['secondary failure'])
+
+    def test_cleanup_failure_is_attached_to_primary_error(self):
+        primary = RuntimeError('primary failure')
+        observed = None
+
+        def fail_cleanup():
+            raise OSError('cleanup failure')
+
+        with redirect_stderr(io.StringIO()):
+            try:
+                raise primary
+            except RuntimeError as caught:
+                observed = caught
+                common.run_cleanup(fail_cleanup, 'test')
+
+        self.assertIs(observed, primary)
+        self.assertTrue(any(
+            'OSError: cleanup failure' in note
+            for note in getattr(primary, '__notes__', ())
+        ))
+
+
 class GhostHookExampleTests(unittest.TestCase):
     def test_hooks_restore_only_services_that_were_running(self):
         with tempfile.TemporaryDirectory() as tmp:

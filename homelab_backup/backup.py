@@ -13,8 +13,9 @@ from .actions import (
 )
 from .backup_state import load_state, save_state
 from .common import (
-    CommandError, FailureSummary, GlobalLock, _print_command_failure, die,
-    format_remediable_error, restic_env, run, run_cleanup,
+    CommandError, FailureSummary, GlobalLock, _print_command_failure,
+    add_exception_note, die, format_remediable_error, restic_env, run,
+    run_cleanup,
 )
 from .fingerprint import snapshot_context_fingerprint, stage_fingerprint
 from .manifest import (
@@ -353,12 +354,12 @@ class BackupWorkflow:
     @staticmethod
     def _raise_postcommit_errors(errors):
         primary = errors[0]
-        if hasattr(primary, 'add_note'):
-            for secondary in errors[1:]:
-                primary.add_note(
-                    'Additional post-commit failure: '
-                    f'{type(secondary).__name__}: {secondary}'
-                )
+        for secondary in errors[1:]:
+            add_exception_note(
+                primary,
+                'Additional post-commit failure: '
+                f'{type(secondary).__name__}: {secondary}',
+            )
         raise primary
 
 

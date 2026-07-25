@@ -92,6 +92,19 @@ class FailureSummary:
         raise SystemExit(1)
 
 
+def add_exception_note(error, note):
+    """Attach context to an exception on every supported Python version."""
+    add_note = getattr(error, 'add_note', None)
+    if callable(add_note):
+        add_note(note)
+        return
+    notes = getattr(error, '__notes__', None)
+    if notes is None:
+        notes = []
+        error.__notes__ = notes
+    notes.append(note)
+
+
 def run_cleanup(action, context):
     """Run cleanup without replacing an exception already in flight."""
     primary_error = sys.exc_info()[1]
@@ -108,10 +121,10 @@ def run_cleanup(action, context):
                 f'ERROR: {message}: {type(cleanup_error).__name__}: {cleanup_error}',
                 file=sys.stderr,
             )
-        if hasattr(primary_error, 'add_note'):
-            primary_error.add_note(
-                f'{message}: {type(cleanup_error).__name__}: {cleanup_error}'
-            )
+        add_exception_note(
+            primary_error,
+            f'{message}: {type(cleanup_error).__name__}: {cleanup_error}',
+        )
 
 
 def run(cmd, *, cwd=None, env=None, check=True, capture=False, pass_fds=()):
