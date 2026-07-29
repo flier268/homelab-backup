@@ -17,7 +17,6 @@ class CaptureModeTests(unittest.TestCase):
         self.config = {
             'staging_root': str(self.root / 'staging'),
             'state_root': str(self.root / 'state'),
-            'trusted_data_roots': [str(self.root)],
             'volume_helper_image': 'helper',
         }
         self.saved_inventory = None
@@ -41,7 +40,6 @@ class CaptureModeTests(unittest.TestCase):
     def common_patches(self):
         return (
             mock.patch.object(staging, 'cleanup_snapshot_state'),
-            mock.patch.object(staging, 'validate_trusted_roots'),
             mock.patch.object(staging, 'ensure_private_directory', side_effect=self._ensure),
             mock.patch.object(staging, 'validate_docker_environment'),
             mock.patch.object(staging, 'validate_docker_bind_probe'),
@@ -302,6 +300,9 @@ class CaptureModeTests(unittest.TestCase):
                 else:
                     stack.enter_context(mock.patch.object(
                         capture, 'running_services', return_value=['app'],
+                    ))
+                    stack.enter_context(mock.patch.object(
+                        capture, 'validate_no_docker_writers',
                     ))
                     stack.enter_context(mock.patch.object(
                         capture, 'compose_run',

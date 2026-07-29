@@ -8,13 +8,12 @@ from pathlib import Path
 from typing import Callable
 
 from .common import run, run_cleanup
-from .manifest import compose_run, requires_docker, source_path
+from .manifest import compose_model, compose_run, requires_docker, source_path
 from .restore_plan import (
     RestorePlan,
     compose_authorization_projection,
     compose_targets,
     deferred_compose_sources,
-    inventory_volumes,
     load_restore_inventory,
     prepare_restore_plan,
     restored_path_details,
@@ -26,12 +25,13 @@ from .restore_plan import (
 from .security import (
     atomic_copy_file, clear_control_leaf, data_object_metadata_state,
     data_object_state, ensure_control_parent, open_data_parent, open_data_path,
-    remove_data_entry, validate_data_parent, validate_data_path, validate_payload,
+    remove_data_entry, validate_data_mount_boundary, validate_data_parent,
+    validate_data_path, validate_payload,
 )
 from .storage import (
     build_path_filter_args, create_restore_volume, docker_mount_conflicts,
-    docker_project_containers, docker_volume_exists, sync_volumes,
-    validate_volume_identity, volume_owned_by_operation,
+    docker_project_containers, docker_volume_exists, resolved_volume_sources,
+    sync_volumes, validate_volume_identity, volume_owned_by_operation,
 )
 from .types import GlobalConfig, ServiceManifest
 
@@ -201,16 +201,17 @@ def restore_path_source(
     if source_type == 'directory' and (not restored.is_dir() or restored.is_symlink()):
         raise RuntimeError(f'restored directory artifact is missing: {restored}')
     direct_library_call = c is None
-    c = c or {'trusted_data_roots': [str(Path(target).parent)]}
+    c = c or {}
     if direct_library_call:
         try:
-            validate_data_path(target, c['trusted_data_roots'])
+            validate_data_path(target)
         except FileNotFoundError:
             pass
     elif rebuild:
-        validate_data_parent(target, c['trusted_data_roots'], allow_missing=True)
+        validate_data_parent(target, allow_missing=True)
     else:
-        validate_data_path(target, c['trusted_data_roots'])
+        validate_data_path(target)
+    mount_state = validate_data_mount_boundary(target)
     validate_payload(restored)
     if hasattr(inventory, 'paths_by_id'):
         entry = inventory.paths_by_id[source['id']]
@@ -222,43 +223,48 @@ def restore_path_source(
         )
         ancestor_metadata = entry.get('ancestors')
     parent_fd, name = open_data_parent(
-        target, c['trusted_data_roots'],
-        create_metadata=ancestor_metadata if rebuild else None,
+        target, create_metadata=ancestor_metadata if rebuild else None,
     )
     try:
         normalize_restore_target(parent_fd, name, source_type)
         if source_type in ('file', 'symlink'):
-            return _restore_non_directory(
+            identity = _restore_non_directory(
                 restored, parent_fd, name, on_publish=on_publish,
             )
-        if rebuild:
-            return _restore_rebuild_directory(
+        elif rebuild:
+            identity = _restore_rebuild_directory(
                 restored, parent_fd, name, on_publish=on_publish,
             )
-        try:
-            os.mkdir(name, 0o700, dir_fd=parent_fd)
-        except FileExistsError:
-            pass
-        target_fd = os.open(
-            name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-            dir_fd=parent_fd,
-        )
-        try:
-            command = ['rsync', '-aHAX', '--numeric-ids', '--delete']
-            command += build_path_filter_args(
-                source, protect_destination_dirs=True,
+        else:
+            try:
+                os.mkdir(name, 0o700, dir_fd=parent_fd)
+            except FileExistsError:
+                pass
+            target_fd = os.open(
+                name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=parent_fd,
             )
-            command += [f'{restored}/', f'/proc/self/fd/{target_fd}/']
-            run(command, pass_fds=(target_fd,))
-            metadata = os.fstat(target_fd)
-            identity = (metadata.st_dev, metadata.st_ino)
-            if on_publish is not None:
-                on_publish(identity, data_object_state(target_fd))
-            return identity
-        finally:
-            os.close(target_fd)
+            try:
+                command = [
+                    'rsync', '-aHAX', '--numeric-ids', '--delete',
+                    '--one-file-system',
+                ]
+                command += build_path_filter_args(
+                    source, protect_destination_dirs=True,
+                )
+                command += [f'{restored}/', f'/proc/self/fd/{target_fd}/']
+                run(command, pass_fds=(target_fd,))
+                metadata = os.fstat(target_fd)
+                identity = (metadata.st_dev, metadata.st_ino)
+                if on_publish is not None:
+                    on_publish(identity, data_object_state(target_fd))
+            finally:
+                os.close(target_fd)
     finally:
         os.close(parent_fd)
+    if validate_data_mount_boundary(target) != mount_state:
+        raise RuntimeError(f'mount topology changed during restore: {target}')
+    return identity
 
 
 def _stop_running_services(plan):
@@ -302,11 +308,11 @@ def _dynamic_preflight(c, plan):
             )
     for source in (plan.manifest.get('sources') or {}).get('paths', []):
         target = source_path(plan.manifest, source)
-        trusted_roots = c.get('trusted_data_roots') or [str(Path(target).parent)]
         if plan.mode == 'rebuild':
-            validate_data_parent(target, trusted_roots, allow_missing=True)
+            validate_data_parent(target, allow_missing=True)
         else:
-            validate_data_path(target, trusted_roots)
+            validate_data_path(target)
+        validate_data_mount_boundary(target)
         entry = _plan_path_entry(plan, source['id'])
         present = (
             entry.present if hasattr(entry, 'present')
@@ -319,7 +325,13 @@ def _dynamic_preflight(c, plan):
         elif present and not exists:
             raise RuntimeError(f'existing target disappeared during preflight: {target}')
     if plan.mode == 'rebuild' and not files_mode:
+        compose_names = {
+            name for source, name in plan.volumes
+            if source.get('compose_volume')
+        }
         for name in plan.all_volume_names:
+            if name in compose_names:
+                continue
             if docker_volume_exists(name):
                 raise RuntimeError(f'rebuild volume appeared during preflight: {name}')
     for source, name in plan.volumes:
@@ -335,11 +347,9 @@ def _dynamic_preflight(c, plan):
         manifest_target = Path(plan.manifest.get(
             '_path', Path(plan.manifest['_dir']) / 'backup.yaml',
         ))
-        controls = (
-            (manifest_target,)
-            if files_mode
-            else (manifest_target, *compose_targets(plan.manifest))
-        )
+        controls = list(() if files_mode else compose_targets(plan.manifest))
+        if plan.manifest.get('_restore_manifest_requested'):
+            controls.append(manifest_target)
         if any(path.exists() or path.is_symlink() for path in controls):
             raise RuntimeError('rebuild control target appeared during preflight')
 
@@ -395,7 +405,6 @@ class VolumeClaim:
 class DataAncestorClaim:
     path: Path
     identity: tuple[int, int]
-    trusted_roots: tuple[str, ...]
 
     @property
     def label(self):
@@ -403,7 +412,7 @@ class DataAncestorClaim:
 
     def rollback(self, deps):
         try:
-            parent_fd, name = deps.open_parent(self.path, self.trusted_roots)
+            parent_fd, name = deps.open_parent(self.path)
         except FileNotFoundError:
             return
         try:
@@ -436,7 +445,6 @@ class DataAncestorClaim:
 @dataclass
 class DataPathClaim:
     path: Path
-    trusted_roots: tuple[str, ...]
     identity: tuple[int, int] | None = None
     state: object = None
     owned: bool = False
@@ -449,9 +457,7 @@ class DataPathClaim:
         if not self.owned:
             return
         try:
-            parent_fd, name = deps.open_parent(
-                self.path, self.trusted_roots,
-            )
+            parent_fd, name = deps.open_parent(self.path)
         except FileNotFoundError:
             return
         try:
@@ -467,9 +473,7 @@ class DataPathClaim:
                     f'changed: {self.path}', file=sys.stderr,
                 )
                 return
-            descriptor, _metadata = deps.open_path(
-                self.path, self.trusted_roots,
-            )
+            descriptor, _metadata = deps.open_path(self.path)
             try:
                 current_state = deps.object_state(descriptor)
             finally:
@@ -536,12 +540,10 @@ class RestoreChanges:
 
 def _claim_rebuild_path(c, target, source_type, ancestors, claim, ledger):
     def ancestor_created(path, identity):
-        ledger.add(DataAncestorClaim(
-            Path(path), identity, tuple(c['trusted_data_roots']),
-        ))
+        ledger.add(DataAncestorClaim(Path(path), identity))
 
     parent_fd, name = open_data_parent(
-        target, c['trusted_data_roots'], create_metadata=ancestors,
+        target, create_metadata=ancestors,
         on_create=ancestor_created,
     )
     try:
@@ -577,11 +579,85 @@ def _plan_path_entry(plan, source_id):
     )
 
 
+def _resolved_rebuild_volumes(plan, model):
+    if model.get('name') != plan.project_name:
+        raise RuntimeError(
+            f'Compose project identity changed: expected {plan.project_name!r}, '
+            f'got {model.get("name")!r}'
+        )
+    resolved_by_id = {
+        source['id']: (source, name)
+        for source, name in resolved_volume_sources(plan.manifest, model=model)
+    }
+    resolved = []
+    seen = {}
+    compose_volumes = model.get('volumes') or {}
+    for source, snapshot_name in plan.volumes:
+        _resolved_source, name = resolved_by_id[source['id']]
+        if name != snapshot_name:
+            raise RuntimeError(
+                f'restored volume target differs from the reviewed Compose '
+                f'model for {source["id"]!r}: snapshot={snapshot_name!r}, '
+                f'compose={name!r}'
+            )
+        logical_name = source.get('compose_volume')
+        if logical_name and compose_volumes[logical_name].get('external'):
+            raise RuntimeError(
+                f'rebuild cannot restore external Compose volume '
+                f'{logical_name!r}; exclude it from rebuild and restore it '
+                'separately after reviewing its rollback requirements'
+            )
+        if name in seen:
+            raise RuntimeError(
+                f'duplicate rebuild volume target {name!r} for '
+                f'{seen[name]!r} and {source["id"]!r}'
+            )
+        seen[name] = source['id']
+        resolved.append((source, name))
+    return tuple(resolved)
+
+
+def _create_rebuild_compose_volumes(
+        plan, model, resolved_volumes, changes, operation_id,
+):
+    compose_volumes = model.get('volumes') or {}
+    for source, name in resolved_volumes:
+        logical_name = source.get('compose_volume')
+        if not logical_name:
+            continue
+        volume = compose_volumes[logical_name]
+        if docker_volume_exists(name):
+            raise RuntimeError(f'rebuild Compose volume already exists: {name}')
+        claim = changes.rollback.add(VolumeClaim(name, operation_id))
+        create_restore_volume(
+            name,
+            service=plan.manifest['service'],
+            source=source,
+            project_name=plan.project_name,
+            operation_id=operation_id,
+            driver=volume.get('driver'),
+            driver_opts=volume.get('driver_opts'),
+            labels=volume.get('labels') or {},
+            on_created=lambda _name, claim=claim:
+            setattr(claim, 'owned', True),
+        )
+
+
 def _restore_data(c, plan, changes, operation_id):
     ledger = changes.rollback
     live_mutations = changes.live_mutations
+    resolved_volumes = plan.volumes
     if plan.mode == 'rebuild':
-        for source, name in plan.volumes:
+        model = None
+        if any(source.get('compose_volume') for source, _name in plan.volumes):
+            model = compose_model(plan.manifest)
+            resolved_volumes = _resolved_rebuild_volumes(plan, model)
+            _create_rebuild_compose_volumes(
+                plan, model, resolved_volumes, changes, operation_id,
+            )
+        for source, name in resolved_volumes:
+            if source.get('compose_volume'):
+                continue
             volume_claim = ledger.add(VolumeClaim(name, operation_id))
             create_restore_volume(
                 name, service=plan.manifest['service'], source=source,
@@ -600,9 +676,7 @@ def _restore_data(c, plan, changes, operation_id):
                 plan.manifest, plan.root, source, plan.inventory,
             )
             if source_type != 'missing':
-                claim = DataPathClaim(
-                    Path(target), tuple(c['trusted_data_roots']),
-                )
+                claim = DataPathClaim(Path(target))
                 entry = _plan_path_entry(plan, source['id'])
                 ancestors = (
                     [item.model_dump() for item in entry.ancestors]
@@ -622,9 +696,7 @@ def _restore_data(c, plan, changes, operation_id):
             if claim is None:
                 return
             if state is None:
-                descriptor, _metadata = open_data_path(
-                    target, claim.trusted_roots,
-                )
+                descriptor, _metadata = open_data_path(target)
                 try:
                     state = data_object_state(descriptor)
                 finally:
@@ -643,7 +715,8 @@ def _restore_data(c, plan, changes, operation_id):
         )
     if requires_docker(plan.manifest):
         sync_volumes(
-            c, plan.manifest, plan.root, restore=True, resolved=plan.volumes,
+            c, plan.manifest, plan.root, restore=True,
+            resolved=resolved_volumes,
         )
 
 
@@ -662,7 +735,7 @@ def _publish_controls(c, requested_manifest, plan, changes):
             if source_type != 'file':
                 raise RuntimeError(f'Compose source must be a regular file: {target}')
             if plan.mode == 'rebuild':
-                ensure_control_parent(target.parent, c['trusted_data_roots'])
+                ensure_control_parent(target.parent)
                 claim = ledger.add(ControlPathClaim(Path(target)))
 
                 def published(identity, claim=claim):
@@ -679,7 +752,7 @@ def _publish_controls(c, requested_manifest, plan, changes):
     if requested_manifest.get('_restore_manifest_requested'):
         target = Path(requested_manifest['_path'])
         if plan.mode == 'rebuild':
-            ensure_control_parent(target.parent, c['trusted_data_roots'])
+            ensure_control_parent(target.parent)
             claim = ledger.add(ControlPathClaim(target))
 
             def manifest_published(identity):
@@ -745,6 +818,43 @@ class RestoreApplyWorkflow:
     def apply(self, c, m, root, *, start_services=False):
         deps = self.dependencies
         plan = deps.prepare_plan(c, m, root)
+        print(f'RESTORE PLAN ({plan.mode})')
+        for source in (
+            (getattr(plan, 'manifest', {}).get('sources') or {}).get('paths', [])
+        ):
+            entry = _plan_path_entry(plan, source['id'])
+            present = (
+                entry.present if hasattr(entry, 'present')
+                else entry['present']
+            )
+            print(
+                f'  path {source["id"]}: '
+                f'{source_path(plan.manifest, source)} '
+                f'({"restore" if present else "snapshot absent"})'
+            )
+        inventory = getattr(plan, 'inventory', None)
+        inventory_volumes = getattr(inventory, 'volumes', None)
+        if not isinstance(inventory_volumes, (list, tuple)):
+            for source, name in getattr(plan, 'volumes', ()):
+                print(f'  volume {source["id"]}: {name} (restore)')
+        else:
+            for entry in inventory_volumes:
+                source_id = (
+                    entry.id if hasattr(entry, 'id') else entry['id']
+                )
+                name = (
+                    entry.actual_name
+                    if hasattr(entry, 'actual_name')
+                    else entry['actual_name']
+                )
+                present = (
+                    entry.present if hasattr(entry, 'present')
+                    else entry['present']
+                )
+                print(
+                    f'  volume {source_id}: {name} '
+                    f'({"restore" if present else "snapshot absent"})'
+                )
         if start_services and not requires_docker(plan.manifest):
             raise ValueError('--start is not supported for files mode')
         targets = list(plan.running_services)
@@ -766,8 +876,13 @@ class RestoreApplyWorkflow:
         try:
             deps.dynamic_preflight(c, plan)
             mutation_started = True
-            deps.restore_data(c, plan, changes, deps.operation_id())
-            deps.publish_controls(c, m, plan, changes)
+            operation_id = deps.operation_id()
+            if plan.mode == 'rebuild':
+                deps.publish_controls(c, m, plan, changes)
+                deps.restore_data(c, plan, changes, operation_id)
+            else:
+                deps.restore_data(c, plan, changes, operation_id)
+                deps.publish_controls(c, m, plan, changes)
         except Exception:
             if not mutation_started and targets:
                 deps.cleanup(

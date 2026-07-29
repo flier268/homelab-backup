@@ -24,7 +24,6 @@ from .manifest import (
 from .security import (
     clear_control_leaf, ensure_private_directory, lexical_absolute,
     path_contains, read_control_text, validate_control_root,
-    validate_trusted_roots,
 )
 from .storage import (
     validate_docker_bind_probe, validate_docker_environment,
@@ -475,6 +474,19 @@ def cmd_restore(c, args):
 
     if args.snapshot != 'latest' and len(selected) != 1:
         die('an explicit snapshot ID can restore exactly one service')
+    if args.apply and c.get('services_root'):
+        missing_authorization = [
+            service for service in selected
+            if find_manifest(c, service) is None
+        ]
+        if missing_authorization:
+            die(
+                'restore --apply requires a protected local manifest for: '
+                + ', '.join(missing_authorization)
+                + '; run restore without --apply, review and install '
+                '_meta/backup.yaml under services_root, run backupctl '
+                'validate, then run backupctl apply'
+            )
 
     print('Selected services: ' + ', '.join(selected))
     if not args.yes:
@@ -486,9 +498,6 @@ def cmd_restore(c, args):
     snapshot = args.snapshot
     if snapshot != 'latest':
         snapshot = resolve_explicit_snapshot(c, selected[0], snapshot)
-    if args.apply:
-        validate_trusted_roots(c['trusted_data_roots'])
-
     policy = 'restore' if args.restore_manifest else 'keep' if args.keep_manifest else 'ask'
     restore_options = {}
     if vars(args).get('allow_low_space', False):
@@ -576,7 +585,6 @@ def cmd_apply(c, args):
     with GlobalLock(c['lock_file']) as acquired:
         if not acquired:
             die('another backupctl process is running')
-        validate_trusted_roots(c['trusted_data_roots'])
         root = _validated_apply_workspace(c, args.service, args.restore_dir)
         m = manifest(c, args.service)
         if requires_docker(m):

@@ -219,6 +219,33 @@ describe('schema validation', () => {
     expect(issues.some(({ message }) => message.includes('跨 phase 唯一'))).toBe(true)
   })
 
+  it('rejects data paths covering protected controls but allows exact Compose controls', () => {
+    const value = createServiceManifest()
+    value.compose = {
+      files: ['config/compose.yaml'],
+      env_file: 'config/compose.env',
+    }
+    value.sources!.paths = [{ id: 'all', path: '.' }]
+    expect(validateDocument({ kind: 'service', value }))
+      .toContainEqual(expect.objectContaining({
+        path: 'sources.paths[0]',
+        message: expect.stringContaining('backup.yaml'),
+      }))
+
+    value.sources!.paths = [{ id: 'config', path: 'config' }]
+    expect(validateDocument({ kind: 'service', value }))
+      .toContainEqual(expect.objectContaining({
+        path: 'sources.paths[0]',
+        message: expect.stringContaining('Compose 控制檔'),
+      }))
+
+    value.sources!.paths = [
+      { id: 'compose', path: 'config/compose.yaml' },
+      { id: 'env', path: 'config/compose.env' },
+    ]
+    expect(validateDocument({ kind: 'service', value })).toEqual([])
+  })
+
   it('allows Bash hooks only in hooks mode', () => {
     const value = createServiceManifest()
     value.consistency = {
@@ -283,15 +310,15 @@ describe('schema validation', () => {
     }))
   })
 
-  it('matches the runtime global path-isolation matrix', () => {
-    const value = createGlobalConfig()
-    value.trusted_data_roots = ['/srv/data']
-    value.staging_root = '/srv/data/staging'
+  it('accepts but removes the deprecated trusted data roots field', () => {
+    const parsed = parseEditorDocument(`
+version: 1
+host_id: server-a
+trusted_data_roots:
+  - /srv/data
+`)
 
-    expect(validateDocument({ kind: 'global', value }))
-      .toContainEqual(expect.objectContaining({
-        path: 'trusted_data_roots[0]',
-      }))
+    expect(serializeEditorDocument(parsed)).not.toContain('trusted_data_roots')
   })
 
   it('rejects empty compose env files and hook commands', () => {

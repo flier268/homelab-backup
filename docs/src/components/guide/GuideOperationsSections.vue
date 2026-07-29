@@ -57,11 +57,34 @@ sudo backupctl restore minecraft --snapshot 01234567 --apply</code></pre>
     <p>非 TTY 的所有 restore 都必須明確加入 <code>--yes</code>；空間不足則需另加 <code>--allow-low-space</code>。</p>
     <h3><code>backup.yaml</code> 還原規則</h3>
     <ul>
-      <li><strong>現有部署：</strong>本機 manifest、Compose files 與 snapshot inventory 必須相符。</li>
-      <li><strong>全新重建：</strong>相關設定、paths、volumes 與 container references 必須全部不存在。</li>
+      <li><strong>現有部署：</strong>受保護的本機 manifest 決定所有 path 與 volume target，並須與 snapshot inventory 相符。</li>
+      <li><strong>全新重建：</strong>先只下載並審核 snapshot manifest，再安裝為受保護的本機 manifest，完成 validate 後使用 <code>backupctl apply</code>。</li>
       <li><strong>混合狀態：</strong>只有部分 target 存在時一律拒絕，不猜測身分或覆寫。</li>
+      <li>snapshot manifest 只描述備份內容，不能單獨授權 root 寫入；<code>--yes</code> 也只確認執行。</li>
       <li><code>--restore-manifest</code> 只允許安全投影一致的 manifest；<code>--keep-manifest</code> 保留本機版本。</li>
     </ul>
+    <h3>全新服務的兩階段重建</h3>
+    <pre v-pre><code>sudo backupctl restore minecraft
+
+sudo install -d -o root -g root -m 0755 /srv/stacks/minecraft
+sudo install -o root -g root -m 0600 \
+  /var/lib/homelab-backup/restores/minecraft/RESTORE_ID/_meta/backup.yaml \
+  /srv/stacks/minecraft/backup.yaml
+
+sudo backupctl validate
+sudo backupctl apply minecraft \
+  /var/lib/homelab-backup/restores/minecraft/RESTORE_ID \
+  --start --yes</code></pre>
+    <p>請以實際 restore ID 與審核後選定的 <code>services_root</code> 子目錄取代範例值。</p>
+    <div class="box warn">
+      若 <code>_meta/inventory.json</code> 有 <code>present: true</code> 的 Compose volume，
+      請核對 <code>actual_name</code> 與還原的 Compose 設定。套用時會先發布
+      Compose files，再以 <code>docker compose config --format json</code> 解析實際名稱、
+      driver、driver options 與 labels。工具只執行 <code>docker volume create</code>
+      建立需要還原的 named volume，補上 Compose identity 與本次操作 ownership labels；
+      此階段不建立 image、container 或 network。<code>external: true</code> 不屬於
+      自動建立與安全 rollback 的範圍，必須另行管理與還原。
+    </div>
     <p>只下載時資料保留在 <code>/var/lib/homelab-backup/restores/&lt;service&gt;/&lt;timestamp&gt;</code>；可清理：</p>
     <pre v-pre><code>sudo backupctl cleanup-restores minecraft/20260717-120000-000000001 --yes
 sudo backupctl cleanup-restores --all --yes</code></pre>
@@ -128,14 +151,20 @@ sudo ./install.sh</code></pre>
   --config /etc/homelab-backup/rclone/rclone.conf
 sudo backupctl snapshots</code></pre>
     <div class="box warn">這是連回既有 repository，<strong>不要執行 <code>backupctl init</code></strong>。</div>
-    <h3>4. 還原全部服務</h3>
-    <pre v-pre><code># 互動模式，預設全選
-sudo backupctl restore --apply --start
+    <h3>4. 下載、審核並安裝各服務 manifest</h3>
+    <pre v-pre><code>sudo backupctl restore --all
 
-# 完全非互動
-sudo backupctl restore --all \
-  --restore-manifest --apply --start --yes</code></pre>
-    <h3>5. 檢查服務，最後才開排程</h3>
+# 對每個服務審核 _meta/backup.yaml，安裝到 services_root 下的預定位置
+sudo install -d -o root -g root -m 0755 /srv/stacks/minecraft
+sudo install -o root -g root -m 0600 \
+  /var/lib/homelab-backup/restores/minecraft/RESTORE_ID/_meta/backup.yaml \
+  /srv/stacks/minecraft/backup.yaml
+sudo backupctl validate</code></pre>
+    <h3>5. 使用已安裝的本機 manifest 套用資料</h3>
+    <pre v-pre><code>sudo backupctl apply minecraft \
+  /var/lib/homelab-backup/restores/minecraft/RESTORE_ID \
+  --start --yes</code></pre>
+    <h3>6. 檢查服務，最後才開排程</h3>
     <pre v-pre><code>docker ps
 cd "/srv/stacks/Minecraft/Advent of Ascension Plus-2026"
 docker compose ps

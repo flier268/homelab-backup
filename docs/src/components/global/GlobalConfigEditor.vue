@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import type { GlobalConfig } from '../../domain/types'
-import StringListEditor from '../shared/StringListEditor.vue'
 
 const model = defineModel<GlobalConfig>({ required: true })
 model.value.rclone ??= {}
@@ -14,7 +13,7 @@ const check = computed(() => model.value.check!)
 <template>
   <div class="editor-stack">
     <el-alert
-      title="全域設定控制備份儲存庫、工作目錄與受信任資料邊界。路徑仍需在主機上由 backupctl validate 檢查權限與 filesystem。"
+      title="全域設定控制備份儲存庫與工作目錄；受保護的 backup.yaml 會授權其中宣告的確切 path 與 volume。"
       type="info"
       :closable="false"
       show-icon
@@ -36,16 +35,6 @@ const check = computed(() => model.value.check!)
             <el-input v-model="model.services_root" placeholder="/srv/stacks" />
           </el-form-item>
         </div>
-        <el-form-item label="Trusted data roots">
-          <StringListEditor
-            v-model="model.trusted_data_roots"
-            placeholder="/srv/data"
-            :minimum="1"
-          />
-          <div class="field-help">
-            各 root 必須為絕對路徑、不可重疊；path source 必須嚴格位於其中一個 root 之下。
-          </div>
-        </el-form-item>
       </el-form>
     </section>
 

@@ -86,8 +86,9 @@ sources:
       密碼與 token 不要放入 argv 或 manifest，應使用 root-only 設定或 secret。
     </div>
     <p>
-      <code>snapshot</code> 的暫存 subvolume 會放在 trusted root 的 root-only workspace，
-      並由 journal 追蹤與回收。多個 subvolume 依序建立，不保證跨 subvolume 原子性。
+      <code>snapshot</code> 的暫存 subvolume 會放在來源外部、同一 Btrfs filesystem
+      且受 root 保護的 workspace，並由 journal 追蹤與回收。若找不到安全且可見的
+      共同父目錄就拒絕 snapshot；多個 subvolume 依序建立，不保證跨 subvolume 原子性。
     </p>
   </section>
 
@@ -118,10 +119,12 @@ sources:
     </p>
     <h3>路徑來源安全邊界</h3>
     <ul>
-      <li>每個 path 必須嚴格位於唯一 trusted root 之下；控制路徑由 root 擁有且不可 group/world write。</li>
-      <li>程式以固定 descriptor 逐層開啟來源與目標；中間 symlink 會被拒絕。</li>
+      <li>受 root 保護的本機 <code>backup.yaml</code> 授權其中宣告的確切 path。</li>
+      <li>程式從 <code>/</code> 以固定 descriptor 逐層開啟來源與目標；中間 symlink 會被拒絕。</li>
+      <li>來源本身可以是 NTFS 等 filesystem 的 mount point，但來源下方的 nested mount 一律拒絕。</li>
       <li>來源本身是 symlink 時只保存 link 與目標字串，不跟隨 referent。</li>
-      <li>支援 ext4、xfs、Btrfs；不支援 ZFS、FUSE、NFS、autofs 或 cross-mount。</li>
+      <li>NTFS 的 UID/GID、mode、ACL、xattr、symlink 與 hardlink 保存能力取決於驅動與掛載選項。</li>
+      <li>一般 path source 可位於 Linux 可存取的 filesystem；NFS、autofs、FUSE、ZFS 等非 Btrfs filesystem 也可作 file-level、best-effort 備份，但斷線或 automount 尚未就緒時不保證可用，metadata 與 POSIX 語意取決於 filesystem 和 mount options，且不提供 snapshot consistency。來源內 nested mount 不支援。</li>
       <li>保存普通檔案、目錄、symlink、ACL、xattr 與 hardlink；拒絕 FIFO、socket 與 device node。</li>
       <li>inventory 保存數字 UID/GID 與 mode，讓全新 rebuild 能重建正確的資料祖先。</li>
     </ul>

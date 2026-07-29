@@ -10,6 +10,50 @@ from tests.helpers import manifest
 
 
 class RuntimeValidationTests(unittest.TestCase):
+    def test_restore_volume_maps_compose_driver_options_and_labels(self):
+        details = {
+            'Name': 'demo_db',
+            'Driver': 'custom-driver',
+            'Options': {'device': '/dev/example', 'mode': 'rw'},
+            'Labels': {
+                'example.owner': 'database',
+                'com.docker.compose.project': 'demo',
+                'com.docker.compose.volume': 'db',
+                'io.homelab-backup.service': 'demo',
+                'io.homelab-backup.source': 'db',
+                'io.homelab-backup.operation': 'operation',
+            },
+        }
+        with mock.patch.object(
+            storage, 'run', return_value=SimpleNamespace(stdout='demo_db\n'),
+        ) as run_mock, mock.patch.object(
+            storage, 'docker_volume_details', return_value=details,
+        ):
+            storage.create_restore_volume(
+                'demo_db',
+                service='demo',
+                source={'id': 'db', 'compose_volume': 'db'},
+                project_name='demo',
+                operation_id='operation',
+                driver='custom-driver',
+                driver_opts={'mode': 'rw', 'device': '/dev/example'},
+                labels={'example.owner': 'database'},
+            )
+
+        self.assertEqual(run_mock.call_args.args[0], [
+            'docker', 'volume', 'create',
+            '--driver', 'custom-driver',
+            '--opt', 'device=/dev/example',
+            '--opt', 'mode=rw',
+            '--label', 'example.owner=database',
+            '--label', 'io.homelab-backup.service=demo',
+            '--label', 'io.homelab-backup.source=db',
+            '--label', 'io.homelab-backup.operation=operation',
+            '--label', 'com.docker.compose.project=demo',
+            '--label', 'com.docker.compose.volume=db',
+            'demo_db',
+        ])
+
     def test_restore_volume_is_journaled_before_ownership_inspection(self):
         journal = []
         with mock.patch.object(
@@ -292,6 +336,117 @@ class RuntimeValidationTests(unittest.TestCase):
 
 
 class PathSyncTests(unittest.TestCase):
+    def test_path_source_needs_no_global_allowlist(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / 'ntfs-media' / 'photos'
+            source.mkdir(parents=True)
+            (source / 'photo.jpg').write_bytes(b'jpeg')
+            value = manifest(root, sources={
+                'paths': [{'id': 'photos', 'path': str(source)}],
+                'volumes': [],
+            })
+
+            ntfs = SimpleNamespace(filesystem_type='ntfs3')
+            with mock.patch.object(
+                storage, 'containing_mount', return_value=ntfs,
+            ):
+                storage.validate_runtime_sources({}, value, {})
+                storage.sync_paths({}, value, root / 'stage')
+
+            self.assertEqual(
+                (root / 'stage' / 'paths' / 'photos' / 'photo.jpg').read_bytes(),
+                b'jpeg',
+            )
+
+    def test_path_source_rejects_root_and_control_path_overlap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            value = manifest(root, sources={
+                'paths': [{'id': 'data', 'path': '/'}],
+                'volumes': [],
+            })
+            with self.assertRaisesRegex(ValueError, 'filesystem root'):
+                storage.validate_runtime_sources({}, value, {})
+
+            value['sources']['paths'][0]['path'] = str(root)
+            with self.assertRaisesRegex(ValueError, 'staging_root'):
+                storage.validate_runtime_sources(
+                    {'staging_root': str(root / 'staging')}, value, {},
+                )
+
+    def test_path_source_rejects_every_runtime_and_local_repository_overlap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_path = root / 'data'
+            source_path.mkdir()
+            source = {'id': 'data', 'path': str(source_path)}
+            value = manifest(root, sources={
+                'paths': [source], 'volumes': [],
+            })
+            for key in (
+                'staging_root', 'restore_root', 'cache_root', 'state_root',
+                'password_file', 'rclone_config', 'lock_file',
+            ):
+                with self.subTest(key=key), self.assertRaisesRegex(
+                    ValueError, key,
+                ):
+                    storage.validate_path_source_policy(
+                        {key: str(source_path / 'control')}, value, source,
+                    )
+            for repository in (
+                str(source_path / 'repository'),
+                f'local:{source_path / "repository"}',
+            ):
+                with self.subTest(repository=repository), \
+                        self.assertRaisesRegex(ValueError, 'repository'):
+                    storage.validate_path_source_policy(
+                        {'repository': repository}, value, source,
+                    )
+
+            self.assertEqual(
+                storage.validate_path_source_policy(
+                    {'services_root': str(root)}, value, source,
+                ),
+                source_path,
+            )
+
+    def test_path_source_rejects_manifest_and_broad_compose_control_overlap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            value = manifest(root, compose={
+                'files': ['config/compose.yaml'],
+                'env_file': 'config/compose.env',
+            })
+            for path, expected in (
+                ('.', 'manifest'),
+                ('backup.yaml', 'manifest'),
+                ('config', 'Compose control'),
+            ):
+                source = {'id': 'data', 'path': path}
+                with self.subTest(path=path), self.assertRaisesRegex(
+                    ValueError, expected,
+                ):
+                    storage.validate_path_source_policy({}, value, source)
+
+    def test_directory_copy_uses_one_filesystem_and_detects_mount_change(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / 'source'
+            source.mkdir()
+            state = ((1, 0, '8:1', '/', '/', 'ext4', '/dev/test'), ())
+            changed = ((2, 0, '8:1', '/', '/', 'ext4', '/dev/test'), ())
+            with mock.patch.object(
+                storage, 'validate_data_mount_boundary',
+                side_effect=[state, changed],
+            ), mock.patch.object(storage, 'run') as runner, \
+                    self.assertRaisesRegex(RuntimeError, 'mount topology changed'):
+                storage._copy_path_source(
+                    source, root / 'stage', {'id': 'source'},
+                )
+
+            self.assertIn('--one-file-system', runner.call_args.args[0])
+
     def test_path_filter_args_are_ordered_with_excludes_first(self):
         source = {
             'include': ['world/**', 'server.properties'],
@@ -398,7 +553,7 @@ class PathSyncTests(unittest.TestCase):
             })
 
             estimate = storage.estimate_path_source(
-                {'trusted_data_roots': [str(root)]},
+                {},
                 value,
                 source,
                 allocation_unit=4096,
@@ -422,7 +577,7 @@ class PathSyncTests(unittest.TestCase):
             })
 
             estimate = storage.estimate_path_source(
-                {'trusted_data_roots': [str(root)]},
+                {},
                 value,
                 source,
                 allocation_unit=4096,
@@ -472,27 +627,41 @@ class PathSyncTests(unittest.TestCase):
             payload.mkdir(parents=True)
             (payload / 'value').write_text('snapshot', encoding='utf-8')
             parent.chmod(0o750)
-            original_copy = storage._copy_path_source
-
-            def copy_then_replace_parent(*args, **kwargs):
-                result = original_copy(*args, **kwargs)
-                parent.rename(parent.with_name('parent-original'))
-                parent.mkdir(mode=0o777)
-                return result
-
-            with mock.patch.object(
-                storage, '_copy_path_source', side_effect=copy_then_replace_parent,
-            ):
-                entry = storage.sync_paths(
-                    {'trusted_data_roots': [str(root)]},
-                    value,
-                    root / 'stage',
-                )[0]
+            entry = storage.sync_paths({}, value, root / 'stage')[0]
 
             metadata = {
                 item['path']: item for item in entry['ancestors']
             }
-            self.assertEqual(metadata['demo/parent']['mode'], 0o750)
+            parent_record = next(
+                item for path, item in metadata.items()
+                if path.endswith('/demo/parent')
+            )
+            self.assertEqual(parent_record['mode'], 0o750)
+
+    def test_ancestor_rename_after_copy_fails_the_backup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            value = manifest(root, sources={
+                'paths': [{'id': 'data', 'path': 'parent/data'}],
+                'volumes': [],
+            })
+            parent = Path(value['_dir']) / 'parent'
+            payload = parent / 'data'
+            payload.mkdir(parents=True)
+            (payload / 'value').write_text('snapshot', encoding='utf-8')
+            original_copy = storage._copy_path_source
+
+            def copy_then_rename_parent(*args, **kwargs):
+                result = original_copy(*args, **kwargs)
+                parent.rename(parent.with_name('parent-original'))
+                parent.mkdir()
+                return result
+
+            with mock.patch.object(
+                storage, '_copy_path_source',
+                side_effect=copy_then_rename_parent,
+            ), self.assertRaisesRegex(RuntimeError, 'changed during backup'):
+                storage.sync_paths({}, value, root / 'stage')
 
     def test_copy_reuses_source_fd_from_ancestor_metadata_walk(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -510,16 +679,16 @@ class PathSyncTests(unittest.TestCase):
                 storage, 'open_data_path', wraps=storage.open_data_path,
             ) as reopen:
                 storage.sync_paths(
-                    {'trusted_data_roots': [str(root)]},
+                    {},
                     value,
                     root / 'stage',
                 )
 
-            # The logical path is reopened once after copying to verify that
-            # it still names the pinned object, never to select what to copy.
-            reopen.assert_called_once_with(
-                payload, [str(root)],
-            )
+            # The logical path is reopened for the copy-level and transaction-
+            # level postchecks, never to select what rsync reads.
+            self.assertEqual(reopen.call_args_list, [
+                mock.call(payload), mock.call(payload),
+            ])
             archived = root / 'stage' / 'paths' / 'data' / 'value'
             self.assertEqual(archived.read_text(encoding='utf-8'), 'original')
 
@@ -540,7 +709,7 @@ class PathSyncTests(unittest.TestCase):
             (snapshot / 'value').write_text('snapshot', encoding='utf-8')
 
             entry = storage.sync_paths(
-                {'trusted_data_roots': [str(root)]},
+                {},
                 value,
                 root / 'stage',
                 source_overrides={'data': snapshot},
@@ -551,7 +720,11 @@ class PathSyncTests(unittest.TestCase):
             metadata = {
                 item['path']: item for item in entry['ancestors']
             }
-            self.assertEqual(metadata['demo/parent']['mode'], 0o750)
+            parent_record = next(
+                item for path, item in metadata.items()
+                if path.endswith('/demo/parent')
+            )
+            self.assertEqual(parent_record['mode'], 0o750)
 
     def test_nested_source_may_be_selected_inside_container_owned_data_tree(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -571,10 +744,10 @@ class PathSyncTests(unittest.TestCase):
             (data_root / 'Pal').chmod(0o777)
             try:
                 storage.validate_runtime_sources(
-                    {'trusted_data_roots': [str(root)]}, value, {},
+                    {}, value, {},
                 )
                 storage.sync_paths(
-                    {'trusted_data_roots': [str(root)]},
+                    {},
                     value,
                     root / 'stage',
                 )
@@ -589,13 +762,13 @@ class PathSyncTests(unittest.TestCase):
                 'world',
             )
             entry = storage.sync_paths(
-                {'trusted_data_roots': [str(root)]},
+                {},
                 value,
                 root / 'stage-2',
             )[0]
             self.assertEqual(
-                [item['path'] for item in entry['ancestors']],
-                ['demo', 'demo/palworld', 'demo/palworld/Pal'],
+                [item['path'].split('/')[-1] for item in entry['ancestors'][-3:]],
+                ['demo', 'palworld', 'Pal'],
             )
             self.assertEqual(entry['ancestors'][-1]['mode'], 0o755)
 
@@ -617,7 +790,7 @@ class PathSyncTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, 'real directory'):
                 storage.sync_paths(
-                    {'trusted_data_roots': [str(root)]},
+                    {},
                     value,
                     root / 'stage',
                 )
@@ -786,6 +959,8 @@ class PathSyncTests(unittest.TestCase):
                     mock.patch.object(storage, 'rsync'):
                 inventory = storage.sync_paths(value, root / 'stage')
 
+            for entry in inventory:
+                self.assertTrue(entry.pop('ancestors'))
             self.assertEqual(inventory, [
                 {'id': 'file', 'path': 'file.txt', 'type': 'file', 'present': True,
                  'capture_method': 'quiesced-copy'},

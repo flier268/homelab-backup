@@ -206,7 +206,6 @@ class StagingLifecycleTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.config = {
             'staging_root': str(self.root / 'staging'),
-            'trusted_data_roots': [str(self.root / 'demo')],
         }
         self.docker_patch = mock.patch.object(
             staging, 'validate_docker_environment', return_value='unix:///var/run/docker.sock',
@@ -261,7 +260,6 @@ class StagingLifecycleTests(unittest.TestCase):
         sentinel.write_text('services: {}\n', encoding='utf-8')
         config = {
             'staging_root': str(self.root),
-            'trusted_data_roots': [str(self.root / 'demo')],
         }
 
         with mock.patch.object(capture, 'sync_paths') as sync_mock:
@@ -286,7 +284,6 @@ class StagingLifecycleTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'symbolic link'):
                 backup.stage_service({
                 'staging_root': str(staging_root),
-                    'trusted_data_roots': [str(self.root / 'demo')],
                 }, value)
 
         self.assertTrue(sentinel.exists())
@@ -313,6 +310,7 @@ class StagingLifecycleTests(unittest.TestCase):
             'snapshot',
         )
         saved = json.loads((stage / '_meta' / 'inventory.json').read_text())
+        self.assertTrue(saved['paths'][0].pop('ancestors'))
         self.assertEqual(saved['paths'], inventory)
         self.assertEqual(saved['service'], 'demo')
         self.assertEqual(saved['service_relative_directory'], 'demo')

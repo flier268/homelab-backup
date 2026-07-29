@@ -144,13 +144,29 @@ def authorize_inventory_against_manifest(
         actual_name = validate_docker_volume_name(
             entry.actual_name, f'inventory volume {source_id!r} actual_name',
         )
+        snapshot_fields = [
+            value for value in (entry.name, entry.compose_volume) if value
+        ]
+        if len(snapshot_fields) != 1:
+            raise RuntimeError(
+                f'restore inventory volume declaration differs: {source_id!r}'
+            )
+        if entry.name and actual_name != entry.name:
+            raise RuntimeError(
+                f'restore inventory volume target differs: {source_id!r}'
+            )
         identity_entry = by_identity_id[source_id]
-        if entry.name != source.get('name') or \
+        if identity_entry.actual_name != actual_name or \
+                identity_entry.logical_name != entry.compose_volume:
+            raise RuntimeError(f'restore inventory volume identity differs: {source_id!r}')
+        if source.get('name'):
+            if actual_name != source['name']:
+                raise RuntimeError(
+                    f'restore inventory volume target differs: {source_id!r}'
+                )
+        elif entry.name is not None or \
                 entry.compose_volume != source.get('compose_volume'):
             raise RuntimeError(f'restore inventory volume declaration differs: {source_id!r}')
-        if identity_entry.actual_name != actual_name or \
-                identity_entry.logical_name != source.get('compose_volume'):
-            raise RuntimeError(f'restore inventory volume identity differs: {source_id!r}')
     expected_compose_files = tuple(
         (m.get('compose') or {}).get('files', ['compose.yaml'])
     )

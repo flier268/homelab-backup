@@ -52,6 +52,10 @@ function pathsOverlap(left: string, right: string): boolean {
   return a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`)
 }
 
+function servicePath(path: string): string {
+  return path.startsWith('/') ? path : `/service-root/${path}`
+}
+
 function collectNamedPaths(
   entries: readonly (readonly [string, unknown])[],
 ): Array<[string, string]> {
@@ -83,25 +87,6 @@ function validateGlobal(config: GlobalConfig): ValidationIssue[] {
     'cache_root', 'lock_file', 'volume_helper_image',
   ]
   strings.forEach((key) => requiredString(issues, config[key], String(key)))
-  if (!Array.isArray(config.trusted_data_roots) || !config.trusted_data_roots.length) {
-    issues.push(issue('trusted_data_roots', '至少需要一個 trusted data root'))
-  } else {
-    const trustedRoots: Array<[string, string]> = []
-    config.trusted_data_roots.forEach((root, index) => {
-      if (!requiredString(issues, root, `trusted_data_roots[${index}]`)) return
-      trustedRoots.push([`trusted_data_roots[${index}]`, root])
-      if (!root.startsWith('/')) {
-        issues.push(issue(`trusted_data_roots[${index}]`, '必須是絕對路徑'))
-      }
-    })
-    for (let left = 0; left < trustedRoots.length; left += 1) {
-      for (let right = left + 1; right < trustedRoots.length; right += 1) {
-        if (pathsOverlap(trustedRoots[left][1], trustedRoots[right][1])) {
-          issues.push(issue('trusted_data_roots', 'trusted roots 不可重複或互相重疊'))
-        }
-      }
-    }
-  }
   const separated = collectNamedPaths([
     ['services_root', config.services_root],
     ['staging_root', config.staging_root],
@@ -135,20 +120,6 @@ function validateGlobal(config: GlobalConfig): ValidationIssue[] {
       }
     })
   })
-  const forbiddenDataPaths = [...workspaceRoots, ...protectedPaths]
-  if (Array.isArray(config.trusted_data_roots)) {
-    config.trusted_data_roots.forEach((root, index) => {
-      if (typeof root !== 'string' || !root) return
-      forbiddenDataPaths.forEach(([pathName, path]) => {
-        if (pathsOverlap(root, path)) {
-          issues.push(issue(
-            `trusted_data_roots[${index}]`,
-            `trusted data root 不可與 ${pathName} 重疊`,
-          ))
-        }
-      })
-    })
-  }
   if (config.rclone?.bwlimit !== undefined
       && typeof config.rclone.bwlimit !== 'string') {
     issues.push(issue('rclone.bwlimit', '必須是字串'))
@@ -222,13 +193,28 @@ function validatePathSources(
       issues.push(issue(`${path}.exclude`, '必須是字串陣列'))
     }
     if (!hasPath) return
+    const target = servicePath(source.path)
+    const manifestTarget = servicePath('backup.yaml')
+    if (pathsOverlap(target, manifestTarget)) {
+      issues.push(issue(path, 'path source 不可涵蓋受保護的 backup.yaml'))
+    }
+    const compose = service.compose
+    const composeControls = (service.consistency?.mode === 'files'
+      ? []
+      : [
+          ...(compose?.files ?? ['compose.yaml']),
+          ...(compose?.env_file ? [compose.env_file] : []),
+        ]).map(servicePath)
+    composeControls.forEach((control) => {
+      if (target !== control && pathsOverlap(target, control)) {
+        issues.push(issue(path, '一般 path source 不可涵蓋 Compose 控制檔'))
+      }
+    })
     for (let previous = 0; previous < index; previous += 1) {
       const previousSourcePath = sources[previous].path
       if (typeof previousSourcePath !== 'string' || !previousSourcePath) continue
-      const base = '/service-root'
-      const currentPath = source.path.startsWith('/') ? source.path : `${base}/${source.path}`
-      const previousPath = previousSourcePath.startsWith('/')
-        ? previousSourcePath : `${base}/${previousSourcePath}`
+      const currentPath = servicePath(source.path)
+      const previousPath = servicePath(previousSourcePath)
       if (pathsOverlap(currentPath, previousPath)) {
         issues.push(issue(path, 'path source 不可重複或互相重疊'))
       }

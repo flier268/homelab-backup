@@ -47,7 +47,6 @@ class FilesBackupTests(unittest.TestCase):
             root = Path(tmp)
             value = manifest(root, consistency={'mode': 'invalid'})
             config = {
-                'trusted_data_roots': [str(root)],
                 'staging_root': str(root / 'staging'),
                 'restore_root': str(root / 'restore'),
                 'password_file': str(root / 'password'),
@@ -60,8 +59,6 @@ class FilesBackupTests(unittest.TestCase):
 
             with mock.patch.object(
                     backup, 'manifests', return_value=[value],
-            ), mock.patch.object(
-                    backup, 'validate_trusted_roots',
             ), mock.patch.object(
                     backup, 'validate_control_root',
             ), mock.patch.object(
@@ -83,7 +80,6 @@ class FilesBackupTests(unittest.TestCase):
             })
             config = {
                 'lock_file': str(root / 'lock'),
-                'trusted_data_roots': [str(root)],
             }
 
             def scheduled_backup(current_config, current_manifest):
@@ -128,7 +124,6 @@ class FilesBackupTests(unittest.TestCase):
                 'volumes': [],
             })
             config = {
-                'trusted_data_roots': [str(root)],
                 'staging_root': str(root / 'staging'),
                 'restore_root': str(root / 'restore'),
                 'password_file': str(root / 'password'),
@@ -136,9 +131,6 @@ class FilesBackupTests(unittest.TestCase):
             }
 
             with ExitStack() as stack:
-                stack.enter_context(mock.patch.object(
-                    backup, 'validate_trusted_roots',
-                ))
                 stack.enter_context(mock.patch.object(
                     backup, 'validate_control_root',
                 ))
@@ -184,7 +176,6 @@ class FilesBackupTests(unittest.TestCase):
             root = Path(tmp)
             value = manifest(root)
             config = {
-                'trusted_data_roots': [str(root)],
                 'staging_root': str(root / 'staging'),
                 'restore_root': str(root / 'restore'),
                 'password_file': str(root / 'password'),
@@ -193,9 +184,6 @@ class FilesBackupTests(unittest.TestCase):
             }
 
             with ExitStack() as stack:
-                stack.enter_context(mock.patch.object(
-                    backup, 'validate_trusted_roots',
-                ))
                 stack.enter_context(mock.patch.object(
                     backup, 'validate_control_root',
                 ))
@@ -241,7 +229,6 @@ class FilesBackupTests(unittest.TestCase):
             config = {
                 'staging_root': str(root / 'staging'),
                 'state_root': str(root / 'state'),
-                'trusted_data_roots': [str(root)],
             }
             saved = {}
             events = []
@@ -263,9 +250,6 @@ class FilesBackupTests(unittest.TestCase):
             with ExitStack() as stack:
                 stack.enter_context(mock.patch.object(
                     staging, 'cleanup_snapshot_state',
-                ))
-                stack.enter_context(mock.patch.object(
-                    staging, 'validate_trusted_roots',
                 ))
                 stack.enter_context(mock.patch.object(
                     staging, 'ensure_private_directory', side_effect=ensure,
@@ -493,7 +477,6 @@ class FilesRestoreTests(unittest.TestCase):
         config = {
             'host_id': 'host',
             'lock_file': '/run/test.lock',
-            'trusted_data_roots': [],
         }
 
         with ExitStack() as stack:
@@ -506,9 +489,6 @@ class FilesRestoreTests(unittest.TestCase):
             lock.return_value.__enter__.return_value = True
             stack.enter_context(mock.patch.object(
                 restore, 'restore_one', return_value=(value, restored),
-            ))
-            stack.enter_context(mock.patch.object(
-                restore, 'validate_trusted_roots',
             ))
             docker_environment = stack.enter_context(mock.patch.object(
                 restore, 'validate_docker_environment',
@@ -548,7 +528,6 @@ class FilesRestoreTests(unittest.TestCase):
         restored = Path(args.restore_dir)
         config = {
             'lock_file': '/run/test.lock',
-            'trusted_data_roots': [],
         }
 
         with ExitStack() as stack:
@@ -556,9 +535,6 @@ class FilesRestoreTests(unittest.TestCase):
                 restore, 'GlobalLock',
             ))
             lock.return_value.__enter__.return_value = True
-            stack.enter_context(mock.patch.object(
-                restore, 'validate_trusted_roots',
-            ))
             stack.enter_context(mock.patch.object(
                 restore, '_validated_apply_workspace', return_value=restored,
             ))

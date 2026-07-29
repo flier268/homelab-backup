@@ -26,7 +26,7 @@ class BtrfsIdentityTests(unittest.TestCase):
             'source_subvolume_id': 256,
             'source_uuid': SOURCE_UUID,
             'filesystem_uuid': FILESYSTEM_UUID,
-            'trusted_root': '/data',
+            'workspace_anchor': '/data',
             'workspace_path': '/data/.homelab-backup-snapshots',
             'snapshot_path': '/data/.homelab-backup-snapshots/demo-op-world',
             'snapshot_subvolume_id': None if phase == 'creating' else 300,
@@ -49,7 +49,7 @@ class BtrfsIdentityTests(unittest.TestCase):
         self.assertEqual(parsed['parent_uuid'], SOURCE_UUID)
         self.assertTrue(parsed['readonly'])
 
-    def test_legacy_journal_shape_is_rejected_without_migration(self):
+    def test_incomplete_legacy_journal_is_rejected(self):
         value = {
             'version': 1, 'service': 'demo', 'operation_id': '0' * 32,
             'snapshots': [{
@@ -61,6 +61,26 @@ class BtrfsIdentityTests(unittest.TestCase):
             btrfs_snapshot, 'read_control_text', return_value=json.dumps(value),
         ), self.assertRaisesRegex(RuntimeError, 'invalid Btrfs snapshot state'):
             btrfs_snapshot._load_state({'state_root': '/state'}, 'demo')
+
+    def test_legacy_workspace_anchor_name_is_migrated_for_cleanup(self):
+        value = self.state()
+        value['operation_id'] = '0' * 32
+        entry = value['snapshots'][0]
+        entry['snapshot_path'] = (
+            '/data/.homelab-backup-snapshots/demo-'
+            + value['operation_id']
+            + '-world'
+        )
+        entry['trusted_root'] = entry.pop('workspace_anchor')
+        with mock.patch.object(
+            btrfs_snapshot, 'read_control_text', return_value=json.dumps(value),
+        ):
+            loaded = btrfs_snapshot._load_state(
+                {'state_root': '/state'}, 'demo',
+            )
+
+        self.assertEqual(loaded['snapshots'][0]['workspace_anchor'], '/data')
+        self.assertNotIn('trusted_root', loaded['snapshots'][0])
 
     def test_plain_btrfs_directory_is_not_a_snapshot_source(self):
         result = SimpleNamespace(
@@ -86,7 +106,7 @@ class BtrfsIdentityTests(unittest.TestCase):
                 filesystem_type='btrfs', opened_metadata=metadata,
             )
 
-    def test_workspace_is_under_trusted_root_not_container_owned_parent(self):
+    def test_workspace_is_under_inferred_anchor_not_source_parent(self):
         self.assertEqual(
             btrfs_snapshot.snapshot_parent('/data'),
             Path('/data/.homelab-backup-snapshots'),
@@ -95,6 +115,46 @@ class BtrfsIdentityTests(unittest.TestCase):
             btrfs_snapshot.snapshot_parent('/data'),
             Path('/data/container/.homelab-backup-snapshots'),
         )
+
+    def test_workspace_anchor_skips_unprotected_parent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / 'container' / 'world'
+            source.mkdir(parents=True)
+
+            def validate(path):
+                if Path(path) != root:
+                    raise ValueError('not protected')
+
+            mount = SimpleNamespace(filesystem_type='btrfs')
+            with mock.patch.object(
+                btrfs_snapshot, 'filesystem_uuid', return_value=FILESYSTEM_UUID,
+            ), mock.patch.object(
+                btrfs_snapshot, 'containing_mount', return_value=mount,
+            ), mock.patch.object(
+                btrfs_snapshot, 'validate_control_directory',
+                side_effect=validate,
+            ):
+                self.assertEqual(
+                    btrfs_snapshot.snapshot_workspace_anchor(source), root,
+                )
+
+    def test_workspace_anchor_rejects_without_safe_same_filesystem_parent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / 'standalone' / 'world'
+            source.mkdir(parents=True)
+            mount = SimpleNamespace(filesystem_type='btrfs')
+            with mock.patch.object(
+                btrfs_snapshot, 'filesystem_uuid', return_value=FILESYSTEM_UUID,
+            ), mock.patch.object(
+                btrfs_snapshot, 'containing_mount', return_value=mount,
+            ), mock.patch.object(
+                btrfs_snapshot, 'validate_control_directory',
+                side_effect=ValueError('not protected'),
+            ), self.assertRaisesRegex(
+                RuntimeError, 'mount the Btrfs top-level or a common parent',
+            ):
+                btrfs_snapshot.snapshot_workspace_anchor(source)
 
     def _identity_patches(self, details=None):
         details = details or {
@@ -220,7 +280,6 @@ class BtrfsIdentityTests(unittest.TestCase):
             }
             config = {
                 'state_root': str(root / 'state'),
-                'trusted_data_roots': [str(root)],
             }
             source_details = {
                 'subvolume_id': 256, 'uuid': SOURCE_UUID,

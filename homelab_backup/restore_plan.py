@@ -5,7 +5,8 @@ import yaml
 
 from .inventory_models import ComposeIdentityModel, RestoreInventoryModel
 from .manifest import (
-    compose_model, manifest, requires_docker, source_path, validate_manifest,
+    compose_control_paths, compose_file_paths, compose_model, manifest,
+    requires_docker, source_path, validate_manifest,
 )
 from .restore_inventory import (
     load_restore_inventory, restored_path_details, validate_restore_inventory,
@@ -17,7 +18,7 @@ from .security import (
 from .storage import (
     compose_identity, docker_mount_conflicts, docker_project_containers,
     docker_volume_exists, resolved_volume_sources, running_services,
-    validate_volume_identity,
+    validate_path_source_policy, validate_volume_identity,
 )
 from .types import GlobalConfig, ServiceManifest, VolumeSource
 
@@ -36,10 +37,7 @@ class RestorePlan:
 
 
 def compose_targets(m):
-    return tuple(
-        lexical_absolute(Path(m['_dir']) / item)
-        for item in m.get('compose', {}).get('files', ['compose.yaml'])
-    )
+    return compose_file_paths(m)
 
 
 def inventory_volumes(m, inventory):
@@ -52,7 +50,7 @@ def inventory_volumes(m, inventory):
 
 
 def deferred_compose_sources(m):
-    targets = set(compose_targets(m))
+    targets = set(compose_control_paths(m))
     sources = []
     for source in (m.get('sources') or {}).get('paths', []):
         if lexical_absolute(source_path(m, source)) in targets:
@@ -96,8 +94,10 @@ def restore_filter_projection(m):
     }
 
 
-def _snapshot_manifest(m):
+def _snapshot_manifest(m, root=None):
     snapshot_path = m.get('_snapshot_manifest')
+    if not snapshot_path and root is not None:
+        snapshot_path = Path(root) / '_meta' / 'backup.yaml'
     if not snapshot_path:
         return m
     try:
@@ -150,45 +150,94 @@ def _load_and_validate_restore_input(m, root):
     return root, inventory
 
 
-def _deployment_mode(m):
+def _deployment_mode(m, inventory, *, require_local_manifest=True):
     manifest_target = Path(m.get('_path', Path(m['_dir']) / 'backup.yaml'))
+    if require_local_manifest and (
+        not manifest_target.is_file() or manifest_target.is_symlink()
+    ):
+        raise RuntimeError(
+            'apply requires a protected local manifest; download the restore, '
+            'review and install _meta/backup.yaml, run backupctl validate, '
+            'then run backupctl apply'
+        )
     if not requires_docker(m):
-        if manifest_target.is_file() and not manifest_target.is_symlink():
-            return 'existing', ()
-        if not manifest_target.exists() and not manifest_target.is_symlink():
+        if not require_local_manifest and not manifest_target.exists() \
+                and not manifest_target.is_symlink():
             return 'rebuild', ()
-        raise RuntimeError('unsupported local manifest state')
+        target_states = []
+        sources = {
+            item['id']: item
+            for item in (m.get('sources') or {}).get('paths', [])
+        }
+        for entry in inventory.paths:
+            if not entry.present:
+                continue
+            target = source_path(m, sources[entry.id])
+            target_states.append(target.exists() or target.is_symlink())
+        if not target_states or all(target_states):
+            return 'existing', ()
+        if not any(target_states):
+            return 'rebuild', ()
+        raise RuntimeError('mixed existing/missing path target state is not supported')
     compose_file_targets = compose_targets(m)
-    manifest_exists = manifest_target.is_file() and not manifest_target.is_symlink()
-    compose_exists = [path.is_file() and not path.is_symlink() for path in compose_file_targets]
-    if manifest_exists and all(compose_exists):
+    compose_controls = compose_control_paths(m)
+    manifest_exists = (
+        manifest_target.is_file() and not manifest_target.is_symlink()
+    )
+    compose_exists = [
+        path.is_file() and not path.is_symlink()
+        for path in compose_controls
+    ]
+    if not require_local_manifest:
+        if manifest_exists and all(compose_exists):
+            return 'existing', compose_file_targets
+        if not manifest_target.exists() and not manifest_target.is_symlink() \
+                and not any(
+                    path.exists() or path.is_symlink()
+                    for path in compose_controls
+                ):
+            return 'rebuild', compose_file_targets
+        raise RuntimeError('mixed local manifest/Compose state is not supported')
+    if all(compose_exists):
         return 'existing', compose_file_targets
-    if not manifest_target.exists() and not manifest_target.is_symlink() \
-            and not any(path.exists() or path.is_symlink() for path in compose_file_targets):
+    if not any(path.exists() or path.is_symlink() for path in compose_file_targets):
         return 'rebuild', compose_file_targets
     raise RuntimeError('mixed local manifest/Compose state is not supported')
 
 
-def _validate_rebuild_compose_sources(m, mode, compose_file_targets):
+def _validate_rebuild_compose_sources(m, mode, _compose_file_targets):
     deferred = deferred_compose_sources(m)
-    if mode == 'rebuild' and len(deferred) != len(compose_file_targets):
-        raise RuntimeError('every Compose file must be a required snapshot path source')
     source_by_id = {item['id']: item for item in (m.get('sources') or {}).get('paths', [])}
+    source_targets = {
+        lexical_absolute(source_path(m, source))
+        for source in source_by_id.values()
+    }
+    if mode == 'rebuild' and any(
+            target not in source_targets for target in compose_control_paths(m)
+    ):
+        raise RuntimeError(
+            'every Compose file and env file must be a required '
+            'snapshot path source'
+        )
     if mode == 'rebuild' and any(not source_by_id[item].get('required', True) for item in deferred):
-        raise RuntimeError('Compose file path sources must be required for rebuild')
+        raise RuntimeError(
+            'Compose file and env file path sources must be required for rebuild'
+        )
     return deferred
 
 
 def _validate_path_targets(c, m, inventory, mode):
-    targets = [source_path(m, source) for source in (m.get('sources') or {}).get('paths', [])]
+    targets = [
+        validate_path_source_policy(c, m, source)
+        for source in (m.get('sources') or {}).get('paths', [])
+    ]
     for source in (m.get('sources') or {}).get('paths', []):
         entry = inventory.paths_by_id[source['id']]
-        target = source_path(m, source)
-        trusted_roots = c.get('trusted_data_roots') or [str(Path(target).parent)]
+        target = validate_path_source_policy(c, m, source)
         if mode == 'rebuild':
-            validate_data_parent(target, trusted_roots, allow_missing=True)
+            validate_data_parent(target, allow_missing=True)
         else:
-            validate_data_path(target, trusted_roots)
+            validate_data_path(target)
         exists = target.exists() or target.is_symlink()
         if not entry.present:
             if mode == 'rebuild' and exists:
@@ -248,7 +297,12 @@ def _authorize_rebuild_restore(m, inventory, restored_volumes):
     identity = inventory.compose
     if not identity.project_name:
         raise RuntimeError('snapshot has no Compose project identity')
-    for _source, name, _present in restored_volumes:
+    for source, name, present in restored_volumes:
+        if source.get('compose_volume'):
+            # The protected manifest authorizes the logical Compose key. Its
+            # actual name and creation options are resolved from the restored
+            # Compose model immediately before Docker creates the volume.
+            continue
         if docker_volume_exists(name):
             raise RuntimeError(f'rebuild volume already exists: {name}')
     if docker_project_containers(identity.project_name, include_stopped=True):
@@ -297,20 +351,35 @@ def prepare_restore_plan(
         c: GlobalConfig, m: ServiceManifest, root,
 ) -> RestorePlan:
     root, inventory = _load_and_validate_restore_input(m, root)
-    files_mode = not requires_docker(m)
-    mode, compose_file_targets = _deployment_mode(m)
+    authorized = manifest(c, m['service']) if c.get('services_root') else m
+    validate_manifest(authorized)
+    validate_restore_inventory(authorized, inventory)
+    if c.get('services_root'):
+        snapshot_m = _snapshot_manifest(m, root)
+        if restore_filter_projection(snapshot_m) != \
+                restore_filter_projection(authorized):
+            raise RuntimeError(
+                'snapshot path filters differ from local authorization'
+            )
+    files_mode = not requires_docker(authorized)
+    mode, compose_file_targets = _deployment_mode(
+        authorized, inventory,
+        require_local_manifest=bool(c.get('services_root')),
+    )
     deferred = (
         ()
         if files_mode
-        else _validate_rebuild_compose_sources(m, mode, compose_file_targets)
+        else _validate_rebuild_compose_sources(
+            authorized, mode, compose_file_targets,
+        )
     )
-    restored_volumes = inventory_volumes(m, inventory)
-    targets = _validate_path_targets(c, m, inventory, mode)
+    restored_volumes = inventory_volumes(authorized, inventory)
+    targets = _validate_path_targets(c, authorized, inventory, mode)
     if files_mode:
         authorized_manifest = (
             _authorize_existing_files_restore(c, m, inventory)
             if mode == 'existing'
-            else m
+            else authorized
         )
         return RestorePlan(
             root, inventory, authorized_manifest, mode, (), (), (), (), '',
@@ -321,7 +390,7 @@ def prepare_restore_plan(
         )
     else:
         authorized_manifest, identity, running = _authorize_rebuild_restore(
-            m, inventory, restored_volumes,
+            authorized, inventory, restored_volumes,
         )
     volumes = tuple((source, name) for source, name, present in restored_volumes if present)
     all_volume_names = tuple(name for _source, name, _present in restored_volumes)

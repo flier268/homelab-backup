@@ -1,13 +1,15 @@
 import os
+import sys
 from pathlib import Path
 
 import yaml
 
 from .common import die, format_remediable_error, load_yaml
-from .security import lexical_absolute, paths_overlap
+from .security import paths_overlap
 from .types import GlobalConfig
 
 CFG = Path('/etc/homelab-backup/config.yaml')
+_TRUSTED_ROOTS_WARNING_SHOWN = False
 
 
 def _load_config():
@@ -43,21 +45,18 @@ def _validate_config_header(c):
         die(f'{CFG}: version must be 1')
 
 
-def _normalize_trusted_roots(c):
-    trusted_roots = c.get('trusted_data_roots')
-    if not isinstance(trusted_roots, list) or not trusted_roots:
-        die(f'{CFG}: trusted_data_roots must be a non-empty list')
-    try:
-        trusted_roots = [lexical_absolute(path) for path in trusted_roots]
-    except (TypeError, ValueError) as err:
-        die(f'{CFG}: invalid trusted_data_roots: {err}')
-    if len(set(trusted_roots)) != len(trusted_roots):
-        die(f'{CFG}: trusted_data_roots contains duplicates')
-    for index, left in enumerate(trusted_roots):
-        if any(paths_overlap(left, right) for right in trusted_roots[index + 1:]):
-            die(f'{CFG}: trusted_data_roots must not overlap')
-    c['trusted_data_roots'] = [str(path) for path in trusted_roots]
-    return trusted_roots
+def _discard_deprecated_trusted_roots(c):
+    global _TRUSTED_ROOTS_WARNING_SHOWN
+    if 'trusted_data_roots' not in c:
+        return
+    c.pop('trusted_data_roots')
+    if not _TRUSTED_ROOTS_WARNING_SHOWN:
+        print(
+            f'WARNING: {CFG}: trusted_data_roots is deprecated and ignored; '
+            'remove it from the configuration',
+            file=sys.stderr,
+        )
+        _TRUSTED_ROOTS_WARNING_SHOWN = True
 
 
 def _validate_optional_sections(c):
@@ -83,7 +82,7 @@ def _validate_optional_sections(c):
             die(f'{CFG}: check.read_data_subset must be a non-empty string')
 
 
-def _validate_root_separation(c, trusted_roots):
+def _validate_root_separation(c):
     roots = {
         'services_root': c['services_root'],
         'staging_root': c['staging_root'],
@@ -105,16 +104,6 @@ def _validate_root_separation(c, trusted_roots):
         for path_name, path in protected_paths.items():
             if paths_overlap(c[root_name], path):
                 die(f'{root_name} must not overlap {path_name}')
-    forbidden_data = {
-        'staging_root': c['staging_root'], 'restore_root': c['restore_root'],
-        **protected_paths,
-    }
-    for trusted_root in trusted_roots:
-        for path_name, path in forbidden_data.items():
-            if paths_overlap(trusted_root, path):
-                die(f'trusted_data_root {trusted_root} must not overlap {path_name}')
-
-
 def cfg() -> GlobalConfig:
     c = _load_config()
     _validate_config_header(c)
@@ -123,9 +112,9 @@ def cfg() -> GlobalConfig:
     )
     if release_helper_image:
         c['volume_helper_image'] = release_helper_image
-    trusted_roots = _normalize_trusted_roots(c)
+    _discard_deprecated_trusted_roots(c)
     _validate_optional_sections(c)
-    _validate_root_separation(c, trusted_roots)
+    _validate_root_separation(c)
     return c
 
 

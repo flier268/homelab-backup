@@ -27,15 +27,25 @@ class MountPolicyTests(unittest.TestCase):
                     '/srv/data', records=[self.record('/', filesystem)],
                 )
 
-    def test_nested_mount_below_payload_is_rejected(self):
+    def test_same_device_bind_mount_below_payload_is_rejected(self):
         records = [
             self.record('/', 'ext4', 1),
             self.record('/srv/data/app/cache', 'ext4', 2),
         ]
         with self.assertRaisesRegex(ValueError, 'nested mount'):
-            security.validate_mount_boundary(
+            security.validate_data_mount_boundary(
                 '/srv/data', records=records,
             )
+
+    def test_data_path_may_itself_be_a_mount_point(self):
+        records = [
+            self.record('/', 'ext4', 1),
+            self.record('/mnt/media', 'ntfs3', 2),
+        ]
+        state = security.validate_data_mount_boundary(
+            '/mnt/media', records=records,
+        )
+        self.assertEqual(state[0][0], 2)
 
     def test_control_root_rejects_unsupported_filesystem_and_nested_mount(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -151,7 +161,10 @@ class PayloadPolicyTests(unittest.TestCase):
             import socket
             handle = socket.socket(socket.AF_UNIX)
             try:
-                handle.bind(str(socket_path))
+                try:
+                    handle.bind(str(socket_path))
+                except PermissionError:
+                    self.skipTest('sandbox does not permit Unix socket creation')
                 with self.assertRaisesRegex(ValueError, 'unsupported payload'):
                     security.validate_payload(payload)
             finally:
@@ -188,7 +201,7 @@ class RuntimeCredentialTests(unittest.TestCase):
 
 
 class DataPathTests(unittest.TestCase):
-    def test_container_owned_ancestors_are_allowed_below_trusted_root(self):
+    def test_container_owned_ancestors_are_allowed(self):
         with tempfile.TemporaryDirectory() as tmp:
             trusted = Path(tmp) / 'data'
             saved = trusted / 'palworld' / 'Pal' / 'Saved'
@@ -197,7 +210,7 @@ class DataPathTests(unittest.TestCase):
             (trusted / 'palworld').chmod(0o777)
             (trusted / 'palworld' / 'Pal').chmod(0o777)
             try:
-                fd, metadata = security.open_data_path(saved, [trusted])
+                fd, metadata = security.open_data_path(saved)
                 try:
                     self.assertTrue(security.stat.S_ISDIR(metadata.st_mode))
                 finally:
@@ -206,7 +219,7 @@ class DataPathTests(unittest.TestCase):
                 (trusted / 'palworld' / 'Pal').chmod(0o755)
                 (trusted / 'palworld').chmod(0o755)
 
-    def test_intermediate_symlink_cannot_escape_trusted_root(self):
+    def test_intermediate_symlink_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             trusted = root / 'data'
@@ -216,9 +229,11 @@ class DataPathTests(unittest.TestCase):
             (trusted / 'palworld').symlink_to(outside, target_is_directory=True)
 
             with self.assertRaisesRegex(ValueError, 'real directory'):
-                security.open_data_path(
-                    trusted / 'palworld' / 'Saved', [trusted],
-                )
+                security.open_data_path(trusted / 'palworld' / 'Saved')
+
+    def test_filesystem_root_is_not_a_data_path(self):
+        with self.assertRaisesRegex(ValueError, 'filesystem root'):
+            security.open_data_path('/')
 
 
 class AtomicPublicationTests(unittest.TestCase):

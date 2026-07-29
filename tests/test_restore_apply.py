@@ -13,6 +13,66 @@ from tests.helpers import manifest, path_inventory, write_restore_inventory
 
 
 class RestoreSourceTests(unittest.TestCase):
+    def test_existing_directory_target_rejects_nested_mount_before_rsync(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            restored = base / 'restore'
+            staged = restored / 'paths' / 'saved'
+            staged.mkdir(parents=True)
+            target = base / 'live'
+            target.mkdir()
+            source = {'id': 'saved', 'path': str(target)}
+
+            with mock.patch.object(
+                restore_apply, 'validate_data_mount_boundary',
+                side_effect=ValueError(
+                    f'nested mount is not supported: {target / "cache"}'
+                ),
+            ), mock.patch.object(
+                restore_apply, 'run',
+            ) as run_mock, self.assertRaisesRegex(ValueError, 'nested mount'):
+                restore_apply.restore_path_source(
+                    {'_dir': str(base)}, restored, source,
+                    {'paths': [{
+                        'id': 'saved', 'path': str(target),
+                        'type': 'directory', 'present': True,
+                    }]},
+                    c={},
+                )
+
+            run_mock.assert_not_called()
+
+    def test_existing_directory_restore_detects_mount_topology_change(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            restored = base / 'restore'
+            staged = restored / 'paths' / 'saved'
+            staged.mkdir(parents=True)
+            target = base / 'live'
+            target.mkdir()
+            source = {'id': 'saved', 'path': str(target)}
+            initial = ((1, 0, '8:1', '/', '/', 'ext4', '/dev/test'), ())
+            changed = ((2, 0, '8:1', '/', '/', 'ext4', '/dev/test'), ())
+
+            with mock.patch.object(
+                restore_apply, 'validate_data_mount_boundary',
+                side_effect=[initial, changed],
+            ), mock.patch.object(
+                restore_apply, 'run',
+            ) as run_mock, self.assertRaisesRegex(
+                RuntimeError, 'mount topology changed during restore',
+            ):
+                restore_apply.restore_path_source(
+                    {'_dir': str(base)}, restored, source,
+                    {'paths': [{
+                        'id': 'saved', 'path': str(target),
+                        'type': 'directory', 'present': True,
+                    }]},
+                    c={},
+                )
+
+            self.assertIn('--one-file-system', run_mock.call_args.args[0])
+
     def test_existing_nested_target_may_be_inside_container_owned_data_tree(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -34,7 +94,7 @@ class RestoreSourceTests(unittest.TestCase):
                         'id': 'saved', 'path': str(target),
                         'type': 'directory', 'present': True,
                     }]},
-                    c={'trusted_data_roots': [str(base)]},
+                    c={},
                 )
             finally:
                 (data_root / 'Pal').chmod(0o755)
@@ -79,7 +139,7 @@ class RestoreSourceTests(unittest.TestCase):
                         'id': 'saved', 'path': str(target),
                         'type': 'directory', 'present': True,
                     }]},
-                    c={'trusted_data_roots': [str(base)]},
+                    c={},
                 )
 
             self.assertEqual(
@@ -114,7 +174,7 @@ class RestoreSourceTests(unittest.TestCase):
 
             restore_apply.restore_path_source(
                 {'_dir': str(base)}, restored, source, inventory,
-                c={'trusted_data_roots': [str(base)]}, rebuild=True,
+                c={}, rebuild=True,
             )
 
             self.assertEqual(
@@ -141,7 +201,7 @@ class RestoreSourceTests(unittest.TestCase):
                         'id': 'saved', 'path': str(target),
                         'type': 'directory', 'present': True,
                     }]},
-                    c={'trusted_data_roots': [str(base)]}, rebuild=True,
+                    c={}, rebuild=True,
                 )
 
     def test_rebuild_directory_is_not_published_until_rsync_succeeds(self):
@@ -171,7 +231,7 @@ class RestoreSourceTests(unittest.TestCase):
                         'id': 'saved', 'path': str(target),
                         'type': 'directory', 'present': True,
                     }]},
-                    c={'trusted_data_roots': [str(base)]}, rebuild=True,
+                    c={}, rebuild=True,
                 )
 
             self.assertEqual(list(target.iterdir()), [])
@@ -359,7 +419,7 @@ class RestoreSourceTests(unittest.TestCase):
             ) as run_mock:
                 restore_apply.restore_path_source(
                     {'_dir': str(base)}, root, source, inventory,
-                    c={'trusted_data_roots': [str(base)]}, rebuild=True,
+                    c={}, rebuild=True,
                 )
 
             command = run_mock.call_args.args[0]
@@ -613,6 +673,157 @@ class RestoreApplyLifecycleTests(unittest.TestCase):
             events, ['stop', 'preflight', 'data', 'publish', 'restart'],
         )
 
+    def test_rebuild_publishes_compose_before_creating_and_restoring_volumes(self):
+        root = Path('/restore')
+        value = {'service': 'demo'}
+        plan = restore_plan.RestorePlan(
+            root, {}, value, 'rebuild', (), (), (), (), 'demo',
+        )
+        events = []
+
+        with mock.patch.object(
+            restore_apply, 'prepare_restore_plan', return_value=plan,
+        ), mock.patch.object(
+            restore_apply, '_stop_running_services',
+            side_effect=lambda _plan: events.append('stop') or [],
+        ), mock.patch.object(
+            restore_apply, '_dynamic_preflight',
+            side_effect=lambda _config, _plan: events.append('preflight'),
+        ), mock.patch.object(
+            restore_apply, '_restore_data',
+            side_effect=lambda _config, _plan, _changed, _operation:
+            events.append('data'),
+        ), mock.patch.object(
+            restore_apply, '_publish_controls',
+            side_effect=lambda _config, _manifest, _plan, _changed:
+            events.append('publish'),
+        ), mock.patch.object(
+            restore_apply, '_restart_services',
+            side_effect=lambda _plan, _targets, _start: events.append('restart'),
+        ):
+            restore_apply.apply_one({}, value, root)
+
+        self.assertEqual(
+            events, ['stop', 'preflight', 'publish', 'data', 'restart'],
+        )
+
+    def test_rebuild_compose_volume_is_created_directly_from_model_before_restore(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = {'id': 'db', 'compose_volume': 'db'}
+            value = {
+                '_dir': str(root / 'demo'),
+                '_path': str(root / 'demo' / 'backup.yaml'),
+                'service': 'demo',
+                'compose': {'files': ['compose.yaml']},
+                'sources': {'paths': [], 'volumes': [source]},
+            }
+            plan = restore_plan.RestorePlan(
+                root, {}, value, 'rebuild', ((source, 'demo_db'),),
+                ('demo_db',), (), (), 'demo',
+            )
+            model = {
+                'name': 'demo',
+                'services': {'app': {'volumes': [{'type': 'volume', 'source': 'db'}]}},
+                'volumes': {
+                    'db': {
+                        'name': 'demo_db',
+                        'driver': 'custom-driver',
+                        'driver_opts': {'device': '/dev/example'},
+                    },
+                },
+            }
+            events = []
+
+            def create(name, *, on_created, **kwargs):
+                self.assertEqual(name, 'demo_db')
+                self.assertEqual(kwargs['driver'], 'custom-driver')
+                self.assertEqual(
+                    kwargs['driver_opts'], {'device': '/dev/example'},
+                )
+                self.assertEqual(kwargs['labels'], {})
+                self.assertEqual(kwargs['project_name'], 'demo')
+                self.assertEqual(kwargs['operation_id'], 'operation')
+                on_created(name)
+                events.append('volume-create')
+
+            def restore(_c, _m, _root, **kwargs):
+                self.assertEqual(kwargs['resolved'], ((source, 'demo_db'),))
+                events.append('restore')
+
+            with mock.patch.object(
+                restore_apply, 'compose_model', return_value=model,
+            ), mock.patch.object(
+                restore_apply, 'docker_volume_exists',
+                return_value=False,
+            ), mock.patch.object(
+                restore_apply, 'sync_volumes', side_effect=restore,
+            ), mock.patch.object(
+                restore_apply, 'create_restore_volume',
+                side_effect=create,
+            ) as direct_create, mock.patch.object(
+                restore_apply, 'compose_run',
+            ) as compose:
+                restore_apply._restore_data(
+                    {}, plan, restore_apply.RestoreChanges(), 'operation',
+                )
+
+            self.assertEqual(events, ['volume-create', 'restore'])
+            direct_create.assert_called_once()
+            compose.assert_not_called()
+
+    def test_rebuild_rejects_restoring_external_compose_volume(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / '_meta').mkdir()
+            source = {'id': 'db', 'compose_volume': 'db'}
+            value = {
+                '_dir': str(root / 'demo'),
+                '_path': str(root / 'demo' / 'backup.yaml'),
+                'service': 'demo',
+                'sources': {'paths': [], 'volumes': [source]},
+            }
+            plan = restore_plan.RestorePlan(
+                root, {}, value, 'rebuild', ((source, 'shared_db'),),
+                ('shared_db',), (), (), 'demo',
+            )
+            model = {
+                'name': 'demo',
+                'services': {},
+                'volumes': {
+                    'db': {'name': 'shared_db', 'external': True},
+                },
+            }
+
+            with mock.patch.object(
+                restore_apply, 'compose_model', return_value=model,
+            ), mock.patch.object(
+                restore_apply, 'create_restore_volume',
+            ) as create, mock.patch.object(
+                restore_apply, 'sync_volumes',
+            ) as restore, self.assertRaisesRegex(
+                RuntimeError, 'external Compose volume',
+            ):
+                restore_apply._restore_data(
+                    {}, plan, restore_apply.RestoreChanges(), 'operation',
+                )
+
+            create.assert_not_called()
+            restore.assert_not_called()
+
+    def test_rebuild_without_start_does_not_touch_compose_project(self):
+        root = Path('/restore')
+        source = {'id': 'db', 'compose_volume': 'db'}
+        plan = restore_plan.RestorePlan(
+            root, {}, {'service': 'demo'}, 'rebuild',
+            ((source, 'demo_db'),), ('demo_db',), (), (), 'demo',
+        )
+
+        with mock.patch.object(restore_apply, 'compose_run') as compose:
+            restore_apply._restart_services(plan, [], False)
+
+        compose.assert_not_called()
+
     def test_dynamic_rebuild_rejects_snapshot_absent_path_that_appeared(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -640,7 +851,7 @@ class RestoreApplyLifecycleTests(unittest.TestCase):
                     mock.patch.object(restore_apply, 'docker_project_containers', return_value=()):
                 with self.assertRaisesRegex(RuntimeError, 'target appeared'):
                     restore_apply.apply_one(
-                        {'trusted_data_roots': [str(root / 'trusted')]}, value, root,
+                        {}, value, root,
                     )
 
     def test_dynamic_rebuild_rejects_snapshot_absent_volume_that_appeared(self):
@@ -820,7 +1031,7 @@ class RestoreApplyLifecycleTests(unittest.TestCase):
             ), mock.patch.object(restore_apply, 'run') as run_mock:
                 with self.assertRaisesRegex(RuntimeError, 'restore failed'):
                     restore_apply.apply_one(
-                        {'trusted_data_roots': [str(root / 'trusted')]},
+                        {},
                         value, root,
                     )
 
@@ -829,6 +1040,59 @@ class RestoreApplyLifecycleTests(unittest.TestCase):
                 ['docker', 'volume', 'rm', 'demo_db'],
                 [call.args[0] for call in run_mock.call_args_list],
             )
+
+    def test_failed_rebuild_rolls_back_directly_created_compose_volume(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = {'id': 'db', 'compose_volume': 'db'}
+            value = {
+                '_dir': str(root / 'demo'),
+                '_path': str(root / 'demo' / 'backup.yaml'),
+                'service': 'demo',
+                'sources': {'paths': [], 'volumes': [source]},
+            }
+            plan = restore_plan.RestorePlan(
+                root, {}, value, 'rebuild', ((source, 'demo_db'),),
+                ('demo_db',), (), (), 'demo',
+            )
+            model = {
+                'name': 'demo', 'services': {},
+                'volumes': {'db': {'name': 'demo_db'}},
+            }
+            events = []
+
+            def create(name, *, on_created, **_kwargs):
+                on_created(name)
+                events.append('create-volume')
+
+            def run(command, **_kwargs):
+                if command == ['docker', 'volume', 'rm', 'demo_db']:
+                    events.append('remove-volume')
+
+            with mock.patch.object(
+                restore_apply, 'prepare_restore_plan', return_value=plan,
+            ), mock.patch.object(
+                restore_apply, '_dynamic_preflight',
+            ), mock.patch.object(
+                restore_apply, '_publish_controls',
+            ), mock.patch.object(
+                restore_apply, 'compose_model', return_value=model,
+            ), mock.patch.object(
+                restore_apply, 'docker_volume_exists',
+                return_value=False,
+            ), mock.patch.object(
+                restore_apply, 'create_restore_volume', side_effect=create,
+            ), mock.patch.object(
+                restore_apply, 'volume_owned_by_operation', return_value=True,
+            ), mock.patch.object(
+                restore_apply, 'sync_volumes',
+                side_effect=RuntimeError('restore failed'),
+            ), mock.patch.object(
+                restore_apply, 'run', side_effect=run,
+            ), self.assertRaisesRegex(RuntimeError, 'restore failed'):
+                restore_apply.apply_one({}, value, root)
+
+            self.assertEqual(events, ['create-volume', 'remove-volume'])
 
     def test_rebuild_rollback_preserves_concurrent_target_content(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -865,7 +1129,7 @@ class RestoreApplyLifecycleTests(unittest.TestCase):
                 side_effect=publish_then_receive_external_write,
             ), self.assertRaisesRegex(RuntimeError, 'later restore failed'):
                 restore_apply.apply_one(
-                    {'trusted_data_roots': [str(root / 'trusted')]},
+                    {},
                     value, root,
                 )
 
@@ -912,7 +1176,7 @@ class RestoreApplyLifecycleTests(unittest.TestCase):
                 side_effect=receive_external_write,
             ), self.assertRaisesRegex(RuntimeError, 'restore failed'):
                 restore_apply.apply_one(
-                    {'trusted_data_roots': [str(trusted)]}, value, root,
+                    {}, value, root,
                 )
 
             self.assertEqual(
@@ -956,7 +1220,7 @@ class RestoreApplyLifecycleTests(unittest.TestCase):
                 side_effect=partial_restore,
             ), self.assertRaisesRegex(RuntimeError, 'restore failed'):
                 restore_apply.apply_one(
-                    {'trusted_data_roots': [str(root / 'trusted')]},
+                    {},
                     value, root,
                 )
 

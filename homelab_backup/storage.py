@@ -8,11 +8,12 @@ from pathlib import Path
 from .common import CommandError, run, run_cleanup
 from .manifest import (
     actual_volume_name, compose_model, compose_run, source_path,
-    validate_docker_volume_name,
+    path_source_control_overlap, validate_docker_volume_name,
 )
 from .security import (
     clear_control_leaf, containing_mount, docker_mount_users,
     ensure_private_directory, open_data_path, open_data_path_with_parent_metadata,
+    lexical_absolute, paths_overlap, validate_data_mount_boundary,
     validate_payload, validate_payload_fd,
 )
 
@@ -94,23 +95,54 @@ def validate_volume_identity(name, *, project_name=None, logical_name=None):
 
 def create_restore_volume(
         name, *, service, source, project_name=None, operation_id=None,
-        on_created=None,
+        driver=None, driver_opts=None, labels=None, on_created=None,
 ):
     name = validate_docker_volume_name(name)
-    command = [
-        'docker', 'volume', 'create',
-        '--label', f'io.homelab-backup.service={service}',
-        '--label', f'io.homelab-backup.source={source["id"]}',
-    ]
+    if driver is not None and (
+        not isinstance(driver, str) or not driver
+    ):
+        raise ValueError('Docker volume driver must be a non-empty string')
+
+    def string_mapping(value, field):
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            raise ValueError(f'{field} must be a mapping')
+        normalized = {}
+        for key, item in value.items():
+            if not isinstance(key, str) or not key:
+                raise ValueError(f'{field} keys must be non-empty strings')
+            if item is None and field == 'Docker volume labels':
+                item = ''
+            if not isinstance(item, str):
+                raise ValueError(f'{field} values must be strings')
+            normalized[key] = item
+        return normalized
+
+    options = string_mapping(driver_opts, 'Docker volume driver options')
+    expected_labels = string_mapping(labels, 'Docker volume labels')
+    expected_labels.update({
+        'io.homelab-backup.service': service,
+        'io.homelab-backup.source': source['id'],
+    })
     if operation_id:
-        command += [
-            '--label', f'io.homelab-backup.operation={operation_id}',
-        ]
+        expected_labels['io.homelab-backup.operation'] = operation_id
     if source.get('compose_volume'):
-        command += [
-            '--label', f'com.docker.compose.project={project_name}',
-            '--label', f'com.docker.compose.volume={source["compose_volume"]}',
-        ]
+        if not isinstance(project_name, str) or not project_name:
+            raise ValueError(
+                'Compose-managed restore volume requires a project name'
+            )
+        expected_labels.update({
+            'com.docker.compose.project': project_name,
+            'com.docker.compose.volume': source['compose_volume'],
+        })
+    command = ['docker', 'volume', 'create']
+    if driver is not None:
+        command += ['--driver', driver]
+    for key, value in sorted(options.items()):
+        command += ['--opt', f'{key}={value}']
+    for key, value in expected_labels.items():
+        command += ['--label', f'{key}={value}']
     command.append(name)
     result = run(command, capture=True)
     if on_created is not None:
@@ -124,10 +156,31 @@ def create_restore_volume(
         raise RuntimeError(
             f'Docker created an unexpected volume: {result.stdout.strip()}'
         )
-    if operation_id and not volume_owned_by_operation(name, operation_id):
-        raise RuntimeError(
-            f'Docker volume is not owned by this restore operation: {name}'
+    if operation_id or driver is not None or driver_opts is not None \
+            or labels is not None or source.get('compose_volume'):
+        details = docker_volume_details(name)
+        if details.get('Name') not in (None, name):
+            raise RuntimeError(
+                f'Docker volume name does not match restore target: {name}'
+            )
+        if driver is not None and details.get('Driver') != driver:
+            raise RuntimeError(
+                f'Docker volume driver does not match Compose model: {name}'
+            )
+        if driver_opts is not None and (details.get('Options') or {}) != options:
+            raise RuntimeError(
+                f'Docker volume options do not match Compose model: {name}'
+            )
+        actual_labels = details.get('Labels') or {}
+        mismatched = sorted(
+            key for key, value in expected_labels.items()
+            if actual_labels.get(key) != value
         )
+        if mismatched:
+            raise RuntimeError(
+                f'Docker volume labels do not match restore specification: '
+                f'{name}: {", ".join(mismatched)}'
+            )
 
 
 def volume_owned_by_operation(name, operation_id):
@@ -204,8 +257,43 @@ def resolved_volume_sources(m, model=None):
     return resolved
 
 
-def _source_trusted_roots(c, m):
-    return c.get('trusted_data_roots') or [m['_dir']]
+def _local_repository_path(repository):
+    if not isinstance(repository, str):
+        return None
+    if repository.startswith('/'):
+        return lexical_absolute(repository)
+    if repository.startswith('local:/'):
+        return lexical_absolute(repository.removeprefix('local:'))
+    return None
+
+
+def validate_path_source_policy(c, m, source):
+    path = lexical_absolute(source_path(m, source))
+    if path == Path('/'):
+        raise ValueError('path source must not be the filesystem root: /')
+    forbidden = {
+        key: c.get(key)
+        for key in (
+            'staging_root', 'restore_root', 'cache_root', 'state_root',
+            'password_file', 'rclone_config', 'lock_file',
+        )
+        if c.get(key)
+    }
+    repository_path = _local_repository_path(c.get('repository'))
+    if repository_path is not None:
+        forbidden['repository'] = repository_path
+    for name, value in forbidden.items():
+        if paths_overlap(path, value):
+            raise ValueError(
+                f'path source {path} must not overlap {name}: {value}'
+            )
+    overlap = path_source_control_overlap(m, source)
+    if overlap is not None:
+        name, control = overlap
+        raise ValueError(
+            f'path source {path} must not overlap protected {name}: {control}'
+        )
+    return path
 
 
 def _validate_path_filter_type(source, metadata, path):
@@ -216,12 +304,12 @@ def _validate_path_filter_type(source, metadata, path):
 
 
 def validate_runtime_sources(c, m, model, *, allow_missing_paths=False):
-    trusted_roots = _source_trusted_roots(c, m)
     for source in (m.get('sources') or {}).get('paths', []):
-        path = source_path(m, source)
+        path = validate_path_source_policy(c, m, source)
         try:
-            fd, metadata = open_data_path(path, trusted_roots)
+            fd, metadata = open_data_path(path)
             try:
+                validate_data_mount_boundary(path)
                 _validate_path_filter_type(source, metadata, path)
             finally:
                 os.close(fd)
@@ -282,45 +370,20 @@ def _same_object(left, right):
     )
 
 
-def _open_path_source(src, *, trusted_roots=None):
-    src = Path(src)
-    if trusted_roots is not None:
-        return open_data_path(src, trusted_roots)
-    initial = src.lstat()
-    if stat.S_ISLNK(initial.st_mode):
-        flags = os.O_PATH | os.O_NOFOLLOW
-    elif stat.S_ISDIR(initial.st_mode):
-        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-    elif stat.S_ISREG(initial.st_mode):
-        flags = os.O_RDONLY | os.O_NOFOLLOW
-    else:
-        raise RuntimeError(f'unsupported path source type: {src}')
-    fd = os.open(src, flags)
-    metadata = os.fstat(fd)
-    if not _same_object(initial, metadata):
-        os.close(fd)
-        raise RuntimeError(f'path source changed while being opened: {src}')
-    return fd, metadata
+def _open_path_source(src):
+    return open_data_path(src)
 
 
-def _verify_path_source(src, metadata, *, trusted_roots=None):
-    if trusted_roots is not None:
-        try:
-            fd, current = open_data_path(src, trusted_roots)
-        except FileNotFoundError as err:
-            raise RuntimeError(f'path source changed during backup: {src}') from err
-        try:
-            if not _same_object(metadata, current):
-                raise RuntimeError(f'path source changed during backup: {src}')
-        finally:
-            os.close(fd)
-        return
+def _verify_path_source(src, metadata):
     try:
-        current = Path(src).lstat()
+        fd, current = open_data_path(src)
     except FileNotFoundError as err:
         raise RuntimeError(f'path source changed during backup: {src}') from err
-    if not _same_object(metadata, current):
-        raise RuntimeError(f'path source changed during backup: {src}')
+    try:
+        if not _same_object(metadata, current):
+            raise RuntimeError(f'path source changed during backup: {src}')
+    finally:
+        os.close(fd)
 
 
 def _estimate_open_source(fd, metadata, display_path):
@@ -385,6 +448,7 @@ def _estimate_filtered_directory(fd, source, allocation_unit):
     with tempfile.TemporaryDirectory(prefix='homelab-backup-estimate-') as destination:
         command = [
             'rsync', '-aHAX', '--numeric-ids', '--dry-run', '--stats',
+            '--one-file-system',
             *build_path_filter_args(source),
             f'/proc/self/fd/{fd}/', f'{destination}/',
         ]
@@ -403,16 +467,16 @@ def estimate_path_source(
         c, m, source, *, physical_source=None, allocation_unit=4096,
 ):
     src = Path(physical_source) if physical_source is not None else source_path(m, source)
-    trusted_roots = _source_trusted_roots(c, m)
+    if physical_source is None:
+        validate_path_source_policy(c, m, source)
     try:
-        fd, metadata = _open_path_source(
-            src, trusted_roots=None if physical_source is not None else trusted_roots,
-        )
+        fd, metadata = _open_path_source(src)
     except FileNotFoundError:
         if source.get('required', True):
             raise ValueError(f'missing source {src}')
         return 0
     filesystem = containing_mount(src).filesystem_type
+    mount_state = validate_data_mount_boundary(src)
     try:
         validate_payload_fd(fd, src, filesystem_type=filesystem)
         _validate_path_filter_type(source, metadata, src)
@@ -422,10 +486,11 @@ def estimate_path_source(
             )
         else:
             size = _estimate_open_source(fd, metadata, src)
-        _verify_path_source(
-            src, metadata,
-            trusted_roots=None if physical_source is not None else trusted_roots,
-        )
+        _verify_path_source(src, metadata)
+        if validate_data_mount_boundary(src) != mount_state:
+            raise RuntimeError(
+                f'mount topology changed during size estimation: {src}'
+            )
         return size
     finally:
         os.close(fd)
@@ -483,12 +548,13 @@ def estimate_backup_size(
 
 
 def _copy_path_source(
-        src, dst, source, *, fd=None, metadata=None, trusted_roots=None,
+        src, dst, source, *, fd=None, metadata=None,
 ):
     src = Path(src)
     own_fd = fd is None
     if own_fd:
-        fd, metadata = _open_path_source(src, trusted_roots=trusted_roots)
+        fd, metadata = _open_path_source(src)
+    mount_state = validate_data_mount_boundary(src)
     dst.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
     clear_control_leaf(dst)
     dst.mkdir(parents=True, mode=0o700)
@@ -518,7 +584,10 @@ def _copy_path_source(
                 )
             source_type = 'symlink'
         elif stat.S_ISDIR(metadata.st_mode):
-            cmd = ['rsync', '-aHAX', '--numeric-ids', '--delete']
+            cmd = [
+                'rsync', '-aHAX', '--numeric-ids', '--delete',
+                '--one-file-system',
+            ]
             cmd += build_path_filter_args(source)
             cmd += [f'/proc/self/fd/{fd}/', f'{dst}/']
             run(cmd, pass_fds=(fd,))
@@ -531,7 +600,9 @@ def _copy_path_source(
             source_type = 'file'
         else:
             raise RuntimeError(f'unsupported path source type: {src}')
-        _verify_path_source(src, metadata, trusted_roots=trusted_roots)
+        _verify_path_source(src, metadata)
+        if validate_data_mount_boundary(src) != mount_state:
+            raise RuntimeError(f'mount topology changed during backup: {src}')
         return source_type
     finally:
         if own_fd:
@@ -539,16 +610,16 @@ def _copy_path_source(
 
 
 def validate_path_payloads(c, m, *, allow_missing=False):
-    trusted_roots = _source_trusted_roots(c, m)
     for source in (m.get('sources') or {}).get('paths', []):
-        src = source_path(m, source)
+        src = validate_path_source_policy(c, m, source)
         try:
-            fd, _metadata = open_data_path(src, trusted_roots)
+            fd, _metadata = open_data_path(src)
         except FileNotFoundError:
             if source.get('required', True) and not allow_missing:
                 raise ValueError(f'missing required source: {src}')
             continue
         try:
+            validate_data_mount_boundary(src)
             filesystem = containing_mount(src).filesystem_type
             validate_payload_fd(fd, src, filesystem_type=filesystem)
         finally:
@@ -564,18 +635,13 @@ def sync_paths(
         # root-only CLI always supplies the explicit global policy.
         stage = m
         m = c
-        roots = sorted(set(
-            str(source_path(m, source).parent)
-            for source in (m.get('sources') or {}).get('paths', [])
-        )) or [m['_dir']]
-        c = {'trusted_data_roots': roots}
-    trusted_roots = _source_trusted_roots(c, m)
+        c = {}
     source_overrides = source_overrides or {}
     capture_methods = capture_methods or {}
     writer_map = writer_map or {}
     inventory = []
     for source in (m.get('sources') or {}).get('paths', []):
-        src = source_path(m, source)
+        src = validate_path_source_policy(c, m, source)
         physical = source_overrides.get(source['id'])
         copy_source = Path(physical) if physical is not None else src
         capture_method = capture_methods.get(source['id'], 'quiesced-copy')
@@ -584,9 +650,8 @@ def sync_paths(
         try:
             if before_copy is not None:
                 before_copy(source)
-            logical_fd, logical_metadata, ancestors = open_data_path_with_parent_metadata(
-                src, trusted_roots,
-            )
+            logical_fd, logical_metadata, ancestors = \
+                open_data_path_with_parent_metadata(src)
             fd = logical_fd
             try:
                 filesystem = containing_mount(copy_source).filesystem_type
@@ -601,8 +666,8 @@ def sync_paths(
                 )
                 source_type = _copy_path_source(
                     copy_source, dst, source, fd=fd, metadata=metadata,
-                    trusted_roots=trusted_roots if physical is None else None,
                 )
+                _verify_path_source(src, logical_metadata)
             finally:
                 if fd is not None:
                     os.close(fd)

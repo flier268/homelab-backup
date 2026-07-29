@@ -73,9 +73,9 @@ def preflight_bundle(source_root):
     config_module.CFG = config_path
     config = load_yaml(config_path)
     config_module._validate_config_header(config)
-    trusted_roots = config_module._normalize_trusted_roots(config)
+    config_module._discard_deprecated_trusted_roots(config)
     config_module._validate_optional_sections(config)
-    config_module._validate_root_separation(config, trusted_roots)
+    config_module._validate_root_separation(config)
     if config['password_file'] != '/etc/homelab-backup/restic-password':
         raise SystemExit(
             'ERROR: restored config password_file must name the bundled restic password'

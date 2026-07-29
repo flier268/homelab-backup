@@ -94,7 +94,6 @@ class BtrfsIntegrationTests(unittest.TestCase):
             transaction = btrfs_snapshot.SnapshotTransaction(
                 {
                     'state_root': str(state_root),
-                    'trusted_data_roots': [str(root)],
                 }, manifest, lambda _path: (),
             )
             self.assertEqual(transaction.create(), {})
@@ -125,7 +124,6 @@ class BtrfsIntegrationTests(unittest.TestCase):
             transaction = btrfs_snapshot.SnapshotTransaction(
                 {
                     'state_root': str(state_root),
-                    'trusted_data_roots': [str(root)],
                 }, manifest, lambda _path: (),
             )
             snapshot = transaction.create()['data']

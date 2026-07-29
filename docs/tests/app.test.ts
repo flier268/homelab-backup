@@ -35,7 +35,8 @@ describe('App', () => {
     await nextTick()
 
     expect(wrapper.text()).toContain('主機與服務位置')
-    expect(wrapper.text()).toContain('Trusted data roots')
+    expect(wrapper.text()).toContain('受保護的 backup.yaml')
+    expect(wrapper.text()).not.toContain('Trusted data roots')
   })
 
   it('switches between the integrated editor and guide', async () => {

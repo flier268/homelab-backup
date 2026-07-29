@@ -12,6 +12,7 @@ from pathlib import Path
 
 MOUNTINFO_PATH = Path('/proc/self/mountinfo')
 ALLOWED_FILESYSTEMS = frozenset({'ext4', 'xfs', 'btrfs'})
+ROOT_DIRECTORY_UID = os.stat('/').st_uid
 _MOUNTINFO_ESCAPES = {
     r'\040': ' ', r'\011': '\t', r'\012': '\n', r'\134': '\\',
 }
@@ -126,6 +127,10 @@ def validate_control_directory(path, *, allow_missing=False, owner_uid=None):
     effective_uid = os.geteuid()
     owner_uid = 0 if owner_uid is None else owner_uid
     allowed_owners = {owner_uid}
+    if owner_uid == 0 and effective_uid != 0:
+        # Sandboxed/user-namespace hosts may expose the host root as an
+        # unmapped overflow UID while the process itself remains unprivileged.
+        allowed_owners.add(ROOT_DIRECTORY_UID)
     if effective_uid != 0:
         # Unit tests call library functions without the root-only CLI boundary.
         # Production always has effective_uid == 0.
@@ -261,7 +266,10 @@ def containing_mount(path, records=None):
     ]
     if not matches:
         raise RuntimeError(f'cannot determine filesystem for {path}')
-    return max(matches, key=lambda item: len(item.mount_point.parts))
+    return max(
+        matches,
+        key=lambda item: (len(item.mount_point.parts), item.mount_id),
+    )
 
 
 def validate_mount_boundary(root, *, records=None):
@@ -272,7 +280,7 @@ def validate_mount_boundary(root, *, records=None):
     if anchor.filesystem_type not in ALLOWED_FILESYSTEMS \
             and (os.geteuid() == 0 or explicit_records):
         raise ValueError(
-            f'unsupported filesystem {anchor.filesystem_type!r} for trusted root {root}'
+            f'unsupported filesystem {anchor.filesystem_type!r} for control root {root}'
         )
     nested = sorted(
         item.mount_point for item in records
@@ -296,26 +304,47 @@ def validate_control_root(path, *, allow_missing=False, records=None):
     return path
 
 
-def select_trusted_root(path, trusted_roots):
+def data_mount_state(path, *, records=None):
+    """Describe the mount containing a data path and every nested mount."""
     path = lexical_absolute(path)
-    matches = [lexical_absolute(root) for root in trusted_roots if path_contains(root, path)]
-    if len(matches) != 1:
-        raise ValueError(f'path must be contained by exactly one trusted_data_root: {path}')
-    return matches[0]
+    records = tuple(mount_records() if records is None else records)
+    anchor = containing_mount(path, records)
+    nested = tuple(sorted(
+        (
+            item.mount_id, item.parent_id, item.device,
+            str(item.filesystem_root), str(item.mount_point),
+            item.filesystem_type, item.source,
+        )
+        for item in records
+        if item.mount_point != path and path_contains(path, item.mount_point)
+    ))
+    anchor_state = (
+        anchor.mount_id, anchor.parent_id, anchor.device,
+        str(anchor.filesystem_root), str(anchor.mount_point),
+        anchor.filesystem_type, anchor.source,
+    )
+    return anchor_state, nested
 
 
-def _open_data_path(path, trusted_roots, *, capture_parent_metadata=False):
+def validate_data_mount_boundary(path, *, records=None):
+    """Reject nested mounts while allowing the data path itself to be a mount."""
+    state = data_mount_state(path, records=records)
+    if state[1]:
+        raise ValueError(f'nested mount is not supported: {state[1][0][4]}')
+    return state
+
+
+def _open_data_path(path, *, capture_parent_metadata=False):
     """Open a payload and optionally describe the exact ancestor chain used."""
     path = lexical_absolute(path)
-    trusted_root = select_trusted_root(path, trusted_roots)
-    if path == trusted_root:
-        raise ValueError(f'data path must be strictly below trusted root: {path}')
+    if path == Path('/'):
+        raise ValueError('data path must not be the filesystem root: /')
     current_fd = os.open(
-        trusted_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        '/', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
     )
     ancestors = []
     try:
-        parts = path.relative_to(trusted_root).parts
+        parts = path.parts[1:]
         for index, component in enumerate(parts):
             final = index == len(parts) - 1
             metadata = os.stat(
@@ -325,7 +354,7 @@ def _open_data_path(path, trusted_roots, *, capture_parent_metadata=False):
                 if not stat.S_ISDIR(metadata.st_mode):
                     raise ValueError(
                         f'data path component is not a real directory: '
-                        f'{trusted_root.joinpath(*parts[:index + 1])}'
+                        f'{Path("/").joinpath(*parts[:index + 1])}'
                     )
                 flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
             elif stat.S_ISDIR(metadata.st_mode):
@@ -361,28 +390,19 @@ def _open_data_path(path, trusted_roots, *, capture_parent_metadata=False):
         raise
 
 
-def open_data_path(path, trusted_roots):
-    """Open a payload below a trusted root without following path-component links.
-
-    Ownership below the trusted root is deliberately unrestricted: container
-    processes may own the complete data tree.  The trusted root is validated by
-    the CLI boundary; this function pins it and walks every payload component
-    relative to file descriptors so a writable ancestor cannot redirect the
-    operation outside that root.
-    """
-    fd, metadata, _ancestors = _open_data_path(path, trusted_roots)
+def open_data_path(path):
+    """Open an absolute payload path without following path-component links."""
+    fd, metadata, _ancestors = _open_data_path(path)
     return fd, metadata
 
 
-def open_data_path_with_parent_metadata(path, trusted_roots):
+def open_data_path_with_parent_metadata(path):
     """Open a payload and return metadata for the pinned ancestor chain."""
-    return _open_data_path(
-        path, trusted_roots, capture_parent_metadata=True,
-    )
+    return _open_data_path(path, capture_parent_metadata=True)
 
 
-def validate_data_path(path, trusted_roots):
-    fd, _metadata = open_data_path(path, trusted_roots)
+def validate_data_path(path):
+    fd, _metadata = open_data_path(path)
     os.close(fd)
     return lexical_absolute(path)
 
@@ -428,24 +448,20 @@ def data_object_state(fd):
     return own_state, tuple(children)
 
 
-def validate_data_parent(path, trusted_roots, *, allow_missing=False):
+def validate_data_parent(path, *, allow_missing=False):
     """Validate existing payload ancestors without imposing ownership policy."""
     path = lexical_absolute(path)
-    trusted_root = select_trusted_root(path, trusted_roots)
-    if path == trusted_root:
-        raise ValueError(f'data path must be strictly below trusted root: {path}')
+    if path == Path('/'):
+        raise ValueError('data path must not be the filesystem root: /')
+    current_fd = os.open(
+        '/', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
     try:
-        current_fd = os.open(
-            trusted_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-        )
-    except FileNotFoundError:
-        if allow_missing:
-            validate_control_directory(trusted_root, allow_missing=True)
-            return trusted_root
-        raise
-    try:
-        for component in path.relative_to(trusted_root).parts[:-1]:
+        for component in path.parts[1:-1]:
             try:
+                metadata = os.stat(
+                    component, dir_fd=current_fd, follow_symlinks=False,
+                )
                 next_fd = os.open(
                     component,
                     os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
@@ -453,45 +469,73 @@ def validate_data_parent(path, trusted_roots, *, allow_missing=False):
                 )
             except FileNotFoundError:
                 if allow_missing:
-                    return trusted_root
+                    return Path('/')
                 raise
+            opened = os.fstat(next_fd)
+            if (
+                metadata.st_dev != opened.st_dev
+                or metadata.st_ino != opened.st_ino
+                or stat.S_IFMT(metadata.st_mode) != stat.S_IFMT(opened.st_mode)
+            ):
+                os.close(next_fd)
+                raise RuntimeError(
+                    f'data parent changed while being opened: {path}'
+                )
             os.close(current_fd)
             current_fd = next_fd
-        return trusted_root
+        return Path('/')
     finally:
         os.close(current_fd)
 
 
 def open_data_parent(
-        path, trusted_roots, *, create_metadata=None, on_create=None,
+        path, *, create_metadata=None, on_create=None,
 ):
     """Pin a payload parent, optionally recreating missing ancestors safely."""
     path = lexical_absolute(path)
-    trusted_root = select_trusted_root(path, trusted_roots)
-    if path == trusted_root:
-        raise ValueError(f'data path must be strictly below trusted root: {path}')
-    parts = path.relative_to(trusted_root).parts
+    if path == Path('/'):
+        raise ValueError('data path must not be the filesystem root: /')
+    parts = path.parts[1:]
     expected = {
         item['path']: item for item in (create_metadata or [])
     }
+
+    def expected_record(relative):
+        record = expected.get(relative)
+        if record is not None:
+            return record
+        relative_parts = Path(relative).parts
+        matches = [
+            item for item in (create_metadata or [])
+            if len(Path(item['path']).parts) <= len(relative_parts)
+            and relative_parts[-len(Path(item['path']).parts):]
+            == Path(item['path']).parts
+        ]
+        return max(
+            matches, key=lambda item: len(Path(item['path']).parts),
+            default=None,
+        )
     current_fd = os.open(
-        trusted_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        '/', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
     )
     try:
         for index, component in enumerate(parts[:-1]):
             relative = Path(*parts[:index + 1]).as_posix()
             try:
+                metadata = os.stat(
+                    component, dir_fd=current_fd, follow_symlinks=False,
+                )
                 next_fd = os.open(
                     component,
                     os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
                     dir_fd=current_fd,
                 )
             except FileNotFoundError:
-                record = expected.get(relative)
+                record = expected_record(relative)
                 if record is None:
                     raise RuntimeError(
                         f'snapshot lacks metadata for missing data ancestor: '
-                        f'{trusted_root / relative}'
+                        f'{Path("/") / relative}'
                     )
                 os.mkdir(component, 0o700, dir_fd=current_fd)
                 next_fd = os.open(
@@ -506,8 +550,20 @@ def open_data_parent(
                 if on_create is not None:
                     metadata = os.fstat(next_fd)
                     on_create(
-                        trusted_root / relative,
+                        Path('/') / relative,
                         (metadata.st_dev, metadata.st_ino),
+                    )
+            else:
+                opened = os.fstat(next_fd)
+                if (
+                    metadata.st_dev != opened.st_dev
+                    or metadata.st_ino != opened.st_ino
+                    or stat.S_IFMT(metadata.st_mode)
+                    != stat.S_IFMT(opened.st_mode)
+                ):
+                    os.close(next_fd)
+                    raise RuntimeError(
+                        f'data parent changed while being opened: {path}'
                     )
             os.close(current_fd)
             current_fd = next_fd
@@ -525,11 +581,6 @@ def remove_data_entry(parent_fd, name):
     except FileNotFoundError:
         pass
     os.fsync(parent_fd)
-
-
-def validate_trusted_roots(trusted_roots, *, records=None):
-    for root in trusted_roots:
-        validate_control_root(root, records=records)
 
 
 def _scan_payload_tree(path):
@@ -559,6 +610,16 @@ def _scan_payload_tree_fd(fd, display_path):
                     dir_fd=fd,
                 )
                 try:
+                    opened = os.fstat(child_fd)
+                    if (
+                        metadata.st_dev != opened.st_dev
+                        or metadata.st_ino != opened.st_ino
+                        or stat.S_IFMT(metadata.st_mode)
+                        != stat.S_IFMT(opened.st_mode)
+                    ):
+                        raise RuntimeError(
+                            f'payload changed while being scanned: {child}'
+                        )
                     _scan_payload_tree_fd(child_fd, child)
                 finally:
                     os.close(child_fd)
@@ -570,6 +631,7 @@ def validate_payload_fd(fd, display_path, *, filesystem_type=None, run=None):
     """Validate a payload through an already pinned, no-follow descriptor."""
     metadata = os.fstat(fd)
     display_path = Path(display_path)
+    validate_data_mount_boundary(display_path)
     if stat.S_ISDIR(metadata.st_mode):
         if filesystem_type == 'btrfs' and os.geteuid() == 0:
             runner = run or subprocess.run
@@ -735,40 +797,9 @@ def ensure_control_directory(path, *, mode=0o700):
     return path
 
 
-def ensure_control_parent(path, trusted_roots):
-    """Create a missing control directory chain relative to a trusted root fd."""
-    path = lexical_absolute(path)
-    trusted_root = select_trusted_root(path, trusted_roots)
-    validate_control_directory(trusted_root)
-    current_fd = os.open(
-        trusted_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-    )
-    try:
-        for component in path.relative_to(trusted_root).parts:
-            try:
-                os.mkdir(component, 0o755, dir_fd=current_fd)
-                os.fsync(current_fd)
-            except FileExistsError:
-                pass
-            next_fd = os.open(
-                component,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                dir_fd=current_fd,
-            )
-            metadata = os.fstat(next_fd)
-            allowed_owners = {0}
-            if os.geteuid() != 0:
-                allowed_owners.add(os.geteuid())
-            if metadata.st_uid not in allowed_owners or \
-                    metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-                os.close(next_fd)
-                raise ValueError(f'created control directory is not protected: {path}')
-            os.close(current_fd)
-            current_fd = next_fd
-        os.fsync(current_fd)
-    finally:
-        os.close(current_fd)
-    return path
+def ensure_control_parent(path):
+    """Create and validate an absolute root-protected control directory."""
+    return ensure_control_directory(path, mode=0o755)
 
 
 def atomic_copy_file(

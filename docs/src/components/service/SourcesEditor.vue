@@ -20,7 +20,7 @@ function sources() {
 
 function addPath(): void {
   const ordinal = sources().paths.length + 1
-  sources().paths.push({ id: `path-${ordinal}`, path: '.', required: true })
+  sources().paths.push({ id: `path-${ordinal}`, path: 'data', required: true })
 }
 
 function addVolume(): void {

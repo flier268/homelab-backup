@@ -168,6 +168,44 @@ class ManifestValidationTests(unittest.TestCase):
                         'volumes': [],
                     }))
 
+    def test_path_source_must_not_cover_protected_control_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for source_path, control_name in (
+                ('.', 'manifest'),
+                ('backup.yaml', 'manifest'),
+                ('config', 'Compose control'),
+            ):
+                with self.subTest(source_path=source_path):
+                    value = manifest(
+                        root,
+                        compose={'files': ['config/compose.yaml']},
+                        sources={
+                            'paths': [{'id': 'data', 'path': source_path}],
+                            'volumes': [],
+                        },
+                    )
+                    with self.assertRaisesRegex(ValueError, control_name):
+                        manifest_module.validate_manifest(value)
+
+    def test_exact_compose_controls_remain_valid_deferred_sources(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            value = manifest(
+                Path(tmp),
+                compose={
+                    'files': ['compose.yaml'],
+                    'env_file': 'compose.env',
+                },
+                sources={
+                    'paths': [
+                        {'id': 'compose', 'path': 'compose.yaml'},
+                        {'id': 'env', 'path': 'compose.env'},
+                    ],
+                    'volumes': [],
+                },
+            )
+            self.assertTrue(manifest_module.validate_manifest(value))
+
     def test_volume_include_is_not_supported(self):
         with tempfile.TemporaryDirectory() as tmp:
             value = manifest(Path(tmp), sources={
@@ -422,7 +460,6 @@ class GlobalConfigValidationTests(unittest.TestCase):
             'services_root': str(root / 'services'),
             'staging_root': str(root / 'staging'),
             'restore_root': str(root / 'restore'),
-            'trusted_data_roots': [str(root / 'services')],
         }
 
     def test_global_version_must_be_one(self):
@@ -513,23 +550,24 @@ class GlobalConfigValidationTests(unittest.TestCase):
             'homelab/volume-rsync:release.test',
         )
 
-    def test_trusted_data_roots_are_required_absolute_and_non_overlapping(self):
+    def test_trusted_data_roots_is_ignored_with_one_deprecation_warning(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             config_path = root / 'config.yaml'
             config_path.touch()
-            cases = (None, [], ['relative'], [str(root / 'data'), str(root / 'data/app')])
-            for roots in cases:
-                value = self.config_data(root)
-                if roots is None:
-                    value.pop('trusted_data_roots')
-                else:
-                    value['trusted_data_roots'] = roots
-                with self.subTest(roots=roots), \
-                        mock.patch.object(config, 'CFG', config_path), \
-                        mock.patch.object(config, 'load_yaml', return_value=value), \
-                        self.assertRaisesRegex(SystemExit, '1'):
-                    config.cfg()
+            value = self.config_data(root)
+            value['trusted_data_roots'] = ['relative']
+            output = StringIO()
+            with mock.patch.object(config, 'CFG', config_path), \
+                    mock.patch.object(config, 'load_yaml', return_value=value), \
+                    mock.patch.object(
+                        config, '_TRUSTED_ROOTS_WARNING_SHOWN', False,
+                    ), redirect_stderr(output):
+                loaded = config.cfg()
+                config.cfg()
+
+        self.assertNotIn('trusted_data_roots', loaded)
+        self.assertEqual(output.getvalue().count('deprecated and ignored'), 1)
 
     def test_optional_sections_must_be_mappings_with_known_fields(self):
         with tempfile.TemporaryDirectory() as tmp:

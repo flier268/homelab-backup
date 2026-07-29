@@ -22,7 +22,6 @@ class GlobalConfig(TypedDict, total=False):
     volume_helper_image: str
     state_root: str
     lock_file: str
-    trusted_data_roots: list[str]
     rclone: RcloneConfig
     check: CheckConfig
 

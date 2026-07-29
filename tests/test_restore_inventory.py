@@ -190,6 +190,40 @@ class RestoreInventoryTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'required volume.*absent'):
                 restore_inventory.validate_restore_inventory(value, inventory)
 
+    def test_named_volume_inventory_cannot_redirect_the_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            value = manifest(root, sources={'paths': [], 'volumes': [{
+                'id': 'db', 'name': 'demo_db',
+            }]})
+            restored = root / 'restore'
+            write_restore_inventory(restored, volumes=[{
+                'id': 'db', 'name': 'demo_db',
+                'actual_name': 'attacker_selected', 'present': True,
+            }])
+            inventory = restore_inventory.load_restore_inventory(restored)
+
+            with self.assertRaisesRegex(RuntimeError, 'volume target differs'):
+                restore_inventory.validate_restore_inventory(value, inventory)
+
+    def test_named_local_authorization_can_pin_a_snapshot_compose_volume(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            value = manifest(root, sources={'paths': [], 'volumes': [{
+                'id': 'db', 'name': 'reviewed_db',
+            }]})
+            restored = root / 'restore'
+            write_restore_inventory(restored, volumes=[{
+                'id': 'db', 'compose_volume': 'db',
+                'actual_name': 'reviewed_db', 'present': True,
+            }])
+            inventory = restore_inventory.load_restore_inventory(restored)
+
+            self.assertIs(
+                restore_inventory.validate_restore_inventory(value, inventory),
+                inventory,
+            )
+
     def test_inventory_model_round_trips_current_snapshot_shape(self):
         data = {
             'version': 1,

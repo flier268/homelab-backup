@@ -4,7 +4,7 @@ Docker Compose 服務的 Restic + OneDrive 備份工具。
 
 - 每個 `/srv/stacks/**/backup.yaml` 自行宣告 Cron、retention、來源與一致性策略；
   可用安全的巢狀目錄分類服務，目錄位置不等於服務 ID。
-- 支援 trusted root 下由容器 UID/GID 擁有的任意深層路徑，以及本機 rootful
+- 支援由受保護 manifest 精確授權、可由容器 UID/GID 擁有的任意深層路徑，以及本機 rootful
   Docker named volume；中間 symlink 不會被跟隨，leaf symlink 只備份 link 本身。
 - `backup.yaml` 會自動保存到每份 snapshot 的 `_meta/backup.yaml`，不必列入 `sources.paths`。
 - 單一 systemd timer 每 5 分鐘掃描到期服務。
@@ -17,8 +17,8 @@ Docker Compose 服務的 Restic + OneDrive 備份工具。
   完整副本。
 - 一致性策略支援停服、hook、外部靜止、live best-effort 與 Btrfs subvolume
   snapshot；所有模式都可先執行具 timeout／required 政策的 argv action。
-- 支援本機部署交叉驗證後覆寫，以及所有 target 均不存在的全新重建；混合
-  狀態一律拒絕。
+- 現有部署會以受保護的本機 manifest 交叉驗證後覆寫；全新重建則先下載、
+  審核並安裝 manifest，再由同一份本機授權套用。混合狀態一律拒絕。
 
 ## 設定檔編輯器
 
@@ -138,9 +138,8 @@ name: "Advent of Ascension Plus-2026"
 
 `service` 是用於 CLI、Restic tag 與本機 state 的穩定唯一 ID，只能包含英數、
 `.`、`_`、`-`；可選的 `name` 是顯示文字，可在單字間使用單一空白。不同分類下
-的 `service` 仍不得重複。快照會記錄 manifest 相對目錄；本機設定不存在時，
-新快照可將 manifest 還原到原分類位置，舊快照則回退到
-`/srv/stacks/<service>`。
+的 `service` 仍不得重複。快照會記錄 manifest 相對目錄供人工重建時參考；
+repository 內的 manifest 本身不會取得 root 寫入授權。
 
 備份完成 staging 後會比較上次成功快照的內容指紋；內容未變時預設不建立新的
 Restic snapshot。若某個服務需要每次排程都留下時間點版本，可在
@@ -190,15 +189,21 @@ timestamped 密文。
 
 ## 支援與安全邊界
 
-- 僅支援 Linux，以及 `ext4`、`xfs`、`btrfs`。Compose／volume 模式需要
+- 僅支援 Linux；path source 可位於 Linux 可存取、包含 NTFS 在內的 filesystem。Compose／volume 模式需要
   本機 rootful Docker；`files` 純檔案模式不需要 Docker。
-- 備份 path 必須位於唯一 trusted root 之下；控制路徑由 root 管理且不可經過
-  symlink、跨 mount 或 nested Btrfs subvolume。資料樹可由容器 UID/GID 擁有。
+- 受 root 保護的本機 `backup.yaml` 授權其中宣告的確切 path；控制路徑不可經過
+  symlink，資料來源以固定 descriptor 開啟且拒絕 nested mount。資料樹可由容器
+  UID/GID 擁有。
+- NTFS 能保存的 UID/GID、mode、ACL、xattr、symlink 與 hardlink 語意取決於驅動
+  與掛載選項，不保證能完整重建 POSIX metadata。
 - 支援普通檔案、目錄、symlink、ACL、xattr 與 payload 內 hardlink；拒絕 FIFO、
   socket 與 device node。還原會保留原始數字 UID/GID 與 mode。
 - `stop`、`hooks`、`external` 會拒絕已知 Docker writer；`live`、`files`
   與未完整受 Btrfs snapshot 保護的來源只提供 `best-effort` 一致性。
-- 不支援 remote/rootless Docker、跨 mount、ZFS、ext2/3、FUSE、NFS 或 autofs。
+- 不支援 remote/rootless Docker 與來源內 nested mount。NFS、autofs、FUSE、ZFS
+  等非 Btrfs filesystem 可作一般 file-level、best-effort path source；斷線或
+  automount 尚未就緒時不保證可用，metadata 與 POSIX 語意取決於 filesystem
+  及 mount options，且不提供 snapshot consistency。
 - 所有 Compose YAML、`compose.env_file`、Restic 密碼與 rclone 設定必須是
   root-owned、不可 group/world write 的普通檔案，且不可為 symlink。Compose
   不載入隱含 `.env` 或外部 `COMPOSE_*` 設定；需要插值時必須在 manifest 明確設定：
@@ -289,13 +294,13 @@ sudo backupctl backup minecraft --allow-low-space
 
 ## 還原全部服務
 
-互動選取，預設全選：
+現有部署已有受保護的本機 manifest 時，可互動選取並直接套用：
 
 ```bash
 sudo backupctl restore --apply --start
 ```
 
-非互動式全部還原：
+非互動式套用所有既有服務：
 
 ```bash
 sudo backupctl restore --all \
@@ -305,9 +310,41 @@ sudo backupctl restore --all \
 安全政策：只要 stdin 不是 TTY，所有 `restore`（包含只下載、不加
 `--apply`）都必須明確指定 `--yes`。
 
-還原前會檢查 snapshot 身分與可用空間；`--yes` 不會略過空間保護。現有部署
-必須通過 manifest 交叉驗證，全新重建則要求所有 target 都不存在；混合狀態
-一律拒絕。歷史 snapshot、刪除與 restore workspace 清理方式請見
+還原前會列出完整 plan，包含每個 path target、Docker volume 與
+existing/rebuild mode。`--yes` 只確認執行，不授權新路徑，也不會略過空間保護。
+現有部署必須通過本機 manifest 交叉驗證；snapshot manifest 不能改寫目標。
+
+全新服務必須使用兩階段流程。先只下載，審核 `_meta/backup.yaml`，再將它以
+root-only 權限安裝到 `services_root` 下的預定服務目錄：
+
+```bash
+sudo backupctl restore minecraft
+
+sudo install -d -o root -g root -m 0755 /srv/stacks/minecraft
+sudo install -o root -g root -m 0600 \
+  /var/lib/homelab-backup/restores/minecraft/RESTORE_ID/_meta/backup.yaml \
+  /srv/stacks/minecraft/backup.yaml
+
+sudo backupctl validate
+sudo backupctl apply minecraft \
+  /var/lib/homelab-backup/restores/minecraft/RESTORE_ID \
+  --start --yes
+```
+
+若 `_meta/inventory.json` 中有 `present: true` 的 Compose volume，請核對其
+`actual_name` 與還原的 Compose 設定。套用時會先發布已驗證的 Compose files，
+再以 `docker compose config --format json` 解析實際名稱、`driver`、
+`driver_opts` 與 labels。工具只執行 `docker volume create` 建立需要還原的
+named volume，補上 Compose identity 與本次操作 ownership labels，驗證結果
+與 snapshot inventory 一致後才還原資料；這個階段不建立 image、container
+或 network。
+
+`external: true` 的 volume 不由 Compose 建立，而且無法納入 rebuild 的安全
+rollback，因此不支援由這個流程直接覆寫；請將它視為獨立管理的 exact `name`
+來源，審核其還原與失敗復原方式後另行處理。
+
+請以實際輸出的 restore ID 與審核後選定的服務目錄取代範例值。只有部分 target
+存在的混合狀態一律拒絕。歷史 snapshot、刪除與 restore workspace 清理方式請見
 `GUIDE.html`。
 
 完整說明請開啟 `GUIDE.html`。

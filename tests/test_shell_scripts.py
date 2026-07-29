@@ -42,7 +42,6 @@ class RestoreConfigsTests(unittest.TestCase):
                 version: {version}
                 host_id: server-a
                 services_root: /srv/stacks
-                trusted_data_roots: [/srv/stacks, /srv/data]
                 repository: rclone:onedrive:Backups/restic/server-a
                 password_file: /etc/homelab-backup/restic-password
                 rclone_config: /etc/homelab-backup/rclone/rclone.conf
@@ -110,10 +109,9 @@ class RestoreConfigsTests(unittest.TestCase):
             self.assertFalse(destination.exists())
 
     def test_restore_rejects_non_tmpfs_plaintext_workspace(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            result = run_sourced(
-                'restore-configs.sh', f'require_runtime_tmpfs {tmp!r}',
-            )
+        result = run_sourced(
+            'restore-configs.sh', 'require_runtime_tmpfs /',
+        )
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('tmpfs', result.stderr)
@@ -438,10 +436,9 @@ class DeploymentScriptTests(unittest.TestCase):
         )
         self.assertEqual(accepted.returncode, 0, accepted.stderr)
 
-        with tempfile.TemporaryDirectory() as tmp:
-            rejected = run_sourced(
-                'backup-configs.sh', f'require_runtime_tmpfs {tmp!r}',
-            )
+        rejected = run_sourced(
+            'backup-configs.sh', 'require_runtime_tmpfs /',
+        )
         self.assertNotEqual(rejected.returncode, 0)
         self.assertIn('tmpfs', rejected.stderr)
 

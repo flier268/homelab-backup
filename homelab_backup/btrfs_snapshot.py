@@ -9,7 +9,7 @@ from .common import run
 from .security import (
     atomic_write_json, clear_control_leaf, containing_mount,
     ensure_control_directory, lexical_absolute, open_data_path,
-    path_contains, read_control_text, select_trusted_root,
+    path_contains, read_control_text,
     validate_control_directory,
 )
 
@@ -32,7 +32,7 @@ def _state_path(c, service):
 def _validate_state_entry(entry):
     fields = {
         'phase', 'source_id', 'source_path', 'source_subvolume_id',
-        'source_uuid', 'filesystem_uuid', 'trusted_root', 'workspace_path',
+        'source_uuid', 'filesystem_uuid', 'workspace_anchor', 'workspace_path',
         'snapshot_path', 'snapshot_subvolume_id', 'snapshot_uuid',
     }
     if not isinstance(entry, dict) or set(entry) != fields \
@@ -40,7 +40,7 @@ def _validate_state_entry(entry):
         return False
     required_strings = (
         'source_id', 'source_path', 'source_uuid', 'filesystem_uuid',
-        'trusted_root', 'workspace_path', 'snapshot_path',
+        'workspace_anchor', 'workspace_path', 'snapshot_path',
     )
     if any(not isinstance(entry.get(field), str) or not entry[field]
            for field in required_strings):
@@ -68,6 +68,11 @@ def _load_state(c, service):
         return None
     except (OSError, ValueError, json.JSONDecodeError) as err:
         raise RuntimeError(f'cannot load Btrfs snapshot state {path}: {err}') from err
+    if isinstance(data, dict) and isinstance(data.get('snapshots'), list):
+        for entry in data['snapshots']:
+            if isinstance(entry, dict) and 'workspace_anchor' not in entry \
+                    and 'trusted_root' in entry:
+                entry['workspace_anchor'] = entry.pop('trusted_root')
     valid = isinstance(data, dict) \
         and set(data) == {'version', 'service', 'operation_id', 'snapshots'} \
         and data.get('version') == STATE_VERSION \
@@ -206,8 +211,30 @@ def _raise_not_subvolume(path):
     raise RuntimeError(f'path is not a Btrfs subvolume: {path}')
 
 
-def snapshot_parent(trusted_root):
-    return lexical_absolute(Path(trusted_root) / SNAPSHOT_DIRECTORY)
+def snapshot_parent(workspace_anchor):
+    return lexical_absolute(Path(workspace_anchor) / SNAPSHOT_DIRECTORY)
+
+
+def snapshot_workspace_anchor(source):
+    """Find a protected visible parent on the source Btrfs filesystem."""
+    source = lexical_absolute(source)
+    source_filesystem_uuid = filesystem_uuid(source)
+    candidate = source.parent
+    while candidate != Path('/'):
+        try:
+            mount = containing_mount(candidate)
+            if mount.filesystem_type == 'btrfs' \
+                    and filesystem_uuid(candidate) == source_filesystem_uuid:
+                validate_control_directory(candidate)
+                return candidate
+        except (OSError, ValueError, RuntimeError):
+            pass
+        candidate = candidate.parent
+    raise RuntimeError(
+        f'cannot place a protected Btrfs snapshot workspace outside {source}; '
+        'mount the Btrfs top-level or a common parent subvolume at a '
+        'root-protected path'
+    )
 
 
 def _validate_workspace(path):
@@ -236,14 +263,14 @@ def _identity_error(entry, reason):
 
 
 def _entry_paths(entry):
-    trusted_root = lexical_absolute(entry['trusted_root'])
+    workspace_anchor = lexical_absolute(entry['workspace_anchor'])
     workspace = lexical_absolute(entry['workspace_path'])
     snapshot = lexical_absolute(entry['snapshot_path'])
-    expected_workspace = snapshot_parent(trusted_root)
+    expected_workspace = snapshot_parent(workspace_anchor)
     if workspace != expected_workspace or snapshot.parent != workspace \
             or not path_contains(workspace, snapshot):
         raise _identity_error(entry, 'unexpected snapshot path')
-    return trusted_root, workspace, snapshot
+    return workspace_anchor, workspace, snapshot
 
 
 def _snapshot_exists(path):
@@ -255,7 +282,7 @@ def _snapshot_exists(path):
 
 
 def _validate_cleanup_identity(entry, *, creating=False):
-    trusted_root, workspace, snapshot = _entry_paths(entry)
+    workspace_anchor, workspace, snapshot = _entry_paths(entry)
     try:
         validate_control_directory(workspace)
         workspace_metadata = os.lstat(workspace)
@@ -273,7 +300,7 @@ def _validate_cleanup_identity(entry, *, creating=False):
             or not stat.S_ISDIR(snapshot_metadata.st_mode) \
             or stat.S_ISLNK(snapshot_metadata.st_mode):
         raise _identity_error(entry, 'workspace or snapshot path is invalid')
-    if filesystem_uuid(trusted_root) != entry['filesystem_uuid'] \
+    if filesystem_uuid(workspace_anchor) != entry['filesystem_uuid'] \
             or filesystem_uuid(workspace) != entry['filesystem_uuid'] \
             or filesystem_uuid(snapshot) != entry['filesystem_uuid']:
         raise _identity_error(entry, 'filesystem UUID')
@@ -312,7 +339,7 @@ def cleanup_snapshot_state(c, service):
         return
     while state['snapshots']:
         entry = state['snapshots'][0]
-        _trusted_root, workspace, snapshot = _entry_paths(entry)
+        _workspace_anchor, workspace, snapshot = _entry_paths(entry)
         exists = _snapshot_exists(snapshot)
         if entry['phase'] == 'creating':
             if not exists:
@@ -360,18 +387,13 @@ class SnapshotTransaction:
         for source in (self.m.get('sources') or {}).get('paths', []):
             source_value = lexical_absolute(source_path(self.m, source))
             try:
-                source_fd, source_metadata = open_data_path(
-                    source_value, self.c['trusted_data_roots'],
-                )
+                source_fd, source_metadata = open_data_path(source_value)
             except FileNotFoundError:
                 if source.get('required', True):
                     raise
                 continue
             try:
-                trusted_root = select_trusted_root(
-                    source_value, self.c['trusted_data_roots'],
-                )
-                mount = containing_mount(trusted_root)
+                mount = containing_mount(source_value)
                 source_proc_path = f'/proc/self/fd/{source_fd}'
                 source_details = subvolume_details(
                     source_proc_path, allow_plain=True,
@@ -380,11 +402,12 @@ class SnapshotTransaction:
                 )
                 if source_details is None:
                     continue
-                workspace = _validate_workspace(snapshot_parent(trusted_root))
+                workspace_anchor = snapshot_workspace_anchor(source_value)
+                workspace = _validate_workspace(snapshot_parent(workspace_anchor))
                 # Btrfs may expose each subvolume with a distinct st_dev even
                 # though they belong to the same filesystem.  The filesystem
                 # UUID is the authoritative cross-subvolume identity here.
-                source_filesystem_uuid = filesystem_uuid(trusted_root)
+                source_filesystem_uuid = filesystem_uuid(workspace_anchor)
                 if filesystem_uuid(workspace) != source_filesystem_uuid:
                     raise RuntimeError(
                         'Btrfs snapshot workspace is not on the source filesystem: '
@@ -408,7 +431,7 @@ class SnapshotTransaction:
                     'source_subvolume_id': source_details['subvolume_id'],
                     'source_uuid': source_details['uuid'],
                     'filesystem_uuid': source_filesystem_uuid,
-                    'trusted_root': str(trusted_root),
+                    'workspace_anchor': str(workspace_anchor),
                     'workspace_path': str(workspace),
                     'snapshot_path': str(snapshot),
                     'snapshot_subvolume_id': None,

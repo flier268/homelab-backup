@@ -8,7 +8,6 @@ export interface GlobalConfig {
   version: 1
   host_id: string
   services_root: string
-  trusted_data_roots: string[]
   repository: string
   password_file: string
   rclone_config: string

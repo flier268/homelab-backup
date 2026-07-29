@@ -211,7 +211,7 @@ function validateNestedShape(kind: DocumentKind, value: Record<string, unknown>)
 
 function normalizeDocument(kind: DocumentKind, value: Record<string, unknown>): void {
   if (kind === 'global') {
-    value.trusted_data_roots ??= []
+    delete value.trusted_data_roots
     return
   }
 

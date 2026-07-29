@@ -12,7 +12,7 @@ from .manifest import (
 )
 from .security import (
     atomic_copy_file, atomic_write_json, ensure_private_directory,
-    paths_overlap, validate_trusted_roots,
+    paths_overlap,
 )
 from .storage import (
     compose_identity, resolved_volume_sources, validate_docker_bind_probe,
@@ -23,7 +23,6 @@ from .types import GlobalConfig, ServiceManifest
 
 def _prepare_stage(c, m):
     validate_manifest(m)
-    validate_trusted_roots(c['trusted_data_roots'])
     # Recovery precedes every action even if the consistency mode changed.
     cleanup_snapshot_state(c, m['service'])
     staging_root = Path(c['staging_root'])

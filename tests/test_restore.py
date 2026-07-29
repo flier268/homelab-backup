@@ -305,7 +305,7 @@ class RestoredManifestTests(unittest.TestCase):
                     restore_apply, 'docker_mount_conflicts', return_value=(),
             ), mock.patch.object(restore_apply, 'sync_volumes'):
                 restore_apply.apply_one(
-                    {'trusted_data_roots': [str(services)]},
+                    {},
                     value, restored,
                 )
 
@@ -626,12 +626,11 @@ class RestoreCommandTests(unittest.TestCase):
             restore_manifest=False, keep_manifest=False, snapshot='latest',
         )
         with mock.patch.object(backupctl, 'validate_docker_environment'), \
-                mock.patch.object(backupctl, 'validate_trusted_roots'), \
                 mock.patch.object(backupctl, 'repository_services', return_value=['demo']), \
                 mock.patch.object(backupctl.sys.stdin, 'isatty', return_value=False), \
                 mock.patch.object(backupctl, 'restore_one') as restore_mock:
             with self.assertRaisesRegex(SystemExit, '1'):
-                backupctl.cmd_restore({'trusted_data_roots': []}, args)
+                backupctl.cmd_restore({}, args)
 
         restore_mock.assert_not_called()
 
@@ -707,7 +706,7 @@ class RestoreCommandTests(unittest.TestCase):
             ['one', 'two'],
         )
 
-    def test_missing_local_manifest_does_not_skip_later_apply(self):
+    def test_missing_local_manifest_rejects_combined_apply_before_download(self):
         args = mock.Mock(
             services=[], all=True, yes=True, apply=True, start=False,
             restore_manifest=False, keep_manifest=True, snapshot='latest',
@@ -735,35 +734,20 @@ class RestoreCommandTests(unittest.TestCase):
                 'host_id': 'host',
                 'lock_file': str(root / 'lock'),
                 'services_root': str(services_root),
-                'trusted_data_roots': [],
             }
-
-            def restore_service(_config, service, _snapshot, _policy):
-                return {'service': service}, restore_roots[service]
-
-            def authorize_local_manifest(config, value, _root, **_kwargs):
-                backupctl.manifest(config, value['service'])
 
             with mock.patch.object(
                 backupctl, 'repository_services', return_value=['one', 'two'],
             ), mock.patch.object(
-                backupctl, 'restore_one', side_effect=restore_service,
-            ), mock.patch.object(
-                backupctl, 'validate_docker_environment',
-            ), mock.patch.object(
-                backupctl, 'validate_docker_bind_probe',
-            ), mock.patch.object(
-                backupctl, 'validate_trusted_roots',
-            ), mock.patch.object(
-                restore_apply, 'apply_one', side_effect=authorize_local_manifest,
+                backupctl, 'restore_one',
+            ) as restore_mock, mock.patch.object(
+                restore_apply, 'apply_one',
             ) as apply_mock:
-                with self.assertRaises(SystemExit):
+                with self.assertRaisesRegex(SystemExit, '1'):
                     backupctl.cmd_restore(config_data, args)
 
-        self.assertEqual(
-            [call.args[1]['service'] for call in apply_mock.call_args_list],
-            ['one', 'two'],
-        )
+        restore_mock.assert_not_called()
+        apply_mock.assert_not_called()
 
     def test_successful_apply_removes_downloaded_restore(self):
         args = mock.Mock(
@@ -778,7 +762,6 @@ class RestoreCommandTests(unittest.TestCase):
             config_data = {
                 'host_id': 'host',
                 'lock_file': str(root / 'lock'),
-                'trusted_data_roots': [],
             }
             with mock.patch.object(
                 backupctl, 'repository_services', return_value=['demo'],
@@ -788,8 +771,6 @@ class RestoreCommandTests(unittest.TestCase):
                 backupctl, 'validate_docker_environment',
             ), mock.patch.object(
                 backupctl, 'validate_docker_bind_probe',
-            ), mock.patch.object(
-                backupctl, 'validate_trusted_roots',
             ), mock.patch.object(restore_apply, 'apply_one'):
                 backupctl.cmd_restore(config_data, args)
 
@@ -896,7 +877,6 @@ class ApplyCommandTests(unittest.TestCase):
             config_data = {
                 'restore_root': str(restore_root),
                 'lock_file': str(root / 'lock'),
-                'trusted_data_roots': [],
             }
 
             with mock.patch.object(backupctl, 'validate_docker_environment'), \
@@ -944,7 +924,6 @@ class ApplyCommandTests(unittest.TestCase):
             config_data = {
                 'restore_root': str(restore_root),
                 'lock_file': str(root / 'lock'),
-                'trusted_data_roots': [],
             }
             lock_state = {'held': False}
 
@@ -966,9 +945,6 @@ class ApplyCommandTests(unittest.TestCase):
                     mock.patch.object(backupctl, 'validate_docker_environment'), \
                     mock.patch.object(backupctl, 'validate_docker_bind_probe'), \
                     mock.patch.object(
-                        backupctl, 'validate_trusted_roots',
-                        side_effect=require_lock,
-                    ) as trust_mock, mock.patch.object(
                         backupctl, 'validate_control_root',
                         side_effect=require_lock,
                     ) as control_mock, mock.patch.object(
@@ -976,7 +952,6 @@ class ApplyCommandTests(unittest.TestCase):
                     ), mock.patch.object(restore_apply, 'apply_one') as apply_mock:
                 backupctl.cmd_apply(config_data, args)
 
-            trust_mock.assert_called_once_with([])
             self.assertGreaterEqual(control_mock.call_count, 3)
             apply_mock.assert_called_once_with(
                 config_data, mock.ANY, workspace, start_services=False,

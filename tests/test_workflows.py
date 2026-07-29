@@ -445,7 +445,7 @@ class WorkflowDependencyTests(unittest.TestCase):
 
         self.assertIs(caught.exception, failure)
         self.assertEqual(
-            events, ['stop', 'preflight', 'restore-data', 'rollback'],
+            events, ['stop', 'preflight', 'publish', 'restore-data', 'rollback'],
         )
 
     def test_rollback_ledger_runs_in_reverse_and_continues_after_failure(self):
@@ -515,15 +515,15 @@ class WorkflowDependencyTests(unittest.TestCase):
             removals = []
             current_state = ['published']
             dependencies = self.rollback_dependencies(
-                open_parent=lambda path, _roots:
+                open_parent=lambda path:
                 (os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY), path.name),
-                open_path=lambda path, _roots:
+                open_path=lambda path:
                 (os.open(path, os.O_RDONLY), path.stat()),
                 object_state=lambda _descriptor: current_state[0],
                 remove_entry=lambda _parent, name: removals.append(name),
             )
             claim = restore_apply.DataPathClaim(
-                target, (tmp,), identity=identity, state='published',
+                target, identity=identity, state='published',
             )
 
             claim.rollback(dependencies)
@@ -550,19 +550,19 @@ class WorkflowDependencyTests(unittest.TestCase):
             metadata = target.stat()
             identity = (metadata.st_dev, metadata.st_ino)
             dependencies = self.rollback_dependencies(
-                open_parent=lambda path, _roots:
+                open_parent=lambda path:
                 (os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY), path.name),
             )
 
             changed = restore_apply.DataAncestorClaim(
-                target, (identity[0], identity[1] + 1), (tmp,),
+                target, (identity[0], identity[1] + 1),
             )
             changed.rollback(dependencies)
             self.assertTrue(target.exists())
 
             child = target / 'concurrent'
             child.touch()
-            claim = restore_apply.DataAncestorClaim(target, identity, (tmp,))
+            claim = restore_apply.DataAncestorClaim(target, identity)
             claim.rollback(dependencies)
             self.assertTrue(target.exists())
 

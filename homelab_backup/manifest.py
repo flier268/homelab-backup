@@ -168,27 +168,74 @@ def manifest(c, name) -> ServiceManifest:
     return m
 
 
+def _service_control_path(m, value):
+    path = Path(value)
+    if not path.is_absolute():
+        path = Path(m['_dir']) / path
+    return lexical_absolute(path)
+
+
+def manifest_target(m):
+    return lexical_absolute(
+        m.get('_path', Path(m['_dir']) / 'backup.yaml')
+    )
+
+
+def compose_file_paths(m):
+    return tuple(
+        _service_control_path(m, value)
+        for value in (m.get('compose') or {}).get('files', ['compose.yaml'])
+    )
+
+
+def compose_env_path(m):
+    value = (m.get('compose') or {}).get('env_file')
+    return _service_control_path(m, value) if value else None
+
+
+def compose_control_paths(m):
+    paths = list(compose_file_paths(m))
+    env_path = compose_env_path(m)
+    if env_path is not None:
+        paths.append(env_path)
+    return tuple(paths)
+
+
+def path_source_control_overlap(m, source):
+    """Return a forbidden protected-control overlap, if any.
+
+    Exact Compose control-file sources are intentionally allowed: restore
+    defers those sources and publishes them atomically instead of passing
+    them through the ordinary data rsync path.
+    """
+    target = lexical_absolute(source_path(m, source))
+    target_manifest = manifest_target(m)
+    if paths_overlap(target, target_manifest):
+        return 'manifest', target_manifest
+    compose_controls = (
+        ()
+        if (m.get('consistency') or {}).get('mode') == 'files'
+        else compose_control_paths(m)
+    )
+    for control in compose_controls:
+        if target != control and paths_overlap(target, control):
+            return 'Compose control', control
+    return None
+
+
 def compose_cmd(m):
     service_dir = lexical_absolute(m['_dir'])
-    compose = m.get('compose') or {}
     cmd = [
         'docker', 'compose', '--project-directory', str(service_dir),
     ]
-    env_file = compose.get('env_file')
-    if env_file:
-        env_path = Path(env_file)
-        env_path = env_path if env_path.is_absolute() else service_dir / env_path
-        env_path = validate_control_file(lexical_absolute(env_path))
-    else:
-        env_path = Path('/dev/null')
+    env_path = compose_env_path(m)
+    env_path = (
+        validate_control_file(env_path)
+        if env_path is not None else Path('/dev/null')
+    )
     cmd += ['--env-file', str(env_path)]
-    for value in compose.get('files', ['compose.yaml']):
-        compose_path = Path(value)
-        compose_path = (
-            compose_path if compose_path.is_absolute()
-            else service_dir / compose_path
-        )
-        compose_path = validate_control_file(lexical_absolute(compose_path))
+    for compose_path in compose_file_paths(m):
+        compose_path = validate_control_file(compose_path)
         cmd += ['-f', str(compose_path)]
     return cmd
 
@@ -425,6 +472,13 @@ def _validate_path_source(m, path, index, source, path_targets):
     target = lexical_absolute(source_path(m, source))
     if any(paths_overlap(target, existing) for existing in path_targets):
         raise ValueError(f'{path}: duplicate or overlapping path target: {target}')
+    overlap = path_source_control_overlap(m, source)
+    if overlap is not None:
+        name, control = overlap
+        raise ValueError(
+            f'{path}: path source {target} must not overlap '
+            f'protected {name}: {control}'
+        )
     path_targets.add(target)
 
 

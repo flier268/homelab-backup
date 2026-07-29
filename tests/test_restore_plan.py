@@ -59,6 +59,13 @@ class RestorePlanningTests(unittest.TestCase):
             inventory = json.loads(inventory_path.read_text(encoding='utf-8'))
             inventory['compose']['services'] = ['old-service']
             inventory_path.write_text(json.dumps(inventory), encoding='utf-8')
+            (restored / '_meta' / 'backup.yaml').write_text(
+                yaml.safe_dump({
+                    key: item for key, item in value.items()
+                    if not key.startswith('_')
+                }),
+                encoding='utf-8',
+            )
             model = {'name': 'demo', 'services': {'new-service': {}}, 'volumes': {}}
             with mock.patch.object(restore_plan, 'manifest', return_value=value), \
                     mock.patch.object(restore_plan, 'compose_model', return_value=model), \
@@ -75,6 +82,13 @@ class RestorePlanningTests(unittest.TestCase):
             value = manifest(base)
             restored = base / 'restored'
             write_restore_inventory(restored)
+            (restored / '_meta' / 'backup.yaml').write_text(
+                yaml.safe_dump({
+                    key: item for key, item in value.items()
+                    if not key.startswith('_')
+                }),
+                encoding='utf-8',
+            )
             model = {'name': 'demo', 'services': {}, 'volumes': {}}
             with mock.patch.object(restore_plan, 'manifest', return_value=value), \
                     mock.patch.object(restore_plan, 'compose_model', return_value=model), \
@@ -111,6 +125,29 @@ class RestorePlanningTests(unittest.TestCase):
         }])
         return value, restored
 
+    def test_compose_env_source_is_deferred_with_compose_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            value, _restored = self._rebuild_fixture(Path(tmp))
+            value['compose']['env_file'] = 'compose.env'
+            value['sources']['paths'].append({
+                'id': 'env', 'path': 'compose.env', 'required': True,
+            })
+
+            self.assertEqual(
+                restore_plan.deferred_compose_sources(value),
+                ('compose', 'env'),
+            )
+
+    def test_rebuild_requires_configured_env_file_snapshot_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            value, _restored = self._rebuild_fixture(Path(tmp))
+            value['compose']['env_file'] = 'compose.env'
+
+            with self.assertRaisesRegex(RuntimeError, 'env file'):
+                restore_plan._validate_rebuild_compose_sources(
+                    value, 'rebuild', restore_plan.compose_targets(value),
+                )
+
     def test_rebuild_requires_every_target_to_be_absent(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -118,7 +155,7 @@ class RestorePlanningTests(unittest.TestCase):
             with mock.patch.object(restore_plan, 'docker_project_containers', return_value=()), \
                     mock.patch.object(restore_plan, 'docker_mount_conflicts', return_value=()):
                 plan = restore_plan.prepare_restore_plan(
-                    {'trusted_data_roots': [str(base / 'services')]}, value, restored,
+                    {}, value, restored,
                 )
                 self.assertEqual(plan.mode, 'rebuild')
 
@@ -127,7 +164,7 @@ class RestorePlanningTests(unittest.TestCase):
                 target.write_text('occupied\n', encoding='utf-8')
                 with self.assertRaisesRegex(RuntimeError, 'mixed|already exists'):
                     restore_plan.prepare_restore_plan(
-                        {'trusted_data_roots': [str(base / 'services')]}, value, restored,
+                        {}, value, restored,
                     )
 
     def test_rebuild_rejects_existing_snapshot_absent_path(self):
@@ -148,7 +185,7 @@ class RestorePlanningTests(unittest.TestCase):
             ])
             with self.assertRaisesRegex(RuntimeError, 'absent.*already exists'):
                 restore_plan.prepare_restore_plan(
-                    {'trusted_data_roots': [str(base / 'services')]}, value, restored,
+                    {}, value, restored,
                 )
 
     def test_rebuild_rejects_existing_snapshot_absent_volume(self):
@@ -168,8 +205,66 @@ class RestorePlanningTests(unittest.TestCase):
                 restore_plan, 'docker_volume_exists', return_value=True,
             ), self.assertRaisesRegex(RuntimeError, 'volume already exists'):
                 restore_plan.prepare_restore_plan(
-                    {'trusted_data_roots': [str(base / 'services')]}, value, restored,
+                    {}, value, restored,
                 )
+
+    def test_rebuild_authorizes_compose_volume_by_protected_logical_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            value, restored = self._rebuild_fixture(base)
+            value['sources']['volumes'] = [{
+                'id': 'db', 'compose_volume': 'db',
+            }]
+            write_restore_inventory(restored, paths=[{
+                'id': 'compose', 'path': 'compose.yaml', 'type': 'file',
+                'present': True,
+            }], volumes=[{
+                'id': 'db', 'compose_volume': 'db',
+                'actual_name': 'attacker_selected', 'present': True,
+            }])
+            inventory = restore_plan.load_restore_inventory(restored)
+            restored_volumes = restore_plan.inventory_volumes(value, inventory)
+
+            with mock.patch.object(
+                restore_plan, 'docker_project_containers', return_value=(),
+            ):
+                authorized, identity, running = restore_plan._authorize_rebuild_restore(
+                    value, inventory, restored_volumes,
+                )
+
+            self.assertIs(authorized, value)
+            self.assertIs(identity, inventory.compose)
+            self.assertEqual(running, ())
+
+    def test_rebuild_accepts_compose_volume_without_rewriting_it_to_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            value, restored = self._rebuild_fixture(base)
+            value['sources']['volumes'] = [{
+                'id': 'db', 'compose_volume': 'db',
+            }]
+            write_restore_inventory(restored, paths=[{
+                'id': 'compose', 'path': 'compose.yaml', 'type': 'file',
+                'present': True,
+            }], volumes=[{
+                'id': 'db', 'compose_volume': 'db',
+                'actual_name': 'reviewed_db', 'present': True,
+            }])
+            (restored / 'volumes' / 'db').mkdir(parents=True)
+
+            with mock.patch.object(
+                restore_plan, 'docker_volume_exists', return_value=False,
+            ), mock.patch.object(
+                restore_plan, 'docker_project_containers', return_value=(),
+            ), mock.patch.object(
+                restore_plan, 'docker_mount_conflicts', return_value=(),
+            ):
+                plan = restore_plan.prepare_restore_plan({}, value, restored)
+
+            self.assertEqual(plan.mode, 'rebuild')
+            self.assertEqual(plan.volumes, (
+                (value['sources']['volumes'][0], 'reviewed_db'),
+            ))
 
     def test_rebuild_publishes_compose_and_manifest_after_data_phase(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -195,7 +290,7 @@ class RestorePlanningTests(unittest.TestCase):
                     mock.patch.object(restore_apply, 'sync_volumes'), \
                     mock.patch.object(restore_apply, 'atomic_copy_file', side_effect=record_copy):
                 restore_apply.apply_one(
-                    {'trusted_data_roots': [str(trusted)]}, value, restored,
+                    {}, value, restored,
                 )
 
             self.assertEqual(publications, ['compose.yaml', 'backup.yaml'])
@@ -211,7 +306,7 @@ class RestorePlanningTests(unittest.TestCase):
             target.write_text('version: 1\nservice: demo\n', encoding='utf-8')
             with self.assertRaisesRegex(RuntimeError, 'mixed'):
                 restore_plan.prepare_restore_plan(
-                    {'trusted_data_roots': [str(base / 'services')]}, value, restored,
+                    {}, value, restored,
                 )
 
 if __name__ == '__main__':

@@ -25,7 +25,6 @@ from .manifest import (
 from .identity import account, action_user
 from .security import (
     clear_control_leaf, validate_control_file, validate_control_root,
-    validate_trusted_roots,
 )
 from .storage import (
     validate_docker_bind_probe, validate_docker_environment,
@@ -389,12 +388,6 @@ def cmd_validate(c, args):
         include_disabled=True,
         on_error=record_manifest_error,
     )
-    try:
-        validate_trusted_roots(c['trusted_data_roots'])
-    except (OSError, ValueError, RuntimeError) as err:
-        errors.append(format_remediable_error(
-            'trusted_data_roots are unsupported', err,
-        ))
     for key in ('staging_root', 'restore_root'):
         try:
             validate_control_root(c[key])

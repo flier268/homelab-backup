@@ -6,9 +6,6 @@
     <pre v-pre><code>version: 1
 host_id: server-a
 services_root: /srv/stacks
-trusted_data_roots:
-  - /srv/stacks
-  - /srv/data
 
 repository: rclone:onedrive:Backups/restic/server-a
 password_file: /etc/homelab-backup/restic-password
