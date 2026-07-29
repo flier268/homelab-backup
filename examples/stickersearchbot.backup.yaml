@@ -1,0 +1,124 @@
+version: 1
+service: stickersearchbot
+name: Sticker Search Bot
+enabled: true
+
+schedule:
+  # 每天 03:30 線上備份；容器全程保持運作。
+  cron: "30 3 * * *"
+  retry_after: 30m
+  max_lateness: 3h
+
+retention:
+  keep_last: 8
+  keep_daily: 14
+  keep_weekly: 8
+  keep_monthly: 12
+  keep_yearly: 3
+
+compose:
+  # 若實際檔名不同，請一併修改下方 compose_file。
+  files: [compose.yaml]
+  env_file: .env
+
+consistency:
+  # 先產生 PostgreSQL 一致性邏輯備份和 Redis RDB，再擷取靜態檔案。
+  mode: hooks
+  timeout: 120
+
+actions:
+  backup:
+    before:
+      - name: dump-postgres-and-redis-live
+        script: |-
+          dump_dir="./backup-dumps"
+          postgres_tmp="$dump_dir/postgres.dump.tmp"
+          postgres_final="$dump_dir/postgres.dump"
+          globals_tmp="$dump_dir/postgres-globals.sql.tmp"
+          globals_final="$dump_dir/postgres-globals.sql"
+          redis_tmp="$dump_dir/redis.rdb.tmp"
+          redis_final="$dump_dir/redis.rdb"
+          redis_container_tmp="/tmp/stickersearchbot-backup.rdb"
+          compose_file="compose.yaml"
+
+          compose=(
+            /usr/bin/docker compose
+            --env-file .env
+            -f "$compose_file"
+          )
+
+          cleanup() {
+            rm -f -- \
+              "$postgres_tmp" "$globals_tmp" "$redis_tmp"
+            "${compose[@]}" exec -T redis \
+              rm -f -- "$redis_container_tmp" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          install -d -m 0700 -- "$dump_dir"
+          cleanup
+
+          # pg_dump 使用 MVCC snapshot，備份期間不需鎖表或停止 PostgreSQL。
+          # shellcheck disable=SC2016
+          "${compose[@]}" exec -T postgres sh -c '
+            exec pg_dump \
+              --format=custom \
+              --compress=6 \
+              --no-owner \
+              --username="$POSTGRES_USER" \
+              --dbname="$POSTGRES_DB"
+          ' > "$postgres_tmp"
+
+          # 另外保存角色與權限，供災難復原使用。
+          # shellcheck disable=SC2016
+          "${compose[@]}" exec -T postgres sh -c '
+            exec pg_dumpall \
+              --globals-only \
+              --username="$POSTGRES_USER"
+          ' > "$globals_tmp"
+
+          # redis-cli --rdb 透過 replication protocol 產生線上 RDB snapshot。
+          # shellcheck disable=SC2016
+          "${compose[@]}" exec -T redis sh -c '
+            rm -f -- "$1"
+            exec redis-cli --rdb "$1"
+          ' sh "$redis_container_tmp"
+          "${compose[@]}" cp \
+            "redis:$redis_container_tmp" "$redis_tmp"
+
+          test -s "$postgres_tmp"
+          test -s "$globals_tmp"
+          test -s "$redis_tmp"
+          chmod 0600 -- \
+            "$postgres_tmp" "$globals_tmp" "$redis_tmp"
+
+          mv -f -- "$postgres_tmp" "$postgres_final"
+          mv -f -- "$globals_tmp" "$globals_final"
+          mv -f -- "$redis_tmp" "$redis_final"
+          trap - EXIT
+          cleanup
+        timeout: 3600
+        required: true
+        run_as: root
+    after: []
+    finally: []
+    on_success: []
+    on_failure: []
+  restore:
+    before: []
+    after: []
+    finally: []
+    on_success: []
+    on_failure: []
+
+sources:
+  paths:
+    - id: compose
+      path: compose.yaml
+    - id: environment
+      path: .env
+    - id: database-dumps
+      path: ./backup-dumps
+  # PostgreSQL/Redis 的 raw volume 正在被寫入，不能直接複製；blob-cache 和 logs
+  # 都是可重建資料，因此只備份上方的線上一致性 dump 與部署設定。
+  volumes: []
