@@ -1,8 +1,10 @@
+import io
 import subprocess
 import os
 import pwd
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -36,7 +38,9 @@ class BeforeActionTests(unittest.TestCase):
         ]
         calls = []
         with mock.patch.object(
-            actions, '_run_action', side_effect=lambda item, _m: calls.append(item['name']),
+                actions, '_run_action',
+                side_effect=lambda item, _m, **_kwargs:
+                calls.append(item['name']),
         ):
             self.assertEqual(actions.run_before_actions(self.manifest(before)), [])
         self.assertEqual(calls, ['one', 'two'])
@@ -48,7 +52,10 @@ class BeforeActionTests(unittest.TestCase):
         ]
         with mock.patch.object(actions, '_run_action') as runner:
             self.assertEqual(actions.run_finally_actions(value), [])
-        runner.assert_called_once_with(value['actions']['finally'][0], value)
+        runner.assert_called_once_with(
+            value['actions']['finally'][0], value,
+            operation='backup', phase='finally', extra_env=None,
+        )
 
     def test_failure_actions_receive_sanitized_failure_environment(self):
         value = self.manifest([])
@@ -69,6 +76,20 @@ class BeforeActionTests(unittest.TestCase):
             'BACKUPCTL_FAILURE_SECONDARY': '',
         })
 
+    def test_empty_legacy_consistency_hooks_are_deprecated(self):
+        value = {
+            'service': 'demo',
+            'consistency': {
+                'mode': 'hooks',
+                'before': [],
+                'after': [],
+            },
+        }
+        self.assertEqual(actions.legacy_action_messages(value), [
+            'consistency.before/after are deprecated; migrate to '
+            'actions.backup.before/finally scripts',
+        ])
+
     def test_optional_failure_is_recorded_and_later_actions_continue(self):
         before = [
             {'name': 'optional', 'command': ['one'], 'required': False},
@@ -76,7 +97,7 @@ class BeforeActionTests(unittest.TestCase):
         ]
         calls = []
 
-        def run_action(item, _manifest):
+        def run_action(item, _manifest, **_kwargs):
             calls.append(item['name'])
             if item['name'] == 'optional':
                 raise RuntimeError('unavailable')
@@ -114,10 +135,88 @@ class BeforeActionTests(unittest.TestCase):
             kwargs['env']['HOME'], pwd.getpwuid(os.geteuid()).pw_dir,
         )
         self.assertTrue(kwargs['start_new_session'])
+        self.assertEqual(kwargs['env']['BACKUPCTL_OPERATION'], 'backup')
+        self.assertEqual(kwargs['env']['BACKUPCTL_ACTION_PHASE'], 'before')
+        self.assertEqual(kwargs['env']['BACKUPCTL_SERVICE'], 'demo')
         self.assertEqual(kwargs['user'], 123)
         self.assertEqual(kwargs['group'], 456)
         self.assertEqual(kwargs['extra_groups'], [])
         process.communicate.assert_called_once_with(timeout=8)
+
+    def test_inline_script_uses_bash_without_logging_script_body(self):
+        process = mock.Mock(returncode=0)
+        process.communicate.return_value = ('', '')
+        action = {
+            'name': 'dump', 'script': 'echo secret-value', 'timeout': 9,
+            'run_as': pwd.getpwuid(os.geteuid()).pw_name,
+        }
+        output = io.StringIO()
+        with mock.patch.object(
+                actions, 'action_executable', return_value='/bin/bash',
+        ), mock.patch.object(
+                actions.subprocess, 'Popen', return_value=process,
+        ) as popen, redirect_stdout(output):
+            actions._run_action(
+                action, self.manifest([]),
+                operation='restore', phase='after',
+            )
+        self.assertEqual(
+            popen.call_args.args[0],
+            ['/bin/bash', '-euo', 'pipefail', '-c', 'echo secret-value'],
+        )
+        self.assertNotIn('secret-value', output.getvalue())
+        self.assertIn('restore.after', output.getvalue())
+
+    def test_root_inline_bash_uses_validated_canonical_executable(self):
+        canonical = Path('/usr/bin/bash')
+        with mock.patch.object(
+                actions.Path, 'resolve', return_value=canonical,
+        ), mock.patch.object(
+                actions, '_validate_root_executable',
+                return_value=str(canonical),
+        ) as validate:
+            self.assertEqual(
+                actions.action_executable(['/bin/bash'], run_as='root'),
+                str(canonical),
+            )
+        validate.assert_called_once_with(canonical)
+
+    def test_inline_script_failure_redacts_script_from_command_error(self):
+        process = mock.Mock(returncode=1)
+        process.communicate.return_value = ('', 'failed\n')
+        action = {
+            'name': 'dump', 'script': 'token=secret-value; false',
+            'run_as': pwd.getpwuid(os.geteuid()).pw_name,
+        }
+        with mock.patch.object(
+                actions, 'action_executable', return_value='/usr/bin/bash',
+        ), mock.patch.object(
+                actions.subprocess, 'Popen', return_value=process,
+        ), self.assertRaises(common.CommandError) as raised:
+            actions._run_action(action, self.manifest([]))
+
+        rendered = ' '.join(raised.exception.cmd)
+        self.assertNotIn('secret-value', rendered)
+        self.assertIn('<inline script>', rendered)
+
+    def test_nested_restore_actions_are_selected_by_operation_and_phase(self):
+        value = self.manifest([])
+        value['actions'] = {
+            'backup': {'before': [{
+                'name': 'backup', 'command': ['backup'], 'run_as': 'root',
+            }]},
+            'restore': {'after': [{
+                'name': 'restore', 'command': ['restore'], 'run_as': 'root',
+            }]},
+        }
+        calls = []
+        with mock.patch.object(
+                actions, '_run_action',
+                side_effect=lambda item, _m, **kwargs:
+                calls.append((item['name'], kwargs['operation'], kwargs['phase'])),
+        ):
+            actions.run_actions(value, 'restore', 'after')
+        self.assertEqual(calls, [('restore', 'restore', 'after')])
 
     def test_relative_executable_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:

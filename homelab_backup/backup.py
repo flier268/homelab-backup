@@ -9,7 +9,9 @@ from typing import Callable
 
 from . import backup_state as _backup_state
 from .actions import (
-    action_executable, run_failure_actions, run_success_actions,
+    ACTION_OPERATIONS, ACTION_PHASES, action_entries, action_executable,
+    action_style, run_failure_actions, run_success_actions,
+    warn_legacy_actions,
 )
 from .backup_state import load_state, save_state
 from .common import (
@@ -403,18 +405,25 @@ def cmd_validate(c, args):
         try:
             validate_manifest(m)
             schema_valid.append(m)
-            for phase in ('before', 'finally', 'on_success', 'on_failure'):
-                for action in (m.get('actions') or {}).get(phase, []):
-                    executable = action['command'][0]
-                    run_as = action_user(action)
-                    account(run_as)
-                    if action_executable(
-                            action['command'], run_as=run_as,
-                    ) is None:
-                        raise RuntimeError(
-                            f'action {action["name"]!r} executable is missing: '
-                            f'{executable}'
-                        )
+            warn_legacy_actions(m)
+            operations = (
+                ACTION_OPERATIONS if action_style(m) == 'nested'
+                else ('backup',)
+            )
+            for operation in operations:
+                for phase in ACTION_PHASES:
+                    for action in action_entries(m, operation, phase):
+                        command = action.get('command') or ['/bin/bash']
+                        executable = command[0]
+                        run_as = action_user(action)
+                        account(run_as)
+                        if action_executable(
+                                command, run_as=run_as,
+                        ) is None:
+                            raise RuntimeError(
+                                f'action {action["name"]!r} executable is '
+                                f'missing: {executable}'
+                            )
             if (m.get('consistency') or {}).get('mode') == 'snapshot':
                 for executable in ('btrfs', 'findmnt'):
                     if shutil.which(executable) is None:

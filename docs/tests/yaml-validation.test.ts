@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { useEditorWorkspace } from '../src/composables/useEditorWorkspace'
 import { createGlobalConfig, createServiceManifest } from '../src/domain/defaults'
 import { validateDocument } from '../src/domain/validation'
 import { parseEditorDocument, serializeEditorDocument } from '../src/domain/yaml'
@@ -86,12 +87,16 @@ sources: null
       kind: 'service',
       value: expect.objectContaining({
         compose: { files: ['compose.yaml'] },
-        consistency: { mode: 'stop', before: [], after: [] },
+        consistency: { mode: 'stop' },
         actions: {
-          before: [],
-          finally: [],
-          on_success: [],
-          on_failure: [],
+          backup: {
+            before: [], after: [], finally: [],
+            on_success: [], on_failure: [],
+          },
+          restore: {
+            before: [], after: [], finally: [],
+            on_success: [], on_failure: [],
+          },
         },
         sources: { paths: [], volumes: [] },
       }),
@@ -131,6 +136,99 @@ actions:
       command: /usr/bin/true
       run_as: root
 `)).toThrow(/command.*陣列/)
+  })
+
+  it('migrates legacy actions and consistency hooks in execution order', () => {
+    const parsed = parseEditorDocument(`
+version: 1
+service: legacy
+schedule:
+  enabled: false
+retention:
+  keep_last: 1
+consistency:
+  mode: hooks
+  timeout: 90
+  before: ["echo freeze"]
+  after: ["echo resume"]
+actions:
+  before:
+    - name: prepare
+      command: [/usr/bin/true]
+      run_as: root
+  finally:
+    - name: cleanup
+      command: [/usr/bin/true]
+      run_as: root
+`)
+    expect(parsed.kind).toBe('service')
+    if (parsed.kind !== 'service') throw new Error('expected service manifest')
+    expect(parsed.value.consistency).toEqual({ mode: 'hooks', timeout: 90 })
+    expect(parsed.value.actions?.backup?.before?.map(({ name }) => name))
+      .toEqual(['prepare', 'legacy-consistency-before-1'])
+    expect(parsed.value.actions?.backup?.finally?.map(({ name }) => name))
+      .toEqual(['legacy-consistency-finally-1', 'cleanup'])
+    expect(parsed.value.actions?.backup?.before?.[1]).toMatchObject({
+      script: 'echo freeze',
+      timeout: 90,
+      required: true,
+      run_as: 'root',
+    })
+  })
+
+  it('rejects null legacy action phases and consistency hooks', () => {
+    expect(() => parseEditorDocument(`
+version: 1
+service: legacy
+actions:
+  before: null
+`)).toThrow(/actions\.before.*陣列/)
+
+    expect(() => parseEditorDocument(`
+version: 1
+service: legacy
+consistency:
+  mode: hooks
+  before: null
+`)).toThrow(/consistency\.before.*字串陣列/)
+  })
+
+  it('rejects mixing nested actions with legacy hooks', () => {
+    expect(() => parseEditorDocument(`
+version: 1
+service: mixed
+consistency:
+  mode: hooks
+  before: ["true"]
+actions:
+  backup: {}
+`)).toThrow(/不可.*混用/)
+  })
+
+  it('only reports legacy migration after a successful import', () => {
+    const workspace = useEditorWorkspace()
+    expect(() => workspace.importYaml(`
+version: 1
+service: mixed
+consistency:
+  mode: hooks
+  before: ["true"]
+actions:
+  backup: {}
+`)).toThrow(/不可.*混用/)
+    expect(workspace.importWarning.value).toBe('')
+
+    workspace.importYaml(`
+version: 1
+service: legacy
+schedule:
+  enabled: false
+retention:
+  keep_last: 1
+actions:
+  before: []
+`)
+    expect(workspace.importWarning.value).toContain('已將舊版')
   })
 
   it('reports missing required values without crashing validation', () => {
@@ -203,20 +301,24 @@ describe('schema validation', () => {
       { id: 'child', path: 'data/child' },
     ]
     value.actions = {
-      before: [{
-        name: 'notify',
-        command: ['/usr/bin/true'],
-        run_as: 'root',
-      }],
-      on_success: [{
-        name: 'notify',
-        command: ['/usr/bin/true'],
-        run_as: 'root',
-      }],
+      backup: {
+        before: [{
+          name: 'notify',
+          command: ['/usr/bin/true'],
+          run_as: 'root',
+        }],
+      },
+      restore: {
+        on_success: [{
+          name: 'notify',
+          command: ['/usr/bin/true'],
+          run_as: 'root',
+        }],
+      },
     }
     const issues = validateDocument({ kind: 'service', value })
     expect(issues.some(({ message }) => message.includes('互相重疊'))).toBe(true)
-    expect(issues.some(({ message }) => message.includes('跨 phase 唯一'))).toBe(true)
+    expect(issues.some(({ message }) => message.includes('跨操作與 phase 唯一'))).toBe(true)
   })
 
   it('rejects data paths covering protected controls but allows exact Compose controls', () => {
@@ -260,18 +362,20 @@ describe('schema validation', () => {
   it('matches runtime action identity and executable rules', () => {
     const value = createServiceManifest()
     value.actions = {
-      before: [{
-        name: 'bad-action',
-        command: ['./relative-script'],
-        run_as: 'UppercaseUser',
-      }],
+      backup: {
+        before: [{
+          name: 'bad-action',
+          command: ['./relative-script'],
+          run_as: 'UppercaseUser',
+        }],
+      },
     }
     const issues = validateDocument({ kind: 'service', value })
     expect(issues).toContainEqual(expect.objectContaining({
-      path: 'actions.before[0].run_as',
+      path: 'actions.backup.before[0].run_as',
     }))
     expect(issues).toContainEqual(expect.objectContaining({
-      path: 'actions.before[0].command[0]',
+      path: 'actions.backup.before[0].command[0]',
     }))
   })
 

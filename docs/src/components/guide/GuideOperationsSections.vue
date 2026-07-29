@@ -62,7 +62,15 @@ sudo backupctl restore minecraft --snapshot 01234567 --apply</code></pre>
       <li><strong>混合狀態：</strong>只有部分 target 存在時一律拒絕，不猜測身分或覆寫。</li>
       <li>snapshot manifest 只描述備份內容，不能單獨授權 root 寫入；<code>--yes</code> 也只確認執行。</li>
       <li><code>--restore-manifest</code> 只允許安全投影一致的 manifest；<code>--keep-manifest</code> 保留本機版本。</li>
+      <li>只下載 snapshot 不執行 action；只有 apply 會執行 <code>actions.restore</code>。</li>
     </ul>
+    <h3>Restore actions</h3>
+    <p>
+      順序固定為 before、資料還原、after、finally、服務狀態協調、on_success；
+      失敗時先執行 finally／on_failure，再停止 action 額外啟動的 containers
+      並完成 rollback 或服務狀態協調。after 適合在 dump 已發布、應用尚未重啟時
+      執行資料庫匯入。資料已修改後 required action 失敗會維持 fail-closed。
+    </p>
     <h3>全新服務的兩階段重建</h3>
     <pre v-pre><code>sudo backupctl restore minecraft
 

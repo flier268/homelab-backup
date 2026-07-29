@@ -58,6 +58,31 @@ def deferred_compose_sources(m):
     return tuple(sources)
 
 
+def _restore_actions_projection(m):
+    actions = m.get('actions') or {}
+    section = (
+        actions.get('restore') or {}
+        if isinstance(actions, dict) else {}
+    )
+    projection = {}
+    for phase in ('before', 'after', 'finally', 'on_success', 'on_failure'):
+        entries = []
+        for action in section.get(phase, []) or []:
+            entry = {
+                'name': action.get('name'),
+                'timeout': action.get('timeout', 30),
+                'required': action.get('required', True),
+                'run_as': action.get('run_as'),
+            }
+            if 'command' in action:
+                entry['command'] = list(action['command'])
+            else:
+                entry['script'] = action.get('script')
+            entries.append(entry)
+        projection[phase] = entries
+    return projection
+
+
 def restore_authorization_projection(m):
     sources = m.get('sources') or {}
     consistency = m.get('consistency') or {}
@@ -67,6 +92,7 @@ def restore_authorization_projection(m):
         'consistency': {
             'mode': consistency.get('mode', 'stop'),
         },
+        'restore_actions': _restore_actions_projection(m),
         'paths': [
             {
                 key: source.get(key)

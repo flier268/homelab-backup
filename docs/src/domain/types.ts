@@ -1,6 +1,7 @@
 export type DocumentKind = 'global' | 'service'
 export type ConsistencyMode = 'stop' | 'hooks' | 'external' | 'live' | 'snapshot' | 'files'
-export type ActionPhase = 'before' | 'finally' | 'on_success' | 'on_failure'
+export type ActionOperation = 'backup' | 'restore'
+export type ActionPhase = 'before' | 'after' | 'finally' | 'on_success' | 'on_failure'
 export type InventoryEntryType = 'file' | 'directory' | 'symlink'
 export type SelectionState = 'unassigned' | 'include' | 'exclude'
 
@@ -51,13 +52,16 @@ export interface ConsistencyConfig {
 
 export interface ActionDefinition {
   name: string
-  command: string[]
+  command?: string[]
+  script?: string
   timeout?: number
   required?: boolean
   run_as: string
 }
 
-export type ActionsConfig = Partial<Record<ActionPhase, ActionDefinition[]>>
+export type OperationActions = Partial<Record<ActionPhase, ActionDefinition[]>>
+
+export type ActionsConfig = Partial<Record<ActionOperation, OperationActions>>
 
 export interface PathSource {
   id: string

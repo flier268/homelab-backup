@@ -10,6 +10,10 @@ from pathlib import Path
 from .common import CommandError, _print_command_failure
 from .identity import account, action_user, fixed_environment, subprocess_identity
 
+ACTION_OPERATIONS = ('backup', 'restore')
+ACTION_PHASES = ('before', 'after', 'finally', 'on_success', 'on_failure')
+LEGACY_ACTION_PHASES = ('before', 'finally', 'on_success', 'on_failure')
+
 
 class ActionTimeoutError(RuntimeError):
     def __init__(self, name, timeout):
@@ -54,16 +58,71 @@ def action_executable(command, *, run_as):
             return None
         candidate = Path(candidate)
     if account(run_as).uid == 0:
+        if candidate == Path('/bin/bash'):
+            try:
+                candidate = candidate.resolve(strict=True)
+            except (OSError, RuntimeError):
+                return None
         return _validate_root_executable(candidate)
     return str(candidate) if candidate.is_file() and not candidate.is_symlink() else None
 
 
-def _run_action(action, m, *, extra_env=None):
-    command = list(action['command'])
+def action_style(m):
+    actions = m.get('actions') or {}
+    return 'nested' if any(key in actions for key in ACTION_OPERATIONS) else 'legacy'
+
+
+def action_entries(m, operation, phase):
+    actions = m.get('actions') or {}
+    if action_style(m) == 'nested':
+        return ((actions.get(operation) or {}).get(phase) or [])
+    if operation == 'backup' and phase in LEGACY_ACTION_PHASES:
+        return actions.get(phase, []) or []
+    return []
+
+
+def legacy_action_messages(m):
+    messages = []
+    actions = m.get('actions') or {}
+    if actions and action_style(m) == 'legacy':
+        messages.append(
+            'legacy flat actions are deprecated; migrate to actions.backup'
+        )
+    consistency = m.get('consistency') or {}
+    if 'before' in consistency or 'after' in consistency:
+        messages.append(
+            'consistency.before/after are deprecated; migrate to '
+            'actions.backup.before/finally scripts'
+        )
+    return messages
+
+
+def warn_legacy_actions(m):
+    for message in legacy_action_messages(m):
+        print(f'WARNING: {m["service"]}: {message}', file=sys.stderr)
+
+
+def _run_action(
+        action, m, *, operation='backup', phase='before', extra_env=None,
+):
+    script = action.get('script')
+    if script is None:
+        command = list(action['command'])
+        display_command = command
+    else:
+        command = ['/bin/bash', '-euo', 'pipefail', '-c', script]
+        display_command = [
+            '/bin/bash', '-euo', 'pipefail', '-c', '<inline script>',
+        ]
     timeout = action.get('timeout', 30)
     user = action_user(action)
     record = account(user)
     env = fixed_environment(user)
+    env.update({
+        'BACKUPCTL_OPERATION': operation,
+        'BACKUPCTL_ACTION_PHASE': phase,
+        'BACKUPCTL_SERVICE': m['service'],
+    })
     if extra_env:
         env.update(extra_env)
     executable = action_executable(command, run_as=user)
@@ -72,10 +131,14 @@ def _run_action(action, m, *, extra_env=None):
             f'action {action["name"]!r} executable was not found: {command[0]}'
         )
     command[0] = executable
-    print(
-        f'+ [as {record.uid}:{record.gid}]',
-        ' '.join(shlex.quote(item) for item in command),
+    prefix = (
+        f'+ [{operation}.{phase} {action["name"]!r} '
+        f'as {record.uid}:{record.gid}]'
     )
+    if script is None:
+        print(prefix, ' '.join(shlex.quote(item) for item in command))
+    else:
+        print(prefix, '/bin/bash -euo pipefail -c <inline script>')
     process = subprocess.Popen(
         command,
         cwd=m['_dir'],
@@ -108,7 +171,7 @@ def _run_action(action, m, *, extra_env=None):
         raise ActionTimeoutError(action['name'], timeout)
     if process.returncode:
         raise CommandError(
-            command, process.returncode, cwd=m['_dir'],
+            display_command, process.returncode, cwd=m['_dir'],
             stdout=stdout, stderr=stderr,
         )
     if stdout:
@@ -117,14 +180,14 @@ def _run_action(action, m, *, extra_env=None):
         print(stderr, end='', file=sys.stderr)
 
 
-def run_actions(m, phase, *, extra_env=None):
+def run_actions(m, operation, phase, *, extra_env=None):
     failures = []
-    for action in (m.get('actions') or {}).get(phase, []):
+    for action in action_entries(m, operation, phase):
         try:
-            if extra_env is None:
-                _run_action(action, m)
-            else:
-                _run_action(action, m, extra_env=extra_env)
+            _run_action(
+                action, m, operation=operation, phase=phase,
+                extra_env=extra_env,
+            )
         except Exception as err:
             if action.get('required', True):
                 raise
@@ -146,24 +209,35 @@ def run_actions(m, phase, *, extra_env=None):
 
 
 def run_before_actions(m):
-    return run_actions(m, 'before')
+    return run_actions(m, 'backup', 'before')
+
+
+def run_after_actions(m):
+    return run_actions(m, 'backup', 'after')
 
 
 def run_finally_actions(m):
-    return run_actions(m, 'finally')
+    return run_actions(m, 'backup', 'finally')
 
 
 def run_success_actions(m):
-    return run_actions(m, 'on_success')
+    return run_actions(m, 'backup', 'on_success')
 
 
-def run_failure_actions(m, *, error, phase):
+def failure_environment(m, *, error, phase):
     reason = ' '.join(str(error).replace('\x00', '').splitlines())[:4096]
     secondary = ' | '.join(getattr(error, '__notes__', ()))[:4096]
-    return run_actions(m, 'on_failure', extra_env={
+    return {
         'BACKUPCTL_FAILURE_PHASE': phase,
         'BACKUPCTL_FAILURE_TYPE': type(error).__name__,
         'BACKUPCTL_FAILURE_REASON': reason,
         'BACKUPCTL_FAILURE_SERVICE': m['service'],
         'BACKUPCTL_FAILURE_SECONDARY': secondary,
-    })
+    }
+
+
+def run_failure_actions(m, *, error, phase):
+    return run_actions(
+        m, 'backup', 'on_failure',
+        extra_env=failure_environment(m, error=error, phase=phase),
+    )

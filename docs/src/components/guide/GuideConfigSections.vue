@@ -89,14 +89,20 @@ compose:
 consistency:
   mode: stop
   timeout: 120
-  before: []
-  after: []
 
 actions:
-  before: []
-  finally: []
-  on_success: []
-  on_failure: []
+  backup:
+    before: []
+    after: []
+    finally: []
+    on_success: []
+    on_failure: []
+  restore:
+    before: []
+    after: []
+    finally: []
+    on_success: []
+    on_failure: []
 
 sources:
   paths:

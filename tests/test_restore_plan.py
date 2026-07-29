@@ -11,6 +11,63 @@ from tests.helpers import manifest, write_restore_inventory
 
 
 class RestorePlanningTests(unittest.TestCase):
+    def test_restore_actions_are_part_of_restore_authorization(self):
+        local = {
+            'service': 'demo',
+            'actions': {'restore': {'after': [{
+                'name': 'import', 'script': 'echo trusted',
+                'run_as': 'root',
+            }]}},
+        }
+        changed = {
+            **local,
+            'actions': {'restore': {'after': [{
+                'name': 'import', 'script': 'echo changed',
+                'run_as': 'root',
+            }]}},
+        }
+        self.assertNotEqual(
+            restore_plan.restore_authorization_projection(local),
+            restore_plan.restore_authorization_projection(changed),
+        )
+
+    def test_restore_action_authorization_normalizes_empty_phases(self):
+        absent = {'service': 'demo'}
+        explicit = {
+            'service': 'demo',
+            'actions': {'restore': {
+                'before': [],
+                'after': [],
+                'finally': [],
+                'on_success': [],
+                'on_failure': [],
+            }},
+        }
+        self.assertEqual(
+            restore_plan.restore_authorization_projection(absent),
+            restore_plan.restore_authorization_projection(explicit),
+        )
+
+    def test_restore_action_authorization_normalizes_action_defaults(self):
+        implicit = {
+            'service': 'demo',
+            'actions': {'restore': {'after': [{
+                'name': 'import', 'script': 'echo trusted',
+                'run_as': 'root',
+            }]}},
+        }
+        explicit = {
+            'service': 'demo',
+            'actions': {'restore': {'after': [{
+                'name': 'import', 'script': 'echo trusted',
+                'timeout': 30, 'required': True, 'run_as': 'root',
+            }]}},
+        }
+        self.assertEqual(
+            restore_plan.restore_authorization_projection(implicit),
+            restore_plan.restore_authorization_projection(explicit),
+        )
+
     def test_existing_restore_rejects_snapshot_filter_mismatch_when_manifest_is_kept(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)

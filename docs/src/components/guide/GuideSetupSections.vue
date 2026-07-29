@@ -35,7 +35,7 @@ rclone → OneDrive repository</div>
     </p>
     <ul>
       <li>新增或匯入全域 <code>config.yaml</code> 與服務 <code>backup.yaml</code>。</li>
-      <li>編輯排程、保留策略、來源、五種一致性模式、hooks 與四階段 actions。</li>
+      <li>編輯排程、保留策略、來源、一致性模式與 backup／restore 五階段 actions。</li>
       <li>匯入清單命令產生的 JSON Lines，將項目標成備份、排除或不納入，再整理成 source 群組。</li>
       <li>清單只有相對路徑及類型，不讀取檔案內容，也不跟隨 symlink。</li>
     </ul>

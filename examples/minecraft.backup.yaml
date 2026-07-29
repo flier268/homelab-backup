@@ -23,8 +23,6 @@ compose:
 consistency:
   mode: stop
   timeout: 120
-  before: []
-  after: []
 
 sources:
   paths:

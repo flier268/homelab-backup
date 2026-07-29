@@ -7,7 +7,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from .common import run, run_cleanup
+from .actions import action_entries, failure_environment, run_actions
+from .common import add_exception_note, run, run_cleanup
 from .manifest import compose_model, compose_run, requires_docker, source_path
 from .restore_plan import (
     RestorePlan,
@@ -31,7 +32,8 @@ from .security import (
 from .storage import (
     build_path_filter_args, create_restore_volume, docker_mount_conflicts,
     docker_project_containers, docker_volume_exists, resolved_volume_sources,
-    sync_volumes, validate_volume_identity, volume_owned_by_operation,
+    running_services, sync_volumes, validate_volume_identity,
+    volume_owned_by_operation,
 )
 from .types import GlobalConfig, ServiceManifest
 
@@ -781,9 +783,67 @@ def _restart_services(plan, targets, start_services):
                 'Compose files were not restored'
             )
         compose_run(plan.manifest, ['up', '-d'], runner=run)
-    elif targets:
+        return
+    if _has_restore_actions(plan.manifest):
+        if plan.mode == 'rebuild':
+            compose_run(
+                plan.manifest, ['down', '--remove-orphans'], runner=run,
+            )
+        else:
+            current = set(running_services(plan.manifest))
+            extras = sorted(current - set(targets))
+            if extras:
+                compose_run(
+                    plan.manifest, ['stop'] + extras, runner=run,
+                )
+    if targets:
         compose_run(
             plan.manifest, ['up', '-d', '--no-deps'] + targets, runner=run,
+        )
+
+
+def _has_restore_actions(m):
+    return any(
+        action_entries(m, 'restore', phase)
+        for phase in ('before', 'after', 'finally', 'on_success', 'on_failure')
+    )
+
+
+def _restore_action_environment(plan, root):
+    return {
+        'BACKUPCTL_RESTORE_ROOT': str(root),
+        'BACKUPCTL_RESTORE_MODE': plan.mode,
+    }
+
+
+def _run_restore_actions(
+        plan, root, phase, *, error=None, failure_phase=None,
+):
+    if not action_entries(plan.manifest, 'restore', phase):
+        return []
+    extra_env = _restore_action_environment(plan, root)
+    if error is not None:
+        extra_env.update(failure_environment(
+            plan.manifest, error=error,
+            phase=failure_phase or phase,
+        ))
+    return run_actions(
+        plan.manifest, 'restore', phase, extra_env=extra_env,
+    )
+
+
+def _stop_hook_started_services(plan):
+    if not requires_docker(plan.manifest) or not _has_restore_actions(plan.manifest):
+        return
+    if plan.mode == 'rebuild':
+        compose_run(
+            plan.manifest, ['down', '--remove-orphans'], runner=run,
+        )
+        return
+    current = running_services(plan.manifest)
+    if current:
+        compose_run(
+            plan.manifest, ['stop'] + list(current), runner=run,
         )
 
 
@@ -860,7 +920,18 @@ class RestoreApplyWorkflow:
         targets = list(plan.running_services)
         try:
             deps.stop_services(plan)
-        except Exception:
+        except Exception as err:
+            deps.cleanup(
+                lambda: _run_restore_actions(
+                    plan, root, 'on_failure', error=err,
+                    failure_phase='stop',
+                ),
+                'restore.on_failure actions',
+            )
+            deps.cleanup(
+                lambda: _stop_hook_started_services(plan),
+                'stop services after failed restore stop',
+            )
             if targets:
                 deps.cleanup(
                     lambda: deps.compose(
@@ -873,46 +944,117 @@ class RestoreApplyWorkflow:
             raise
         mutation_started = False
         changes = RestoreChanges()
+        primary_error = None
+        primary_phase = None
+        active_phase = 'preflight'
         try:
             deps.dynamic_preflight(c, plan)
+            active_phase = 'before'
+            _run_restore_actions(plan, root, 'before')
             mutation_started = True
             operation_id = deps.operation_id()
+            active_phase = 'restore'
             if plan.mode == 'rebuild':
                 deps.publish_controls(c, m, plan, changes)
                 deps.restore_data(c, plan, changes, operation_id)
             else:
                 deps.restore_data(c, plan, changes, operation_id)
                 deps.publish_controls(c, m, plan, changes)
-        except Exception:
-            if not mutation_started and targets:
+            active_phase = 'after'
+            _run_restore_actions(plan, root, 'after')
+        except Exception as err:
+            primary_error = err
+            primary_phase = active_phase
+        try:
+            _run_restore_actions(plan, root, 'finally')
+        except Exception as err:
+            if primary_error is None:
+                primary_error = err
+                primary_phase = 'finally'
+            else:
+                add_exception_note(
+                    primary_error,
+                    f'restore.finally also failed: '
+                    f'{type(err).__name__}: {err}',
+                )
+        if primary_error is not None:
+            try:
+                raise primary_error
+            except Exception:
                 deps.cleanup(
-                    lambda: deps.compose(
-                        plan.manifest,
-                        ['up', '-d', '--no-deps'] + targets,
-                        runner=deps.run_command,
+                    lambda: _run_restore_actions(
+                        plan, root, 'on_failure', error=primary_error,
+                        failure_phase=primary_phase,
                     ),
-                    'service recovery after restore preflight',
+                    'restore.on_failure actions',
                 )
-            elif mutation_started and plan.mode == 'rebuild':
-                deps.rollback(changes.rollback)
-                print(
-                    'ERROR: rebuild restore failed; rollback of new targets '
-                    'was attempted',
-                    file=sys.stderr,
+                deps.cleanup(
+                    lambda: _stop_hook_started_services(plan),
+                    'stop services started by restore actions',
                 )
-            elif mutation_started:
-                files_mode = not requires_docker(plan.manifest)
-                message = 'ERROR: restore failed after live mutation'
-                if not files_mode:
-                    message += '; services remain stopped'
-                print(message, file=sys.stderr)
-                for target in dict.fromkeys(changes.live_mutations):
+                if not mutation_started and targets:
+                    deps.cleanup(
+                        lambda: deps.compose(
+                            plan.manifest,
+                            ['up', '-d', '--no-deps'] + targets,
+                            runner=deps.run_command,
+                        ),
+                        'service recovery after restore preflight',
+                    )
+                elif mutation_started and plan.mode == 'rebuild':
+                    deps.cleanup(
+                        lambda: deps.rollback(changes.rollback),
+                        'rebuild restore rollback',
+                    )
                     print(
-                        f'  - possibly modified: {target}',
+                        'ERROR: rebuild restore failed; rollback of new targets '
+                        'was attempted',
                         file=sys.stderr,
                     )
+                elif mutation_started:
+                    files_mode = not requires_docker(plan.manifest)
+                    message = 'ERROR: restore failed after live mutation'
+                    if not files_mode:
+                        message += '; services remain stopped'
+                    print(message, file=sys.stderr)
+                    for target in dict.fromkeys(changes.live_mutations):
+                        print(
+                            f'  - possibly modified: {target}',
+                            file=sys.stderr,
+                        )
+                raise
+        try:
+            deps.restart_services(plan, targets, start_services)
+        except Exception as err:
+            deps.cleanup(
+                lambda: _run_restore_actions(
+                    plan, root, 'on_failure', error=err,
+                    failure_phase='restart',
+                ),
+                'restore.on_failure actions',
+            )
+            deps.cleanup(
+                lambda: _stop_hook_started_services(plan),
+                'stop services after failed restore restart',
+            )
             raise
-        deps.restart_services(plan, targets, start_services)
+        try:
+            _run_restore_actions(plan, root, 'on_success')
+        except Exception as err:
+            deps.cleanup(
+                lambda: _run_restore_actions(
+                    plan, root, 'on_failure', error=err,
+                    failure_phase='on_success',
+                ),
+                'restore.on_failure actions',
+            )
+            deps.cleanup(
+                lambda: deps.restart_services(
+                    plan, targets, start_services,
+                ),
+                'service reconciliation after failed restore.on_success',
+            )
+            raise
 
 
 def apply_one(

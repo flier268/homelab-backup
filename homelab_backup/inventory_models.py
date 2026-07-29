@@ -110,7 +110,7 @@ class ComposeIdentityModel(_SnapshotModel):
 
 
 class OptionalActionFailureModel(_SnapshotModel):
-    phase: Literal['before', 'finally', 'on_success', 'on_failure']
+    phase: Literal['before', 'after', 'finally', 'on_success', 'on_failure']
     name: str
     result: Literal['failed', 'timeout']
 

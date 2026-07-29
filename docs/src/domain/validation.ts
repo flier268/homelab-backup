@@ -150,14 +150,22 @@ function validateAction(
       ))
     }
   }
-  if (!Array.isArray(action.command) || !action.command.length
-      || action.command.some((part) => typeof part !== 'string' || !part)) {
-    issues.push(issue(`${path}.command`, '至少需要一個非空 argv 參數'))
-  } else if (action.command[0].includes('/') && !action.command[0].startsWith('/')) {
-    issues.push(issue(
-      `${path}.command[0]`,
-      '含有 / 的 executable 必須使用絕對路徑',
-    ))
+  const hasCommand = action.command !== undefined
+  const hasScript = action.script !== undefined
+  if (hasCommand === hasScript) {
+    issues.push(issue(path, 'command 與 script 必須擇一設定'))
+  } else if (hasCommand) {
+    if (!Array.isArray(action.command) || !action.command.length
+        || action.command.some((part) => typeof part !== 'string' || !part)) {
+      issues.push(issue(`${path}.command`, '至少需要一個非空 argv 參數'))
+    } else if (action.command[0].includes('/') && !action.command[0].startsWith('/')) {
+      issues.push(issue(
+        `${path}.command[0]`,
+        '含有 / 的 executable 必須使用絕對路徑',
+      ))
+    }
+  } else if (typeof action.script !== 'string' || !action.script) {
+    issues.push(issue(`${path}.script`, '必須是非空 Bash script'))
   }
   if (action.timeout !== undefined
       && (!Number.isInteger(action.timeout) || action.timeout <= 0)) {
@@ -298,14 +306,19 @@ function validateService(service: ServiceManifest): ValidationIssue[] {
     issues.push(issue('consistency', 'before/after hooks 只能用於 hooks 模式'))
   }
   const actionNames = new Set<string>()
-  for (const phase of ['before', 'finally', 'on_success', 'on_failure'] as const) {
-    ;(service.actions?.[phase] ?? []).forEach((action, index) => {
-      validateAction(action, `actions.${phase}[${index}]`, issues)
-      if (actionNames.has(action.name)) {
-        issues.push(issue(`actions.${phase}[${index}].name`, 'action name 必須跨 phase 唯一'))
-      }
-      actionNames.add(action.name)
-    })
+  for (const operation of ['backup', 'restore'] as const) {
+    for (const phase of [
+      'before', 'after', 'finally', 'on_success', 'on_failure',
+    ] as const) {
+      ;(service.actions?.[operation]?.[phase] ?? []).forEach((action, index) => {
+        const path = `actions.${operation}.${phase}[${index}]`
+        validateAction(action, path, issues)
+        if (actionNames.has(action.name)) {
+          issues.push(issue(`${path}.name`, 'action name 必須跨操作與 phase 唯一'))
+        }
+        actionNames.add(action.name)
+      })
+    }
   }
   const allIds = new Set<string>()
   validatePathSources(service, service.sources?.paths ?? [], issues, allIds)

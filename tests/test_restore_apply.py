@@ -639,6 +639,219 @@ class RestoreApplyPreflightTests(unittest.TestCase):
 
 class RestoreApplyLifecycleTests(unittest.TestCase):
 
+    def test_restore_actions_wrap_data_and_restart_in_phase_order(self):
+        root = Path('/restore')
+        value = {
+            'service': 'demo',
+            'consistency': {'mode': 'files'},
+            'actions': {
+                'restore': {
+                    phase: [{
+                        'name': phase, 'command': ['/usr/bin/true'],
+                        'run_as': 'root',
+                    }]
+                    for phase in (
+                        'before', 'after', 'finally',
+                        'on_success', 'on_failure',
+                    )
+                },
+            },
+        }
+        plan = restore_plan.RestorePlan(
+            root, {}, value, 'existing', (), (), (), (), 'demo',
+        )
+        events = []
+
+        def action_phase(_plan, _root, phase, **_kwargs):
+            events.append(phase)
+            return []
+
+        with mock.patch.object(
+            restore_apply, 'prepare_restore_plan', return_value=plan,
+        ), mock.patch.object(
+            restore_apply, '_stop_running_services',
+            side_effect=lambda _plan: events.append('stop') or [],
+        ), mock.patch.object(
+            restore_apply, '_dynamic_preflight',
+            side_effect=lambda *_args: events.append('preflight'),
+        ), mock.patch.object(
+            restore_apply, '_restore_data',
+            side_effect=lambda *_args: events.append('data'),
+        ), mock.patch.object(
+            restore_apply, '_publish_controls',
+            side_effect=lambda *_args: events.append('publish'),
+        ), mock.patch.object(
+            restore_apply, '_restart_services',
+            side_effect=lambda *_args: events.append('restart'),
+        ), mock.patch.object(
+            restore_apply, '_run_restore_actions', side_effect=action_phase,
+        ):
+            restore_apply.apply_one({}, value, root)
+
+        self.assertEqual(events, [
+            'stop', 'preflight', 'before', 'data', 'publish',
+            'after', 'finally', 'restart', 'on_success',
+        ])
+
+    def test_restore_after_failure_runs_finally_and_failure_but_not_restart(self):
+        root = Path('/restore')
+        value = {
+            'service': 'demo',
+            'consistency': {'mode': 'files'},
+            'actions': {'restore': {
+                phase: [{
+                    'name': phase, 'command': ['/usr/bin/true'],
+                    'run_as': 'root',
+                }]
+                for phase in ('before', 'after', 'finally', 'on_failure')
+            }},
+        }
+        plan = restore_plan.RestorePlan(
+            root, {}, value, 'existing', (), (), (), (), 'demo',
+        )
+        events = []
+
+        def action_phase(_plan, _root, phase, **_kwargs):
+            events.append(phase)
+            if phase == 'after':
+                raise RuntimeError('import failed')
+            return []
+
+        with mock.patch.object(
+            restore_apply, 'prepare_restore_plan', return_value=plan,
+        ), mock.patch.object(
+            restore_apply, '_stop_running_services', return_value=[],
+        ), mock.patch.object(
+            restore_apply, '_dynamic_preflight',
+        ), mock.patch.object(
+            restore_apply, '_restore_data',
+        ), mock.patch.object(
+            restore_apply, '_publish_controls',
+        ), mock.patch.object(
+            restore_apply, '_restart_services',
+        ) as restart, mock.patch.object(
+            restore_apply, '_run_restore_actions', side_effect=action_phase,
+        ), self.assertRaisesRegex(RuntimeError, 'import failed'):
+            restore_apply.apply_one({}, value, root)
+
+        self.assertEqual(events, ['before', 'after', 'finally', 'on_failure'])
+        restart.assert_not_called()
+
+    def test_restore_failure_reconciles_compose_after_on_failure_actions(self):
+        root = Path('/restore')
+        value = {
+            'service': 'demo',
+            'actions': {'restore': {
+                phase: [{
+                    'name': phase, 'command': ['/usr/bin/true'],
+                    'run_as': 'root',
+                }]
+                for phase in ('before', 'after', 'finally', 'on_failure')
+            }},
+        }
+        plan = restore_plan.RestorePlan(
+            root, {}, value, 'existing', (), (), (), (), 'demo',
+        )
+        events = []
+
+        def action_phase(_plan, _root, phase, **_kwargs):
+            events.append(phase)
+            if phase == 'after':
+                raise RuntimeError('import failed')
+            return []
+
+        with mock.patch.object(
+            restore_apply, 'prepare_restore_plan', return_value=plan,
+        ), mock.patch.object(
+            restore_apply, '_stop_running_services', return_value=[],
+        ), mock.patch.object(
+            restore_apply, '_dynamic_preflight',
+        ), mock.patch.object(
+            restore_apply, '_restore_data',
+        ), mock.patch.object(
+            restore_apply, '_publish_controls',
+        ), mock.patch.object(
+            restore_apply, '_run_restore_actions', side_effect=action_phase,
+        ), mock.patch.object(
+            restore_apply, '_stop_hook_started_services',
+            side_effect=lambda _plan: events.append('reconcile'),
+        ), self.assertRaisesRegex(RuntimeError, 'import failed'):
+            restore_apply.apply_one({}, value, root)
+
+        self.assertEqual([
+            'before', 'after', 'finally', 'on_failure', 'reconcile',
+        ], events)
+
+    def test_restore_failure_environment_uses_triggering_phase(self):
+        root = Path('/restore')
+        action = {
+            'name': 'notify', 'command': ['/usr/bin/true'], 'run_as': 'root',
+        }
+        value = {
+            'service': 'demo',
+            'actions': {'restore': {'on_failure': [action]}},
+        }
+        plan = restore_plan.RestorePlan(
+            root, {}, value, 'existing', (), (), (), (), 'demo',
+        )
+        with mock.patch.object(
+                restore_apply, 'run_actions', return_value=[],
+        ) as runner:
+            restore_apply._run_restore_actions(
+                plan, root, 'on_failure',
+                error=RuntimeError('import failed'),
+                failure_phase='after',
+            )
+
+        environment = runner.call_args.kwargs['extra_env']
+        self.assertEqual(environment['BACKUPCTL_FAILURE_PHASE'], 'after')
+
+    def test_on_success_failure_reconciles_after_on_failure_actions(self):
+        root = Path('/restore')
+        value = {
+            'service': 'demo',
+            'actions': {'restore': {
+                phase: [{
+                    'name': phase, 'command': ['/usr/bin/true'],
+                    'run_as': 'root',
+                }]
+                for phase in ('on_success', 'on_failure')
+            }},
+        }
+        plan = restore_plan.RestorePlan(
+            root, {}, value, 'existing', (), (), ('app',), (), 'demo',
+        )
+        events = []
+
+        def action_phase(_plan, _root, phase, **_kwargs):
+            events.append(phase)
+            if phase == 'on_success':
+                raise RuntimeError('notification failed')
+            return []
+
+        with mock.patch.object(
+            restore_apply, 'prepare_restore_plan', return_value=plan,
+        ), mock.patch.object(
+            restore_apply, '_stop_running_services', return_value=['app'],
+        ), mock.patch.object(
+            restore_apply, '_dynamic_preflight',
+        ), mock.patch.object(
+            restore_apply, '_restore_data',
+        ), mock.patch.object(
+            restore_apply, '_publish_controls',
+        ), mock.patch.object(
+            restore_apply, '_run_restore_actions', side_effect=action_phase,
+        ), mock.patch.object(
+            restore_apply, '_restart_services',
+            side_effect=lambda *_args: events.append('reconcile'),
+        ), self.assertRaisesRegex(RuntimeError, 'notification failed'):
+            restore_apply.apply_one({}, value, root)
+
+        self.assertEqual([
+            'before', 'after', 'finally', 'reconcile',
+            'on_success', 'on_failure', 'reconcile',
+        ], events)
+
     def test_apply_runs_preflight_data_publication_and_restart_in_order(self):
         root = Path('/restore')
         value = {'service': 'demo'}
@@ -824,6 +1037,58 @@ class RestoreApplyLifecycleTests(unittest.TestCase):
 
         compose.assert_not_called()
 
+    def test_rebuild_restore_actions_remove_temporary_containers_without_volumes(self):
+        action = {
+            'name': 'import', 'command': ['/usr/bin/true'], 'run_as': 'root',
+        }
+        plan = restore_plan.RestorePlan(
+            Path('/restore'), {}, {
+                'service': 'demo',
+                'actions': {'restore': {'after': [action]}},
+            },
+            'rebuild', (), (), (), (), 'demo',
+        )
+        with mock.patch.object(
+            restore_apply, 'compose_run',
+        ) as compose, mock.patch.object(
+            restore_apply, 'running_services',
+        ) as running:
+            restore_apply._stop_hook_started_services(plan)
+            restore_apply._restart_services(plan, [], False)
+
+        self.assertEqual(compose.call_count, 2)
+        for call in compose.call_args_list:
+            self.assertEqual(
+                call.args[1], ['down', '--remove-orphans'],
+            )
+            self.assertNotIn('-v', call.args[1])
+        running.assert_not_called()
+
+    def test_existing_restore_stops_only_services_started_by_actions(self):
+        action = {
+            'name': 'import', 'command': ['/usr/bin/true'], 'run_as': 'root',
+        }
+        plan = restore_plan.RestorePlan(
+            Path('/restore'), {}, {
+                'service': 'demo',
+                'actions': {'restore': {'after': [action]}},
+            },
+            'existing', (), (), ('app',), (), 'demo',
+        )
+        with mock.patch.object(
+            restore_apply, 'running_services',
+            return_value=['app', 'postgres'],
+        ), mock.patch.object(restore_apply, 'compose_run') as compose:
+            restore_apply._restart_services(plan, ['app'], False)
+
+        self.assertEqual(
+            [call.args[1] for call in compose.call_args_list],
+            [
+                ['stop', 'postgres'],
+                ['up', '-d', '--no-deps', 'app'],
+            ],
+        )
+
     def test_dynamic_rebuild_rejects_snapshot_absent_path_that_appeared(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -940,13 +1205,22 @@ class RestoreApplyLifecycleTests(unittest.TestCase):
 
     def test_partial_stop_failure_attempts_to_restore_original_services(self):
         root = Path('/restore')
-        value = {'_dir': '/service', 'service': 'demo'}
+        value = {
+            '_dir': '/service',
+            'service': 'demo',
+            'actions': {'restore': {'on_failure': [{
+                'name': 'notify',
+                'command': ['/usr/bin/true'],
+                'run_as': 'root',
+            }]}},
+        }
         plan = restore_plan.RestorePlan(
             root, {'paths': []}, value, 'existing', (), (), ('one', 'two'), (),
             'demo',
         )
         stop_error = common.CommandError(['docker', 'compose', 'stop'], 1)
         commands = []
+        events = []
 
         def fake_run(_manifest, command, **_kwargs):
             commands.append(command)
@@ -958,10 +1232,21 @@ class RestoreApplyLifecycleTests(unittest.TestCase):
             restore_apply, 'prepare_restore_plan', return_value=plan,
         ), mock.patch.object(
             restore_apply, 'compose_run', side_effect=fake_run,
+        ), mock.patch.object(
+            restore_apply, '_run_restore_actions',
+            side_effect=lambda _plan, _root, phase, **kwargs:
+            events.append((phase, kwargs.get('failure_phase'))),
+        ), mock.patch.object(
+            restore_apply, '_stop_hook_started_services',
+            side_effect=lambda _plan: events.append(('reconcile', None)),
         ), self.assertRaises(common.CommandError) as caught:
             restore_apply.apply_one({}, value, root)
 
         self.assertIs(caught.exception, stop_error)
+        self.assertEqual(events, [
+            ('on_failure', 'stop'),
+            ('reconcile', None),
+        ])
         self.assertTrue(any('up' in command for command in commands))
 
     def test_apply_failure_does_not_restart_services(self):

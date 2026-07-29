@@ -2,7 +2,10 @@ import sys
 from pathlib import Path
 
 from . import capture as _capture
-from .actions import run_before_actions, run_finally_actions
+from .actions import (
+    run_after_actions, run_before_actions, run_finally_actions,
+    warn_legacy_actions,
+)
 from .btrfs_snapshot import cleanup_snapshot_state
 from .capture import _check_backup_space
 from .common import run_cleanup
@@ -138,6 +141,7 @@ def _write_stage_metadata(context, captured, optional_action_failures):
 def stage_service(
         c: GlobalConfig, m: ServiceManifest, *, allow_low_space=False,
 ):
+    warn_legacy_actions(m)
     stage, mode = _prepare_stage(c, m)
     optional_action_failures = []
     try:
@@ -146,6 +150,7 @@ def stage_service(
             c, m, stage, mode, allow_low_space,
         )
         captured = _capture._capture_stage(context)
+        optional_action_failures.extend(run_after_actions(m))
     finally:
         _finish_actions(
             m, optional_action_failures,

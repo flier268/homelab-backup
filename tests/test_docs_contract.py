@@ -40,6 +40,14 @@ class DocsContractTests(unittest.TestCase):
             value['_dir'] = tmp
             self.assertTrue(manifest.validate_manifest(value))
 
+    def test_all_documented_service_examples_are_runtime_valid(self):
+        for source in sorted((ROOT / 'examples').glob('*.backup.yaml')):
+            value = yaml.safe_load(source.read_text(encoding='utf-8'))
+            with self.subTest(source=source.name), tempfile.TemporaryDirectory() as tmp:
+                value['_path'] = str(Path(tmp) / 'backup.yaml')
+                value['_dir'] = tmp
+                self.assertTrue(manifest.validate_manifest(value))
+
     def test_global_fixture_is_accepted_by_runtime_validator(self):
         value = yaml.safe_load((FIXTURES / 'config.yaml').read_text(encoding='utf-8'))
         with tempfile.TemporaryDirectory() as tmp:

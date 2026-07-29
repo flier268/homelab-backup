@@ -21,30 +21,34 @@ consistency:
   timeout: 120
 
 actions:
-  before:
-    # Adjust the service name and RCON command to match the selected image.
-    # Keep passwords in the container's secret/config, never in this argv.
-    - name: save-world
-      command:
-        - /usr/bin/docker
-        - compose
-        - exec
-        - -T
-        - palworld
-        - rcon-cli
-        - Save
-      timeout: 30
-      required: true
-      # Docker socket access is root-equivalent. Prefer direct HTTP/RCON when
-      # the command can run as a less-privileged identity.
-      run_as: root
-  # Optional finalizer, for example to resume writes after staging and snapshot
-  # cleanup. It runs even when before or staging fails.
-  finally: []
-  # These run after the Restic outcome. on_failure receives BACKUPCTL_FAILURE_*
-  # including BACKUPCTL_FAILURE_SERVICE in its local process environment.
-  on_success: []
-  on_failure: []
+  backup:
+    before:
+      # Adjust the service name and RCON command to match the selected image.
+      # Keep passwords in the container's secret/config, never in this argv.
+      - name: save-world
+        command:
+          - /usr/bin/docker
+          - compose
+          - exec
+          - -T
+          - palworld
+          - rcon-cli
+          - Save
+        timeout: 30
+        required: true
+        # Docker socket access is root-equivalent. Prefer direct HTTP/RCON when
+        # the command can run as a less-privileged identity.
+        run_as: root
+    after: []
+    finally: []
+    on_success: []
+    on_failure: []
+  restore:
+    before: []
+    after: []
+    finally: []
+    on_success: []
+    on_failure: []
 
 sources:
   paths:

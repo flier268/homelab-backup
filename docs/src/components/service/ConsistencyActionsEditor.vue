@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import type {
+  ActionDefinition,
+  ActionOperation,
   ActionPhase,
   ConsistencyMode,
   ServiceManifest,
 } from '../../domain/types'
-import StringListEditor from '../shared/StringListEditor.vue'
 import ActionPhaseEditor from './ActionPhaseEditor.vue'
 
 const model = defineModel<ServiceManifest>({ required: true })
@@ -28,7 +29,7 @@ const modes: {
     id: 'hooks',
     title: 'Hooks',
     badge: '應用協調',
-    description: '先執行 before Bash hook，備份後執行 after hook。',
+    description: '由 actions.backup 的 before／finally 協調應用一致性。',
     suitable: 'SQL logical dump、RCON save、應用內建 snapshot。',
   },
   {
@@ -61,26 +62,36 @@ const modes: {
   },
 ]
 
-const phases: { id: ActionPhase; title: string; description: string }[] = [
+const phases: ActionPhase[] = [
+  'before', 'after', 'finally', 'on_success', 'on_failure',
+]
+
+const operations: {
+  id: ActionOperation
+  title: string
+  descriptions: Record<ActionPhase, string>
+}[] = [
   {
-    id: 'before',
-    title: '備份交易前',
-    description: '任何 consistency mode 開始 staging 前執行；必要 action 失敗會中止。',
+    id: 'backup',
+    title: 'Backup',
+    descriptions: {
+      before: '建立 capture context 與擷取來源之前執行。',
+      after: '來源擷取成功後、提交 Restic snapshot 前執行。',
+      finally: '擷取或 after 成敗都會嘗試執行，適合解除 quiesce。',
+      on_success: 'Restic snapshot 已提交且 staging 已清理後執行。',
+      on_failure: '備份失敗後執行，並收到 BACKUPCTL_FAILURE_*。',
+    },
   },
   {
-    id: 'finally',
-    title: '交易清理後',
-    description: '服務恢復、hook after 或 snapshot 清理之後執行；主要流程失敗也會嘗試。',
-  },
-  {
-    id: 'on_success',
-    title: '成功後',
-    description: 'Restic snapshot 已提交，或內容未變而成功略過時執行。',
-  },
-  {
-    id: 'on_failure',
-    title: '失敗後',
-    description: '收到 BACKUPCTL_FAILURE_* 環境變數，可用於安全通知與診斷。',
+    id: 'restore',
+    title: 'Restore',
+    descriptions: {
+      before: '服務停止並通過 preflight 後、修改資料前執行。',
+      after: 'paths、volumes 與控制檔還原後、服務重啟前執行。',
+      finally: '還原或 after 成敗都會嘗試執行。',
+      on_success: '服務狀態協調完成後執行。',
+      on_failure: '失敗後、最終 rollback／服務協調前執行，並收到 BACKUPCTL_FAILURE_*。',
+    },
   },
 ]
 
@@ -88,14 +99,16 @@ function ensureSections(): void {
   model.value.consistency ??= {
     mode: 'stop',
     timeout: 120,
-    before: [],
-    after: [],
   }
   model.value.actions ??= {
-    before: [],
-    finally: [],
-    on_success: [],
-    on_failure: [],
+    backup: {},
+    restore: {},
+  }
+  for (const operation of operations) {
+    model.value.actions[operation.id] ??= {}
+    for (const phase of phases) {
+      model.value.actions[operation.id]![phase] ??= []
+    }
   }
 }
 
@@ -119,15 +132,19 @@ const mode = computed({
       model.value.compose ??= { files: ['compose.yaml'] }
     }
     model.value.consistency!.mode = value
-    if (value !== 'hooks') {
-      model.value.consistency!.before = []
-      model.value.consistency!.after = []
-    }
   },
 })
 
 const consistency = computed(() => model.value.consistency!)
 const actions = computed(() => model.value.actions!)
+
+function setPhase(
+  operation: ActionOperation,
+  phase: ActionPhase,
+  value: ActionDefinition[],
+): void {
+  actions.value[operation]![phase] = value
+}
 </script>
 
 <template>
@@ -178,22 +195,8 @@ const actions = computed(() => model.value.actions!)
       </div>
 
       <div v-if="mode === 'hooks'" class="hooks-grid">
-        <el-form-item label="Before hooks（Bash）">
-          <StringListEditor
-            :model-value="consistency.before ?? []"
-            placeholder="./scripts/dump-database.sh"
-            @update:model-value="consistency.before = $event"
-          />
-        </el-form-item>
-        <el-form-item label="After hooks（Bash）">
-          <StringListEditor
-            :model-value="consistency.after ?? []"
-            placeholder="./scripts/resume-writes.sh"
-            @update:model-value="consistency.after = $event"
-          />
-        </el-form-item>
         <el-alert
-          title="Hooks 由 /bin/bash -euo pipefail -c 執行。before 必須真的停止或隔離所有 writer；required volume 不能由 hook 動態建立。"
+          title="請在 actions.backup.before 建立 logical dump 或隔離 writer，並在 actions.backup.finally 做必要清理。"
           type="warning"
           :closable="false"
           show-icon
@@ -205,36 +208,46 @@ const actions = computed(() => model.value.actions!)
       <div class="section-heading">
         <div>
           <p class="eyebrow">ACTIONS</p>
-          <h2>備份生命週期命令</h2>
+          <h2>Backup／Restore 生命週期命令</h2>
         </div>
       </div>
       <el-alert
-        title="Action 使用 argv 直接執行、不經 shell；root 執行檔及其父目錄必須由 root 擁有、不可被其他人寫入，也不可是 symlink。"
+        title="每個 Action 必須擇一使用安全 argv Command 或 inline Bash Script；名稱須跨操作與階段唯一。"
         type="warning"
         :closable="false"
         show-icon
       />
-      <el-collapse class="actions-collapse" accordion>
-        <el-collapse-item
-          v-for="phase in phases"
-          :key="phase.id"
-          :name="phase.id"
+      <el-tabs>
+        <el-tab-pane
+          v-for="operation in operations"
+          :key="operation.id"
+          :label="operation.title"
+          :name="operation.id"
         >
-          <template #title>
-            <strong>{{ phase.title }}</strong>
-            <el-tag class="phase-count" size="small" effect="plain">
-              {{ actions[phase.id]?.length ?? 0 }}
-            </el-tag>
-          </template>
-          <ActionPhaseEditor
-            :model-value="actions[phase.id] ?? []"
-            :phase="phase.id"
-            :title="phase.title"
-            :description="phase.description"
-            @update:model-value="actions[phase.id] = $event"
-          />
-        </el-collapse-item>
-      </el-collapse>
+          <el-collapse class="actions-collapse" accordion>
+            <el-collapse-item
+              v-for="phase in phases"
+              :key="phase"
+              :name="`${operation.id}.${phase}`"
+            >
+              <template #title>
+                <strong>{{ phase }}</strong>
+                <el-tag class="phase-count" size="small" effect="plain">
+                  {{ actions[operation.id]?.[phase]?.length ?? 0 }}
+                </el-tag>
+              </template>
+              <ActionPhaseEditor
+                :model-value="actions[operation.id]?.[phase] ?? []"
+                :operation="operation.id"
+                :phase="phase"
+                :title="`${operation.title} · ${phase}`"
+                :description="operation.descriptions[phase]"
+                @update:model-value="setPhase(operation.id, phase, $event)"
+              />
+            </el-collapse-item>
+          </el-collapse>
+        </el-tab-pane>
+      </el-tabs>
     </section>
   </div>
 </template>

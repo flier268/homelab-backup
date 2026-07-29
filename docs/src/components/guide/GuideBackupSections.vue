@@ -5,7 +5,7 @@
       <thead><tr><th>模式</th><th>行為</th><th>適用情境</th></tr></thead>
       <tbody>
         <tr><td><code>stop</code></td><td>停止原本運行的 Compose services，完成備份後重啟。</td><td>持續寫入檔案、raw database volume。</td></tr>
-        <tr><td><code>hooks</code></td><td>before hook 產生一致資料，備份後執行 after hook。</td><td>SQL dump、RCON save、應用快照。</td></tr>
+        <tr><td><code>hooks</code></td><td>由 <code>actions.backup.before/finally</code> 產生一致資料並清理。</td><td>SQL dump、RCON save、應用快照。</td></tr>
         <tr><td><code>external</code></td><td>不控制服務，要求 writer 已由外部停止。</td><td>外部編排器已靜止的服務、唯讀資料。</td></tr>
         <tr><td><code>live</code></td><td>直接同步；偵測到 writer 時標成 <code>best-effort</code>。</td><td>可接受 fuzzy copy 的可重建內容。</td></tr>
         <tr><td><code>snapshot</code></td><td>對 Btrfs subvolume 建唯讀 snapshot，其餘來源直接同步。</td><td>需要低停機時間的檔案型服務。</td></tr>
@@ -21,9 +21,17 @@
 # 或
 consistency:
   mode: hooks
-  before:
-    - ./scripts/dump-database.sh
-  after: []</code></pre>
+
+actions:
+  backup:
+    before:
+      - name: dump-database
+        script: |-
+          docker compose exec -T db dump-command > ./backup/db.dump
+        timeout: 600
+        required: true
+        run_as: root
+    finally: []</code></pre>
     <h3>純檔案模式</h3>
     <pre v-pre><code>consistency:
   mode: files
@@ -35,55 +43,48 @@ sources:
   volumes: []</code></pre>
     <p>
       <code>files</code> 不允許 <code>compose</code> 或 Docker volume，也不偵測 writer。
-      可使用 before/finally Actions 協調外部服務；還原只處理 path，不執行 Actions
-      或 <code>--start</code>。
+      可使用 backup／restore Actions 協調外部服務；files mode 不會自行啟停外部
+      服務，也不可使用 <code>--start</code>。
     </p>
-    <h3>備份交易 actions</h3>
+    <h3>統一的 Backup／Restore actions</h3>
     <p>
-      <code>actions.before</code> 與 <code>actions.finally</code> 適用所有模式；
-      <code>on_success</code> 在快照提交或未變略過後執行，
-      <code>on_failure</code> 則在 staging、Restic、cleanup 或 state 失敗時執行。
-      命令以 argv 執行，不經 shell。
+      <code>actions.backup</code> 與 <code>actions.restore</code> 共用
+      before、after、finally、on_success、on_failure 五個 phase。每個 action
+      必須擇一使用不經 shell 的 command argv，或 inline Bash script。
     </p>
     <pre v-pre><code>actions:
-  before:
-    - name: save-palworld
-      command:
-        - /usr/bin/docker
-        - compose
-        - exec
-        - -T
-        - palworld
-        - rcon-cli
-        - Save
-      timeout: 30
-      required: true
-      run_as: root
-  finally:
-    - name: notify-backup-complete
-      command: [/usr/local/bin/notify-backup, complete]
-      timeout: 30
-      required: false
-      run_as: root
-  on_success:
-    - name: notify-success
-      command: [/usr/local/bin/notify-backup, success]
-      timeout: 15
-      required: false
-      run_as: root
-  on_failure:
-    - name: notify-failure
-      command: [/usr/local/bin/notify-backup-failure]
-      timeout: 15
-      required: false
-      run_as: root</code></pre>
+  backup:
+    before:
+      - name: save-palworld
+        command: [/usr/bin/docker, compose, exec, -T, palworld, rcon-cli, Save]
+        timeout: 30
+        required: true
+        run_as: root
+    after: []
+    finally: []
+    on_success: []
+    on_failure: []
+  restore:
+    before: []
+    after:
+      - name: import-database
+        script: |-
+          docker compose up -d db
+          docker compose exec -T db restore-command &lt; ./backup/db.dump
+        timeout: 600
+        required: true
+        run_as: root
+    finally: []
+    on_success: []
+    on_failure: []</code></pre>
     <p>
       每個 action 都要設定 <code>run_as</code>，可用本機帳號或 <code>"UID:GID"</code>。
       相對 executable 會被拒絕；root action 的程式及父目錄必須由 root 擁有且不可由他人寫入。
     </p>
     <div class="box warn">
       Restic 成功後，required on-success action 即使失敗也無法撤回已提交的 snapshot。
-      密碼與 token 不要放入 argv 或 manifest，應使用 root-only 設定或 secret。
+      restore.after 失敗時應用維持停止。密碼與 token 不要放入 argv，應使用
+      root-only 設定或 secret。
     </div>
     <p>
       <code>snapshot</code> 的暫存 subvolume 會放在來源外部、同一 Btrfs filesystem
@@ -213,6 +214,7 @@ sources:
         <tr><td><code>examples/ghost.backup.yaml</code></td><td>同時備份 bind mount 與 MySQL named volume。</td></tr>
         <tr><td><code>examples/palworld.backup.yaml</code></td><td>以 Btrfs snapshot 與 action 實作低停機備份。</td></tr>
         <tr><td><code>examples/files.backup.yaml</code></td><td>不依賴 Docker、使用 Actions 協調外部服務的純檔案備份。</td></tr>
+        <tr><td><code>examples/postgres.backup.yaml</code></td><td>PostgreSQL 線上 logical dump 與自動 pg_restore。</td></tr>
       </tbody>
     </table>
     <div class="box warn">資料庫建議用 <code>hooks</code> 產生 logical dump；若備份 raw volume，還原環境應使用相同產品與 major version。</div>

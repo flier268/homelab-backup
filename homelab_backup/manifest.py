@@ -353,56 +353,111 @@ def _validate_consistency(m, path):
             )
 
 
+def _validate_action_definition(action, field, seen):
+    if not isinstance(action, dict):
+        raise ValueError(f'{field} must be a mapping')
+    unknown_action = sorted(
+        set(action) - {
+            'name', 'command', 'script', 'timeout', 'required', 'run_as',
+        }
+    )
+    if unknown_action:
+        raise ValueError(f'{field} has unsupported fields: {unknown_action}')
+    name = action.get('name')
+    if not isinstance(name, str) or not name:
+        raise ValueError(f'{field}.name must be a non-empty string')
+    if name in seen:
+        raise ValueError(f'duplicate action name {name!r}')
+    seen.add(name)
+    validate_identity(action.get('run_as'), f'{field}.run_as')
+    command = action.get('command')
+    script = action.get('script')
+    if (command is None) == (script is None):
+        raise ValueError(
+            f'{field} must define exactly one of command or script'
+        )
+    if command is not None and (
+            not isinstance(command, list) or not command or not all(
+                isinstance(item, str) and item for item in command
+            )
+    ):
+        raise ValueError(
+            f'{field}.command must be a non-empty list of non-empty strings'
+        )
+    if script is not None and (not isinstance(script, str) or not script):
+        raise ValueError(f'{field}.script must be a non-empty string')
+    timeout = action.get('timeout', 30)
+    if type(timeout) is not int or timeout <= 0:
+        raise ValueError(
+            f'{field}.timeout must be an integer greater than zero'
+        )
+    if not isinstance(action.get('required', True), bool):
+        raise ValueError(f'{field}.required must be boolean')
+
+
 def _validate_actions(m, path):
     actions = m.get('actions')
     if actions is None:
         return
     if not isinstance(actions, dict):
         raise ValueError(f'{path}: actions must be a mapping')
-    phases = ('before', 'finally', 'on_success', 'on_failure')
-    unknown = sorted(set(actions) - set(phases))
+    operations = ('backup', 'restore')
+    phases = ('before', 'after', 'finally', 'on_success', 'on_failure')
+    legacy_phases = ('before', 'finally', 'on_success', 'on_failure')
+    nested = any(key in actions for key in operations)
+    legacy = any(key in actions for key in legacy_phases)
+    if nested and legacy:
+        raise ValueError(
+            f'{path}: nested backup/restore actions cannot be mixed with '
+            'legacy flat actions'
+        )
+    allowed = operations if nested else legacy_phases
+    unknown = sorted(set(actions) - set(allowed))
     if unknown:
         raise ValueError(f'{path}: unsupported actions fields: {unknown}')
+    consistency = m.get('consistency') or {}
+    if nested and ('before' in consistency or 'after' in consistency):
+        raise ValueError(
+            f'{path}: nested actions cannot be mixed with '
+            'consistency.before/after hooks'
+        )
     seen = set()
-    for phase in phases:
-        entries = actions.get(phase, [])
-        if not isinstance(entries, list):
-            raise ValueError(f'{path}: actions.{phase} must be a list')
-        for index, action in enumerate(entries):
-            field = f'{path}: actions.{phase}[{index}]'
-            if not isinstance(action, dict):
-                raise ValueError(f'{field} must be a mapping')
-            unknown_action = sorted(
-                set(action) - {
-                    'name', 'command', 'timeout', 'required',
-                    'run_as',
-                }
+    sections = (
+        (
+            (
+                operation,
+                actions[operation] if operation in actions else {},
             )
-            if unknown_action:
-                raise ValueError(f'{field} has unsupported fields: {unknown_action}')
-            name = action.get('name')
-            if not isinstance(name, str) or not name:
-                raise ValueError(f'{field}.name must be a non-empty string')
-            if name in seen:
+            for operation in operations
+        )
+        if nested else
+        (('', actions),)
+    )
+    for operation, section in sections:
+        if not isinstance(section, dict):
+            raise ValueError(f'{path}: actions.{operation} must be a mapping')
+        operation_phases = phases if nested else legacy_phases
+        unknown_phases = sorted(set(section) - set(operation_phases))
+        if unknown_phases:
+            prefix = f'actions.{operation}' if operation else 'actions'
+            raise ValueError(
+                f'{path}: unsupported {prefix} fields: {unknown_phases}'
+            )
+        for phase in operation_phases:
+            entries = section.get(phase, [])
+            prefix = f'{operation}.' if operation else ''
+            if not isinstance(entries, list):
                 raise ValueError(
-                    f'{path}: duplicate action name {name!r}'
+                    f'{path}: actions.{prefix}{phase} must be a list'
                 )
-            seen.add(name)
-            validate_identity(action.get('run_as'), f'{field}.run_as')
-            command = action.get('command')
-            if not isinstance(command, list) or not command or not all(
-                isinstance(item, str) and item for item in command
-            ):
-                raise ValueError(
-                    f'{field}.command must be a non-empty list of non-empty strings'
-                )
-            timeout = action.get('timeout', 30)
-            if type(timeout) is not int or timeout <= 0:
-                raise ValueError(
-                    f'{field}.timeout must be an integer greater than zero'
-                )
-            if not isinstance(action.get('required', True), bool):
-                raise ValueError(f'{field}.required must be boolean')
+            for index, action in enumerate(entries):
+                field = f'{path}: actions.{prefix}{phase}[{index}]'
+                try:
+                    _validate_action_definition(action, field, seen)
+                except ValueError as err:
+                    if str(err).startswith('duplicate action name'):
+                        raise ValueError(f'{path}: {err}') from err
+                    raise
 
 
 def _validate_compose(m, path):

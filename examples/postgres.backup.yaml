@@ -1,0 +1,82 @@
+version: 1
+service: erp
+name: ERP
+enabled: true
+
+schedule:
+  cron: "15 3 * * *"
+  retry_after: 30m
+  max_lateness: 3h
+
+retention:
+  keep_last: 8
+  keep_daily: 14
+  keep_weekly: 8
+  keep_monthly: 12
+  keep_yearly: 3
+
+compose:
+  files: [compose.yml]
+  env_file: .env
+
+consistency:
+  mode: hooks
+  timeout: 120
+
+actions:
+  backup:
+    before:
+      - name: postgres-dump
+        script: |-
+          dump_dir="./backup-dumps"
+          tmp_dump="$dump_dir/postgres.dump.tmp"
+          final_dump="$dump_dir/postgres.dump"
+          install -d -m 0700 -- "$dump_dir"
+          rm -f -- "$tmp_dump"
+          trap 'rm -f -- "$tmp_dump"' EXIT
+          docker compose --env-file .env -f compose.yml exec -T postgres \
+            sh -c 'exec pg_dump --format=custom --no-owner \
+              --username="$POSTGRES_USER" --dbname="$POSTGRES_DB"' \
+            > "$tmp_dump"
+          test -s "$tmp_dump"
+          chmod 0600 "$tmp_dump"
+          mv -f -- "$tmp_dump" "$final_dump"
+          trap - EXIT
+        timeout: 3600
+        required: true
+        run_as: root
+    after: []
+    finally: []
+    on_success: []
+    on_failure: []
+  restore:
+    before: []
+    after:
+      - name: postgres-restore
+        script: |-
+          docker compose --env-file .env -f compose.yml up -d postgres
+          docker compose --env-file .env -f compose.yml exec -T postgres \
+            sh -c 'exec pg_restore --clean --if-exists --no-owner \
+              --exit-on-error --username="$POSTGRES_USER" \
+              --dbname="$POSTGRES_DB"' \
+            < ./backup-dumps/postgres.dump
+        timeout: 3600
+        required: true
+        run_as: root
+    finally: []
+    on_success: []
+    on_failure: []
+
+sources:
+  paths:
+    - id: compose
+      path: compose.yml
+    - id: project-env
+      path: .env
+    - id: runtime-env
+      path: ./env
+    - id: caddyfile
+      path: Caddyfile.cloudflared
+    - id: postgres-dump
+      path: ./backup-dumps
+  volumes: []

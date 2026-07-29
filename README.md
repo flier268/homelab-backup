@@ -24,8 +24,8 @@ Docker Compose 服務的 Restic + OneDrive 備份工具。
 
 專案提供 Vue 3 + Element Plus 的離線設定檔編輯器，可建立或匯入全域
 `config.yaml` 與服務 `backup.yaml`。服務編輯器包含 Cron、retention、五種
-一致性模式、path／volume sources、hooks，以及 before、finally、on-success、
-on-failure actions 的欄位與安全說明。
+一致性模式、path／volume sources，以及統一的 backup／restore 五階段
+actions、inline Bash 與安全說明。
 
 編輯器會產生一段可在服務根目錄執行的 `python3` 清單命令。命令輸出版本化
 JSON Lines，不依賴 `ls` 的語系格式，並可安全表示空白、Unicode、tab 與換行；
@@ -213,7 +213,9 @@ timestamped 密文。
     files: [compose.yaml]
     env_file: compose.env
   ```
-- Actions 不經 shell，必須指定 `run_as`，且不可把密碼或 token 放入 argv。
+- Actions 依 `actions.backup`／`actions.restore` 分組；每項必須擇一使用不經
+  shell 的 `command` argv，或由 `/bin/bash -euo pipefail -c` 執行的 inline
+  `script`，並指定 `run_as`。密碼或 token 不可放入 argv。
   完整欄位、writer 判定與 Btrfs 限制請見 `GUIDE.html`。
 
 從預設加密檔放回系統，依提示貼入 SSH 私鑰並解密：
@@ -257,18 +259,19 @@ consistency:
   mode: files
 
 actions:
-  before:
-    - name: quiesce-service
-      command: [/usr/local/sbin/example-backup-quiesce]
-      timeout: 60
-      required: true
-      run_as: root
-  finally:
-    - name: resume-service
-      command: [/usr/local/sbin/example-backup-resume]
-      timeout: 60
-      required: true
-      run_as: root
+  backup:
+    before:
+      - name: quiesce-service
+        command: [/usr/local/sbin/example-backup-quiesce]
+        timeout: 60
+        required: true
+        run_as: root
+    finally:
+      - name: resume-service
+        command: [/usr/local/sbin/example-backup-resume]
+        timeout: 60
+        required: true
+        run_as: root
 
 sources:
   paths:
@@ -278,9 +281,9 @@ sources:
 ```
 
 `files` 禁止 `compose` 與 Docker volume，不執行 Docker writer 偵測。Actions
-仍依一般備份生命週期執行，但 inventory 一律保守標示為 `best-effort`。還原只處理
-path，不會執行 Actions 或啟停外部服務，且不可搭配 `--start`。若 Actions
-用於暫停外部服務，協調命令應記錄服務原始狀態，並只恢復備份前原本運行的服務。
+仍依各自的 backup／restore 生命週期執行，但 inventory 一律保守標示為
+`best-effort`。Files mode 不啟停外部服務且不可搭配 `--start`；若 actions
+協調外部服務，命令必須自行保存並恢復原始狀態。
 安裝程序仍會使用 Docker 建置 volume helper image；完成安裝後，只有 `files`
 manifests 的備份、驗證、排程與還原不需要 Docker daemon。
 
@@ -313,6 +316,16 @@ sudo backupctl restore --all \
 還原前會列出完整 plan，包含每個 path target、Docker volume 與
 existing/rebuild mode。`--yes` 只確認執行，不授權新路徑，也不會略過空間保護。
 現有部署必須通過本機 manifest 交叉驗證；snapshot manifest 不能改寫目標。
+
+只有實際 `restore --apply` 或 `backupctl apply` 會執行
+`actions.restore`；只下載 snapshot 不執行。固定順序為
+`before → 還原資料 → after → finally → 恢復服務 → on_success`，失敗則在
+`finally` 後執行 `on_failure`，再停止 action 額外啟動的 containers 並完成
+rollback／服務狀態協調。資料已寫回後若 required action 失敗，Compose 應用
+維持停止，避免以半還原狀態重新接受寫入。
+
+PostgreSQL 不停機 logical dump 與自動 `pg_restore` 的完整設定見
+`examples/postgres.backup.yaml`。
 
 全新服務必須使用兩階段流程。先只下載，審核 `_meta/backup.yaml`，再將它以
 root-only 權限安裝到 `services_root` 下的預定服務目錄：

@@ -43,7 +43,15 @@ class ExceptionNoteCompatibilityTests(unittest.TestCase):
 
 
 class GhostHookExampleTests(unittest.TestCase):
-    def test_hooks_restore_only_services_that_were_running(self):
+    @staticmethod
+    def example():
+        return common.load_yaml(
+            Path(__file__).resolve().parents[1]
+            / 'examples'
+            / 'ghost.backup.yaml'
+        )
+
+    def test_backup_creates_live_transactional_dump_without_stopping_services(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             service_dir = root / 'ghost'
@@ -55,37 +63,101 @@ class GhostHookExampleTests(unittest.TestCase):
             docker.write_text(
                 '#!/bin/sh\n'
                 'printf "%s\\n" "$*" >> "$DOCKER_LOG"\n'
-                'if [ "$1 $2" = "compose ps" ]; then\n'
-                '  printf "web\\ndb\\n"\n'
+                'if [ "$1 $2" = "compose exec" ]; then\n'
+                '  printf "CREATE TABLE live_dump (id INT);\\n"\n'
                 'fi\n',
                 encoding='utf-8',
             )
             docker.chmod(0o755)
-            example = common.load_yaml(
-                Path(__file__).resolve().parents[1] / 'examples' / 'ghost.backup.yaml'
-            )
-            state_dir = root / 'hook-state'
+            example = self.example()
             environment = os.environ.copy()
             environment.update({
                 'PATH': f'{bin_dir}:{environment["PATH"]}',
                 'DOCKER_LOG': str(log),
-                'BACKUPCTL_HOOK_STATE_DIR': str(state_dir),
             })
 
-            for hook_name in ('before', 'after'):
-                common.run(
-                    ['/bin/bash', '-euo', 'pipefail', '-c',
-                     example['consistency'][hook_name][0]],
-                    cwd=service_dir,
-                    env=environment,
-                )
+            common.run(
+                ['/bin/bash', '-euo', 'pipefail', '-c',
+                 example['actions']['backup']['before'][0]['script']],
+                cwd=service_dir,
+                env=environment,
+            )
 
-            commands = log.read_text(encoding='utf-8').splitlines()
-            self.assertIn('compose stop web db', commands)
-            self.assertIn('compose start web db', commands)
-            self.assertFalse((state_dir / 'ghost.running-services').exists())
+            commands = log.read_text(encoding='utf-8')
+            self.assertIn('compose exec -T db sh -c', commands)
+            self.assertIn('--single-transaction', commands)
+            self.assertIn('--quick', commands)
+            self.assertIn('--skip-lock-tables', commands)
+            self.assertNotIn('compose stop', commands)
+            self.assertNotIn('compose start', commands)
+            self.assertEqual(
+                (service_dir / 'backup-dumps' / 'ghost.sql').read_text(
+                    encoding='utf-8'
+                ),
+                'CREATE TABLE live_dump (id INT);\n',
+            )
+            self.assertFalse(
+                (service_dir / 'backup-dumps' / 'ghost.sql.tmp').exists()
+            )
+            self.assertEqual(
+                (service_dir / 'backup-dumps' / 'ghost.sql').stat().st_mode
+                & 0o777,
+                0o600,
+            )
 
-    def test_failed_dump_does_not_start_services_that_were_never_stopped(self):
+    def test_restore_starts_database_and_imports_restored_dump(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service_dir = root / 'ghost'
+            dump_dir = service_dir / 'backup-dumps'
+            dump_dir.mkdir(parents=True)
+            (dump_dir / 'ghost.sql').write_text(
+                'CREATE TABLE restored (id INT);\n',
+                encoding='utf-8',
+            )
+            bin_dir = root / 'bin'
+            bin_dir.mkdir()
+            log = root / 'docker.log'
+            docker = bin_dir / 'docker'
+            docker.write_text(
+                '#!/bin/sh\n'
+                'printf "%s\\n" "$*" >> "$DOCKER_LOG"\n'
+                'if [ "$1 $2" = "compose exec" ]; then\n'
+                '  cat > "$DOCKER_STDIN"\n'
+                'fi\n',
+                encoding='utf-8',
+            )
+            docker.chmod(0o755)
+            stdin_capture = root / 'docker.stdin'
+            environment = os.environ.copy()
+            environment.update({
+                'PATH': f'{bin_dir}:{environment["PATH"]}',
+                'DOCKER_LOG': str(log),
+                'DOCKER_STDIN': str(stdin_capture),
+            })
+            action = self.example()['actions']['restore']['after'][0]
+
+            common.run(
+                ['/bin/bash', '-euo', 'pipefail', '-c', action['script']],
+                cwd=service_dir,
+                env=environment,
+            )
+
+            commands = log.read_text(encoding='utf-8')
+            self.assertIn(
+                'compose up --wait --wait-timeout 180 db',
+                commands,
+            )
+            self.assertIn('compose exec -T db sh -c', commands)
+            self.assertIn('mysqladmin ping', commands)
+            self.assertIn('drop "$MYSQL_DATABASE"', commands)
+            self.assertIn('create "$MYSQL_DATABASE"', commands)
+            self.assertEqual(
+                stdin_capture.read_text(encoding='utf-8'),
+                'CREATE TABLE restored (id INT);\n',
+            )
+
+    def test_failed_live_dump_removes_partial_file_without_stopping_services(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             service_dir = root / 'ghost'
@@ -97,44 +169,38 @@ class GhostHookExampleTests(unittest.TestCase):
             docker.write_text(
                 '#!/bin/sh\n'
                 'printf "%s\\n" "$*" >> "$DOCKER_LOG"\n'
-                'if [ "$1 $2" = "compose ps" ]; then\n'
-                '  printf "web\\n"\n'
-                '  exit 0\n'
-                'fi\n'
                 'if [ "$1 $2" = "compose exec" ]; then\n'
+                '  printf "partial dump\\n"\n'
                 '  exit 1\n'
                 'fi\n'
                 'exit 0\n',
                 encoding='utf-8',
             )
             docker.chmod(0o755)
-            example = common.load_yaml(
-                Path(__file__).resolve().parents[1] / 'examples' / 'ghost.backup.yaml'
-            )
+            example = self.example()
             environment = os.environ.copy()
             environment.update({
                 'PATH': f'{bin_dir}:{environment["PATH"]}',
                 'DOCKER_LOG': str(log),
-                'BACKUPCTL_HOOK_STATE_DIR': str(root / 'hook-state'),
             })
 
             with self.assertRaises(common.CommandError):
                 common.run(
-                    ['/bin/bash', '-euo', 'pipefail', '-c',
-                     example['consistency']['before'][0]],
+                     ['/bin/bash', '-euo', 'pipefail', '-c',
+                     example['actions']['backup']['before'][0]['script']],
                     cwd=service_dir,
                     env=environment,
                 )
-            common.run(
-                ['/bin/bash', '-euo', 'pipefail', '-c',
-                 example['consistency']['after'][0]],
-                cwd=service_dir,
-                env=environment,
-            )
 
-            commands = log.read_text(encoding='utf-8').splitlines()
-            self.assertFalse(any('compose stop' in item for item in commands))
-            self.assertFalse(any('compose start' in item for item in commands))
+            commands = log.read_text(encoding='utf-8')
+            self.assertNotIn('compose stop', commands)
+            self.assertNotIn('compose start', commands)
+            self.assertFalse(
+                (service_dir / 'backup-dumps' / 'ghost.sql').exists()
+            )
+            self.assertFalse(
+                (service_dir / 'backup-dumps' / 'ghost.sql.tmp').exists()
+            )
 
 
 class ValidationDiagnosticTests(unittest.TestCase):

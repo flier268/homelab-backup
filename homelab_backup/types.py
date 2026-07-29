@@ -55,19 +55,27 @@ class ConsistencyConfig(TypedDict, total=False):
     after: list[str]
 
 
-class BeforeAction(TypedDict, total=False):
+class ActionDefinition(TypedDict, total=False):
     name: str
     command: list[str]
+    script: str
     timeout: int
     required: bool
     run_as: str
 
 
+OperationActions = TypedDict('OperationActions', {
+    'before': list[ActionDefinition],
+    'after': list[ActionDefinition],
+    'finally': list[ActionDefinition],
+    'on_success': list[ActionDefinition],
+    'on_failure': list[ActionDefinition],
+}, total=False)
+
+
 ActionsConfig = TypedDict('ActionsConfig', {
-    'before': list[BeforeAction],
-    'finally': list[BeforeAction],
-    'on_success': list[BeforeAction],
-    'on_failure': list[BeforeAction],
+    'backup': OperationActions,
+    'restore': OperationActions,
 }, total=False)
 
 

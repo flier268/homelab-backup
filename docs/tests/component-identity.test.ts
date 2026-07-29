@@ -38,6 +38,7 @@ describe('editable collection identity', () => {
     const wrapper = mount(ActionPhaseEditor, {
       props: {
         modelValue: actions,
+        operation: 'backup',
         phase: 'before',
         title: '備份前',
         description: '測試',

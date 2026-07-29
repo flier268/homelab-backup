@@ -334,6 +334,88 @@ class ManifestValidationTests(unittest.TestCase):
                         manifest(root, actions=actions),
                     )
 
+    def test_nested_backup_restore_actions_support_command_and_script(self):
+        actions = {
+            'backup': {
+                'before': [{
+                    'name': 'dump', 'script': 'echo dump',
+                    'timeout': 60, 'required': True, 'run_as': 'root',
+                }],
+                'after': [],
+                'finally': [],
+                'on_success': [],
+                'on_failure': [],
+            },
+            'restore': {
+                'after': [{
+                    'name': 'import', 'command': ['/usr/bin/true'],
+                    'run_as': 'root',
+                }],
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertTrue(manifest_module.validate_manifest(
+                manifest(Path(tmp), actions=actions),
+            ))
+
+    def test_nested_actions_reject_mixed_shapes_and_ambiguous_execution(self):
+        invalid = (
+            {
+                'backup': {},
+                'before': [],
+            },
+            {
+                'backup': {'before': [{
+                    'name': 'missing-execution', 'run_as': 'root',
+                }]},
+            },
+            {
+                'backup': {'before': [{
+                    'name': 'ambiguous', 'command': ['/usr/bin/true'],
+                    'script': 'true', 'run_as': 'root',
+                }]},
+            },
+            {
+                'backup': {'before': [{
+                    'name': 'same', 'command': ['/usr/bin/true'],
+                    'run_as': 'root',
+                }]},
+                'restore': {'after': [{
+                    'name': 'same', 'script': 'true', 'run_as': 'root',
+                }]},
+            },
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for actions in invalid:
+                with self.subTest(actions=actions), self.assertRaises(ValueError):
+                    manifest_module.validate_manifest(
+                        manifest(root, actions=actions),
+                    )
+
+    def test_nested_actions_reject_falsy_non_mapping_operations(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for section in (None, [], '', 0, False):
+                with self.subTest(section=section), self.assertRaisesRegex(
+                        ValueError, 'actions.backup must be a mapping',
+                ):
+                    manifest_module.validate_manifest(
+                        manifest(root, actions={'backup': section}),
+                    )
+
+    def test_nested_actions_reject_legacy_consistency_hooks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            value = manifest(
+                Path(tmp),
+                consistency={
+                    'mode': 'hooks', 'before': ['true'], 'after': [],
+                },
+                actions={'backup': {'before': []}},
+            )
+            with self.assertRaisesRegex(ValueError, 'cannot be mixed'):
+                manifest_module.validate_manifest(value)
+
     def test_execution_section_is_not_supported(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

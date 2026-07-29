@@ -19,7 +19,9 @@ const emit = defineEmits<{
   sectionChange: [section: EditorSection]
 }>()
 
-const { document, importError, issues, yaml, create, importYaml } = useEditorWorkspace()
+const {
+  document, importError, importWarning, issues, yaml, create, importYaml,
+} = useEditorWorkspace()
 const activeServiceTab = ref<Exclude<EditorSection, 'global'>>('overview')
 const yamlInput = ref<HTMLInputElement>()
 
@@ -140,6 +142,14 @@ async function importYamlFile(event: Event): Promise<void> {
       class="page-alert"
       :title="importError"
       type="error"
+      :closable="false"
+      show-icon
+    />
+    <el-alert
+      v-if="importWarning"
+      class="page-alert"
+      :title="importWarning"
+      type="warning"
       :closable="false"
       show-icon
     />

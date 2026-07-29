@@ -17,19 +17,30 @@ compose:
 consistency:
   mode: stop
   timeout: 120
-  before: []
-  after: []
 actions:
-  before:
-    - name: prepare
-      command:
-        - /usr/bin/true
-      timeout: 30
-      required: true
-      run_as: root
-  finally: []
-  on_success: []
-  on_failure: []
+  backup:
+    before:
+      - name: prepare
+        command:
+          - /usr/bin/true
+        timeout: 30
+        required: true
+        run_as: root
+    after: []
+    finally: []
+    on_success: []
+    on_failure: []
+  restore:
+    before: []
+    after:
+      - name: restore-check
+        script: test -d .
+        timeout: 30
+        required: true
+        run_as: root
+    finally: []
+    on_success: []
+    on_failure: []
 sources:
   paths:
     - id: data
