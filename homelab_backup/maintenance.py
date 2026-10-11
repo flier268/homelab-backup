@@ -1,3 +1,4 @@
+import copy
 import datetime as dt
 import hashlib
 import json
@@ -199,13 +200,13 @@ def _notify_status(c, now, stale, lock_alert, lock_holder, status_errors):
         return
     lines = [
         f"{service}: last success {state.get('last_success_at') or 'never'}"
-        f"; last error {state.get('last_error') or '-'}"
+        f"; last error {_first_line(state.get('last_error') or '-')}"
         for service, state, _ in stale
     ]
     if lock_alert:
         lines.append(lock_alert)
     lines.extend(
-        f'status error: {operation}: {error}'
+        f'status error: {operation}: {_first_line(error)}'
         for operation, error in status_errors
     )
     title = _status_title(stale, lock_alert, status_errors)
@@ -278,6 +279,9 @@ def cmd_status(c, args):
     failures.raise_if_any('STATUS FAILURES')
     if stale or lock_alert:
         raise SystemExit(STALE_EXIT_CODE)
+    # A clean status run resets the unit's throttle, so the next status
+    # failure is pushed immediately.
+    _clear_unit_alert(c, STATUS_UNIT)
 
 
 BACKUP_UNIT = 'homelab-backup.service'
@@ -285,6 +289,17 @@ MAINTENANCE_UNIT = 'homelab-backup-maintenance.service'
 CHECK_UNIT = 'homelab-backup-check.service'
 STATUS_UNIT = 'homelab-backup-status.service'
 STATUS_HANDLED_WINDOW = dt.timedelta(minutes=20)
+RUN_DUE_HANDOFF_WINDOW = dt.timedelta(minutes=20)
+CRASH_QUIET_PERIOD = dt.timedelta(hours=1)
+ERROR_LINE_LIMIT = 200
+JOURNAL_TAIL_LIMIT = 3000
+
+
+def _first_line(error, limit=ERROR_LINE_LIMIT):
+    """First non-empty line of an error, truncated for notification bodies."""
+    lines = [line.strip() for line in str(error).splitlines() if line.strip()]
+    line = lines[0] if lines else '-'
+    return line if len(line) <= limit else line[:limit - 1] + '…'
 
 
 def print_unit_failure_alert(unit):
@@ -298,23 +313,94 @@ def _unit_record(alert_state, unit):
 
 
 def _update_unit_record(c, unit, update):
-    """Apply ``update(record)`` to ``units[unit]`` under the alert lock."""
+    """Apply ``update(record)`` to ``units[unit]`` under the alert lock.
+
+    A record left empty is removed.
+    """
     with alert_state_transaction(c) as alert_state:
         units = alert_state.get('units')
         units = units if isinstance(units, dict) else {}
         record = units.get(unit)
-        record = dict(record) if isinstance(record, dict) else {}
+        record = copy.deepcopy(record) if isinstance(record, dict) else {}
         update(record)
-        units[unit] = record
-        alert_state['units'] = units
+        if record:
+            units[unit] = record
+        else:
+            units.pop(unit, None)
+        if units or 'units' in alert_state:
+            alert_state['units'] = units
 
 
-def _record_unit_failures(c, unit, failures):
-    """Remember which operations failed so a changed set re-notifies."""
-    signature = sorted({str(operation) for operation, _ in failures.items})
-    _update_unit_record(
-        c, unit, lambda record: record.update(failure_signature=signature),
-    )
+def _record_dict(record, key):
+    value = record.get(key)
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _record_run_due(c, now, attempted, failures, known_services):
+    """Per-service alert bookkeeping at the end of a completed run-due.
+
+    A successful backup removes only that service's throttle entry; services
+    not attempted this round keep theirs. ``known_services`` (None when some
+    manifest failed to load) lets entries of removed services be dropped.
+    The failed set is stored with this run's INVOCATION_ID so notify-failure
+    can tell it apart from a stale record of an older run. A crash entry is
+    cleared only by a round that attempted a backup with no failures, once
+    the crash has not been seen for CRASH_QUIET_PERIOD, so an intermittent
+    crash between good rounds stays throttled; "No backups are due" proves
+    nothing.
+    """
+    failed = {}
+    for operation, error in failures.items:
+        failed.setdefault(str(operation), _first_line(error))
+    succeeded = set(attempted) - set(failed)
+    if not failed and not _unit_record(load_alert_state(c), BACKUP_UNIT):
+        return
+
+    def update(record):
+        # Whole-unit throttle fields from older releases.
+        for legacy in ('failure_signature', 'notified_signature', 'notified_at'):
+            record.pop(legacy, None)
+        services = _record_dict(record, 'services')
+        for name in list(services):
+            if name in succeeded or (
+                known_services is not None
+                and name not in known_services and name not in failed
+            ):
+                services.pop(name)
+        if services:
+            record['services'] = services
+        else:
+            record.pop('services', None)
+        crashes = _record_dict(record, 'crashes')
+        if attempted and not failed:
+            for key in [k for k, v in crashes.items() if _crash_quiet(v, now)]:
+                crashes.pop(key)
+        if crashes:
+            record['crashes'] = crashes
+        else:
+            record.pop('crashes', None)
+        if failed:
+            record['run'] = {
+                'invocation_id': os.environ.get('INVOCATION_ID'),
+                'completed_at': now.isoformat(),
+                'failures': failed,
+            }
+        else:
+            record.pop('run', None)
+            record.pop('last_failure_at', None)
+
+    _update_unit_record(c, BACKUP_UNIT, update)
+
+
+def _crash_quiet(entry, now):
+    """True when a crash entry was last seen CRASH_QUIET_PERIOD ago or more."""
+    if not isinstance(entry, dict):
+        return True
+    # Entries from older releases only carry notified_at.
+    last_seen = parse_timestamp(entry.get('last_seen_at') or entry.get('notified_at'))
+    if last_seen is None:
+        return True
+    return last_seen <= now and now - last_seen >= CRASH_QUIET_PERIOD
 
 
 def _clear_unit_alert(c, unit):
@@ -335,12 +421,12 @@ def _status_handled_failed_run(alert_state, record, now):
     handled_at = parse_timestamp(status.get('handled_at'))
     if handled_at is None or handled_at > now:
         return False
-    handled_id = status.get('invocation_id')
-    # systemd >= 251 passes the failed run's id to OnFailure= units.
+    # systemd >= 251 passes the failed run's id to OnFailure= units; a
+    # record without an id then cannot be proven to belong to this run.
     failed_id = os.environ.get('MONITOR_INVOCATION_ID')
-    if handled_id and failed_id:
-        return handled_id == failed_id
-    # Without both ids, only a recent record that no earlier notify-failure
+    if failed_id:
+        return status.get('invocation_id') == failed_id
+    # Without the id, only a recent record that no earlier notify-failure
     # has already consumed can belong to this failure.
     if now - handled_at > STATUS_HANDLED_WINDOW:
         return False
@@ -351,61 +437,184 @@ def _status_handled_failed_run(alert_state, record, now):
 def cmd_notify_failure(c, args):
     """Entry point for systemd OnFailure= (homelab-backup-notify@.service).
 
-    The ALERT line always reaches the journal. The push is throttled per unit
-    by alert.renotify_after while the recorded failure signature (the failed
-    services of run-due) is unchanged; a successful run clears the record. A
-    failed status run whose problem ``status --notify`` already handled is
-    not pushed again; status' own errors always are.
+    The ALERT line always reaches the journal. run-due failures are throttled
+    per service (see ``_notify_run_due_failure``); other units by
+    alert.renotify_after per unit, and their successful run clears the
+    record. A failed status run whose problem ``status --notify`` already
+    handled is not pushed again; status' own errors always are.
     """
     unit = args.unit
     if getattr(args, 'alert_printed', False) is not True:
         print_unit_failure_alert(unit)
     now = local_now()
+    if unit == BACKUP_UNIT:
+        _notify_run_due_failure(c, now)
+        return
     alert_state = load_alert_state(c)
     record = _unit_record(alert_state, unit)
-    signature = record.get('failure_signature')
     delivered = False
     if unit == STATUS_UNIT and _status_handled_failed_run(alert_state, record, now):
         print(
             'status already handled this problem; not pushing it again',
             file=sys.stderr,
         )
-    elif notified_within(record, c, now) \
-            and record.get('notified_signature') == signature:
+    elif notified_within(record, c, now):
         print(
             f"{unit} failure already notified at {record['notified_at']}; "
             'not pushing again before alert.renotify_after',
             file=sys.stderr,
         )
     else:
-        delivered = _push_unit_failure(c, unit, signature)
+        delivered = _push_unit_failure(c, unit, f'{unit} failed', '')
 
     def update(current):
         current['last_failure_at'] = now.isoformat()
         if delivered:
             current['notified_at'] = now.isoformat()
-            current.pop('notified_signature', None)
-            if signature is not None:
-                current['notified_signature'] = signature
 
     _update_unit_record(c, unit, update)
 
 
-def _push_unit_failure(c, unit, signature):
-    detail = ''
+def _monitor_result():
+    """The failed run's result as passed by systemd >= 251 to OnFailure=."""
+    result = os.environ.get('MONITOR_SERVICE_RESULT') or 'unknown'
+    details = [
+        f'{name}={value}' for name, value in (
+            ('result', result),
+            ('exit_code', os.environ.get('MONITOR_EXIT_CODE')),
+            ('exit_status', os.environ.get('MONITOR_EXIT_STATUS')),
+        ) if value
+    ]
+    return result, ', '.join(details)
+
+
+def _trusted_run_due_record(record, now):
+    """The run-due failure record written by the run that failed, or None.
+
+    With MONITOR_INVOCATION_ID (systemd >= 251) the ids must match. Without
+    it, only a recent record that no earlier notify-failure consumed counts.
+    """
+    run_record = record.get('run')
+    if not isinstance(run_record, dict) \
+            or not isinstance(run_record.get('failures'), dict) \
+            or not run_record['failures']:
+        return None
+    failed_id = os.environ.get('MONITOR_INVOCATION_ID')
+    if failed_id:
+        return run_record if run_record.get('invocation_id') == failed_id else None
+    completed = parse_timestamp(run_record.get('completed_at'))
+    if completed is None or completed > now \
+            or now - completed > RUN_DUE_HANDOFF_WINDOW:
+        return None
+    last_failure = parse_timestamp(record.get('last_failure_at'))
+    if last_failure is not None and last_failure >= completed:
+        return None
+    return run_record
+
+
+def _notify_run_due_failure(c, now):
+    """Push run-due failures per service, or a crash without bookkeeping.
+
+    A failed service is pushed when it newly enters failure or its last push
+    is older than alert.renotify_after; one push lists every such service.
+    When run-due did not finish its bookkeeping (crash, timeout, OOM, kill,
+    config error) the failure is pushed as ``crash:<result>``, throttled per
+    result type by its last push. Every crash, pushed or not, refreshes the
+    entry's last_seen_at, which ``_record_run_due`` uses to clear it.
+    """
+    record = _unit_record(load_alert_state(c), BACKUP_UNIT)
+    run_record = _trusted_run_due_record(record, now)
+    delivered = False
+    if run_record is not None:
+        failed = {
+            str(name): str(error) for name, error in run_record['failures'].items()
+        }
+        services = _record_dict(record, 'services')
+        pending = sorted(
+            name for name in failed
+            if not notified_within(services.get(name), c, now)
+        )
+        known = sorted(set(failed) - set(pending))
+        if pending:
+            lines = ['failed: ' + ', '.join(pending)]
+            lines += [f'- {name}: {failed[name]}' for name in pending]
+            if known:
+                lines.append(
+                    'still failing (already notified): ' + ', '.join(known),
+                )
+            delivered = _push_unit_failure(
+                c, BACKUP_UNIT, f'{BACKUP_UNIT} failed', '\n'.join(lines),
+            )
+        else:
+            print(
+                f"failed services already notified ({', '.join(known)}); "
+                'not pushing again before alert.renotify_after',
+                file=sys.stderr,
+            )
+
+        def update(current):
+            current['last_failure_at'] = now.isoformat()
+            if delivered:
+                stored = _record_dict(current, 'services')
+                for name in pending:
+                    stored[name] = {
+                        'notified_at': now.isoformat(), 'error': failed[name],
+                    }
+                current['services'] = stored
+
+        _update_unit_record(c, BACKUP_UNIT, update)
+        return
+    result, details = _monitor_result()
+    key = f'crash:{result}'
+    crashes = _record_dict(record, 'crashes')
+    if notified_within(crashes.get(key), c, now):
+        print(
+            f"{BACKUP_UNIT} {result} failure already notified at "
+            f"{crashes[key]['notified_at']}; not pushing again before "
+            'alert.renotify_after',
+            file=sys.stderr,
+        )
+    else:
+        delivered = _push_unit_failure(
+            c, BACKUP_UNIT, f'{BACKUP_UNIT} failed ({result})',
+            f'run-due ended without recording which services failed '
+            f'({details}); it crashed, timed out, was killed or could not '
+            'start. Check the journal.',
+        )
+
+    def update(current):
+        current['last_failure_at'] = now.isoformat()
+        stored = _record_dict(current, 'crashes')
+        entry = _record_dict(stored, key)
+        entry.update(last_seen_at=now.isoformat(), details=details)
+        if delivered:
+            entry['notified_at'] = now.isoformat()
+        stored[key] = entry
+        current['crashes'] = stored
+
+    _update_unit_record(c, BACKUP_UNIT, update)
+
+
+def _push_unit_failure(c, unit, title, summary):
     try:
-        detail = run(
+        journal = run(
             ['journalctl', '--unit', unit, '--lines', '30', '--no-pager',
              '--output', 'cat'],
             capture=True, check=False,
         ).stdout or ''
     except Exception as err:  # noqa: BLE001 - journal is optional context
-        detail = f'(journal unavailable: {err})'
-    if signature:
-        detail = 'failed: ' + ', '.join(signature) + '\n\n' + detail
+        journal = f'(journal unavailable: {err})'
+    result, details = _monitor_result()
+    if unit != BACKUP_UNIT and os.environ.get('MONITOR_SERVICE_RESULT') \
+            and result != 'exit-code':
+        title += f' ({result})'
+    if not summary and os.environ.get('MONITOR_SERVICE_RESULT'):
+        summary = details
+    journal = journal[-JOURNAL_TAIL_LIMIT:]
+    detail = '\n\n'.join(part for part in (summary, journal) if part)
     delivered = notify(
-        c, f"homelab-backup on {c.get('host_id', '?')}: {unit} failed",
-        detail[-3500:] or 'see journalctl for details',
+        c, f"homelab-backup on {c.get('host_id', '?')}: {title}",
+        detail or 'see journalctl for details',
     )
     if not delivered:
         print(
@@ -426,10 +635,20 @@ def cmd_run_due(c, args):
         now = local_now()
         due = []
         failures = FailureSummary()
-        for m in manifests(c, on_error=_manifest_error_recorder(failures)):
+        known_services = set()
+        record_manifest_error = _manifest_error_recorder(failures)
+
+        def on_manifest_error(path, err):
+            nonlocal known_services
+            known_services = None
+            record_manifest_error(path, err)
+
+        for m in manifests(c, on_error=on_manifest_error):
             service = m.get('service', '<unnamed>')
             try:
                 service = _service_name(m)
+                if known_services is not None:
+                    known_services.add(service)
                 is_due, reason, _ = due_status(c, m, now)
             except Exception as err:
                 failures.record_exception(
@@ -464,11 +683,10 @@ def cmd_run_due(c, args):
                 )
                 if os.environ.get('BACKUPCTL_DEBUG') == '1':
                     raise
-        if failures.has_failures():
-            _record_unit_failures(c, BACKUP_UNIT, failures)
-        elif due:
-            # "No backups are due" proves nothing; keep the record then.
-            _clear_unit_alert(c, BACKUP_UNIT)
+        _record_run_due(
+            c, local_now(), [m['service'] for m in due], failures,
+            known_services,
+        )
         failures.raise_if_any('SCHEDULED BACKUP FAILURES')
 
 

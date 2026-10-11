@@ -144,10 +144,14 @@ def build_parser():
              'failure is unchanged',
         description='Log an ALERT line for UNIT and push a notification '
                     'including the last 30 journal lines of the unit to '
-                    'alert.notify_url_file. Repeated failures of the same '
-                    'unit are pushed at most once per alert.renotify_after '
-                    'unless the set of failed services changes; a successful '
-                    'run of the unit resets this.',
+                    'alert.notify_url_file. run-due failures are throttled '
+                    'per service: a service is pushed when it newly fails or '
+                    'its last push is older than alert.renotify_after, and its '
+                    'successful backup resets it; a run-due that ended '
+                    'without recording its failures (crash, timeout, kill) is '
+                    'pushed per result type. Other units are pushed at most '
+                    'once per alert.renotify_after; a successful run of the '
+                    'unit resets this.',
     )
     command.add_argument('unit')
     sub.add_parser('docs')

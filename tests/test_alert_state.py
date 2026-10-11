@@ -86,18 +86,27 @@ class AlertFixture(unittest.TestCase):
 
 
 class RunDueAlertResetTests(AlertFixture):
-    def run_due(self, results, *, due=True):
-        """``results`` maps service -> None (success) or an exception."""
+    """Per-service throttling of homelab-backup.service failures."""
+
+    def run_due(self, results, *, due=None, at=NOW, invocation_id=None):
+        """``results`` maps service -> None (success) or an exception.
+
+        ``due`` is the set of due services (default: all of them).
+        """
         manifests = [{'service': name, 'schedule': CRON} for name in results]
+        due = set(results) if due is None else set(due)
 
         def backup_one(_c, m):
             if results[m['service']] is not None:
                 raise results[m['service']]
 
-        with mock.patch.object(maintenance, 'manifests', return_value=manifests), \
-                mock.patch.object(maintenance, 'local_now', return_value=NOW), \
+        env = {'INVOCATION_ID': invocation_id} if invocation_id else {}
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(maintenance, 'manifests', return_value=manifests), \
+                mock.patch.object(maintenance, 'local_now', return_value=at), \
                 mock.patch.object(
-                    maintenance, 'due_status', return_value=(due, 'r', None),
+                    maintenance, 'due_status',
+                    side_effect=lambda _c, m, _now: (m['service'] in due, 'r', None),
                 ), mock.patch.object(maintenance, 'clear_stale_restic_locks'), \
                 mock.patch.object(maintenance, 'backup_one', side_effect=backup_one), \
                 redirect_stdout(StringIO()), redirect_stderr(StringIO()):
@@ -106,52 +115,165 @@ class RunDueAlertResetTests(AlertFixture):
             except SystemExit:
                 pass
 
-    def test_failure_records_sorted_failed_services(self):
-        self.run_due({'b': RuntimeError('x'), 'a': RuntimeError('y'), 'c': None})
-        self.assertEqual(
-            self.unit_record(maintenance.BACKUP_UNIT)['failure_signature'],
-            ['a', 'b'],
+    def round(self, results, minutes, **kwargs):
+        """One run-due + notify-failure pair, as systemd would run them."""
+        at = NOW + dt.timedelta(minutes=minutes)
+        run_id = f'run-{minutes}'
+        self.run_due(results, at=at, invocation_id=run_id, **kwargs)
+        return self.notify_failure(
+            maintenance.BACKUP_UNIT, at=at, monitor_id=run_id,
         )
 
-    def test_unchanged_failure_set_is_throttled(self):
-        self.run_due({'a': RuntimeError('x')})
-        self.notify_failure(maintenance.BACKUP_UNIT).assert_called_once()
-        self.run_due({'a': RuntimeError('other text, same service')})
-        self.notify_failure(
-            maintenance.BACKUP_UNIT, at=NOW + dt.timedelta(minutes=5),
+    def test_failure_records_failed_services_with_invocation_id(self):
+        self.run_due(
+            {'b': RuntimeError('x'), 'a': RuntimeError('y\nmore'), 'c': None},
+            invocation_id='run-1',
+        )
+        self.assertEqual(self.unit_record(maintenance.BACKUP_UNIT)['run'], {
+            'invocation_id': 'run-1', 'completed_at': NOW.isoformat(),
+            'failures': {'a': 'y', 'b': 'x'},
+        })
+
+    def test_error_is_reduced_to_a_truncated_first_line(self):
+        self.run_due({'a': RuntimeError('\n  ' + 'e' * 500 + '\nsecond')})
+        error = self.unit_record(maintenance.BACKUP_UNIT)['run']['failures']['a']
+        self.assertEqual(len(error), maintenance.ERROR_LINE_LIMIT)
+        self.assertTrue(error.startswith('eee'))
+        self.assertTrue(error.endswith('…'))
+
+    def test_unchanged_failure_is_throttled_per_service(self):
+        notify = self.round({'a': RuntimeError('x')}, 0)
+        notify.assert_called_once()
+        self.assertIn('- a: x', notify.call_args.args[2])
+        self.round(
+            {'a': RuntimeError('other text, same service')}, 5,
         ).assert_not_called()
 
-    def test_changed_failure_set_renotifies_immediately(self):
-        self.run_due({'a': RuntimeError('x'), 'b': None})
-        self.notify_failure(maintenance.BACKUP_UNIT).assert_called_once()
-        self.run_due({'a': RuntimeError('x'), 'b': RuntimeError('x')})
+    def test_newly_failing_service_is_pushed_without_repeating_others(self):
+        self.round({'a': RuntimeError('x'), 'b': None}, 0).assert_called_once()
+        notify = self.round({'a': RuntimeError('x'), 'b': RuntimeError('y')}, 5)
+        notify.assert_called_once()
+        body = notify.call_args.args[2]
+        self.assertIn('failed: b\n- b: y', body)
+        self.assertNotIn('- a:', body)
+        self.assertIn('still failing (already notified): a', body)
+        self.round(
+            {'a': RuntimeError('x'), 'b': RuntimeError('y')}, 10,
+        ).assert_not_called()
+
+    def test_success_removes_only_that_service(self):
+        self.round({'a': RuntimeError('x'), 'b': RuntimeError('y')}, 0)
+        self.round({'a': None, 'b': RuntimeError('y')}, 5).assert_not_called()
+        services = self.unit_record(maintenance.BACKUP_UNIT)['services']
+        self.assertEqual(set(services), {'b'})
+        notify = self.round({'a': RuntimeError('x'), 'b': RuntimeError('y')}, 10)
+        notify.assert_called_once()
+        self.assertIn('failed: a\n', notify.call_args.args[2])
+
+    def test_round_without_failures_keeps_entries_of_services_not_attempted(self):
+        self.round({'a': RuntimeError('x'), 'b': RuntimeError('y')}, 0)
+        self.run_due(
+            {'a': None, 'b': None}, due={'a'}, invocation_id='run-5',
+            at=NOW + dt.timedelta(minutes=5),
+        )
+        record = self.unit_record(maintenance.BACKUP_UNIT)
+        self.assertEqual(set(record['services']), {'b'})
+        self.assertNotIn('run', record)
+        self.round(
+            {'a': None, 'b': RuntimeError('y')}, 10, due={'b'},
+        ).assert_not_called()
+
+    def test_removed_service_entry_is_pruned(self):
+        self.round({'a': RuntimeError('x'), 'b': None}, 0)
+        self.run_due({'b': None}, at=NOW + dt.timedelta(minutes=5))
+        self.assertEqual(self.unit_record(maintenance.BACKUP_UNIT), {})
+
+    def test_legacy_whole_unit_record_does_not_suppress(self):
+        with alerting.alert_state_transaction(self.c) as state:
+            state['units'] = {maintenance.BACKUP_UNIT: {
+                'notified_at': NOW.isoformat(), 'failure_signature': ['a'],
+                'notified_signature': ['a'],
+            }}
+        self.round({'a': RuntimeError('x')}, 5).assert_called_once()
+        record = self.unit_record(maintenance.BACKUP_UNIT)
+        for legacy in ('notified_at', 'failure_signature', 'notified_signature'):
+            self.assertNotIn(legacy, record)
+
+    def test_failed_set_without_monitor_id_uses_recent_unconsumed_record(self):
+        self.run_due({'a': RuntimeError('x')})
+        notify = self.notify_failure(maintenance.BACKUP_UNIT)
+        self.assertIn('- a: x', notify.call_args.args[2])
+        # The record was consumed; a second failure is a crash of another run.
         notify = self.notify_failure(
             maintenance.BACKUP_UNIT, at=NOW + dt.timedelta(minutes=5),
         )
-        notify.assert_called_once()
-        self.assertIn('failed: a, b', notify.call_args.args[2])
-        self.run_due({'a': RuntimeError('x'), 'b': RuntimeError('x')})
-        self.notify_failure(
-            maintenance.BACKUP_UNIT, at=NOW + dt.timedelta(minutes=10),
-        ).assert_not_called()
+        self.assertIn('failed (unknown)', notify.call_args.args[1])
 
-    def test_success_clears_record_so_next_failure_pushes(self):
+    def test_stale_failed_set_is_not_trusted_for_another_run(self):
+        self.round({'a': RuntimeError('x')}, 0)
+        env = {'MONITOR_SERVICE_RESULT': 'timeout', 'MONITOR_EXIT_CODE': 'killed',
+               'MONITOR_EXIT_STATUS': 'TERM'}
+        with mock.patch.dict(os.environ, env):
+            notify = self.notify_failure(
+                maintenance.BACKUP_UNIT, at=NOW + dt.timedelta(minutes=5),
+                monitor_id='run-crashed',
+            )
+        title, body = notify.call_args.args[1:3]
+        self.assertIn('homelab-backup.service failed (timeout)', title)
+        self.assertIn('result=timeout, exit_code=killed, exit_status=TERM', body)
+        self.assertNotIn('- a:', body)
+        self.assertIn('crash:timeout', self.unit_record(maintenance.BACKUP_UNIT)['crashes'])
+
+    def test_record_without_invocation_id_is_not_trusted_with_monitor_id(self):
         self.run_due({'a': RuntimeError('x')})
-        self.notify_failure(maintenance.BACKUP_UNIT).assert_called_once()
-        self.run_due({'a': None})
+        notify = self.notify_failure(maintenance.BACKUP_UNIT, monitor_id='run-1')
+        self.assertIn('failed (unknown)', notify.call_args.args[1])
+
+    def test_completed_round_clears_crash_entries(self):
+        self.notify_failure(maintenance.BACKUP_UNIT, monitor_id='run-x')
+        self.assertIn('crashes', self.unit_record(maintenance.BACKUP_UNIT))
+        self.run_due({'a': None}, due=set(), at=NOW + dt.timedelta(minutes=5))
+        self.assertIn('crashes', self.unit_record(maintenance.BACKUP_UNIT))
+        # Too soon after the crash: an intermittent crash stays throttled.
+        self.run_due({'a': None}, at=NOW + dt.timedelta(minutes=10))
+        self.assertIn('crashes', self.unit_record(maintenance.BACKUP_UNIT))
+        # A round with a service failure never clears it.
+        self.run_due({'a': RuntimeError('x')}, at=NOW + dt.timedelta(minutes=60))
+        self.assertIn('crashes', self.unit_record(maintenance.BACKUP_UNIT))
+        self.run_due({'a': None}, at=NOW + dt.timedelta(minutes=65))
         self.assertEqual(self.unit_record(maintenance.BACKUP_UNIT), {})
-        self.run_due({'a': RuntimeError('x')})
+
+    def test_undelivered_crash_is_recorded_as_seen_and_pushed_again(self):
         self.notify_failure(
-            maintenance.BACKUP_UNIT, at=NOW + dt.timedelta(minutes=10),
+            maintenance.BACKUP_UNIT, monitor_id='run-x', delivered=False,
+        ).assert_called_once()
+        entry = self.unit_record(maintenance.BACKUP_UNIT)['crashes']['crash:unknown']
+        self.assertEqual(entry['last_seen_at'], NOW.isoformat())
+        self.assertNotIn('notified_at', entry)
+        self.notify_failure(
+            maintenance.BACKUP_UNIT, monitor_id='run-y',
+            at=NOW + dt.timedelta(minutes=5),
         ).assert_called_once()
 
+    def test_throttled_crash_refreshes_last_seen_only(self):
+        self.notify_failure(maintenance.BACKUP_UNIT, monitor_id='run-x')
+        later = NOW + dt.timedelta(minutes=30)
+        self.notify_failure(
+            maintenance.BACKUP_UNIT, monitor_id='run-y', at=later,
+        ).assert_not_called()
+        entry = self.unit_record(maintenance.BACKUP_UNIT)['crashes']['crash:unknown']
+        self.assertEqual(entry['notified_at'], NOW.isoformat())
+        self.assertEqual(entry['last_seen_at'], later.isoformat())
+
     def test_nothing_due_keeps_the_record(self):
-        self.run_due({'a': RuntimeError('x')})
-        self.notify_failure(maintenance.BACKUP_UNIT)
+        self.round({'a': RuntimeError('x')}, 0)
         before = self.unit_record(maintenance.BACKUP_UNIT)
-        self.run_due({'a': None}, due=False)
-        self.assertEqual(self.unit_record(maintenance.BACKUP_UNIT), before)
-        self.assertIn('notified_at', before)
+        self.run_due({'a': None}, due=set(), at=NOW + dt.timedelta(minutes=5))
+        self.assertEqual(
+            self.unit_record(maintenance.BACKUP_UNIT)['services'],
+            before['services'],
+        )
+        self.assertIn('notified_at', before['services']['a'])
 
     def test_success_does_not_touch_other_units(self):
         self.notify_failure(maintenance.CHECK_UNIT)
@@ -310,17 +432,47 @@ class StatusFailureHandOffTests(AlertFixture):
             maintenance.STATUS_UNIT, at=NOW + dt.timedelta(minutes=21),
         ).assert_called_once()
 
-    def test_fallback_when_only_one_id_is_known(self):
+    def test_monitor_id_without_stored_id_always_pushes(self):
+        # The record cannot be proven to belong to run-9, so the time window
+        # is not used when systemd provides the failed run's id.
         self.status({'a': STALE})
         self.notify_failure(
             maintenance.STATUS_UNIT, at=NOW + dt.timedelta(minutes=1),
             monitor_id='run-9',
-        ).assert_not_called()
+        ).assert_called_once()
+
+    def test_fallback_without_monitor_id_ignores_stored_id(self):
         self.status({'a': STALE}, invocation_id='run-1',
                     at=NOW + dt.timedelta(hours=2))
         self.notify_failure(
             maintenance.STATUS_UNIT, at=NOW + dt.timedelta(hours=2, minutes=1),
         ).assert_not_called()
+
+    def test_clean_status_clears_unit_record_so_next_failure_pushes(self):
+        self.notify_failure(maintenance.STATUS_UNIT).assert_called_once()
+        self.notify_failure(
+            maintenance.STATUS_UNIT, at=NOW + dt.timedelta(minutes=5),
+        ).assert_not_called()
+        code, _ = self.status(
+            {'a': {'last_success_at': NOW.isoformat()}},
+            at=NOW + dt.timedelta(hours=1),
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(self.unit_record(maintenance.STATUS_UNIT), {})
+        self.notify_failure(
+            maintenance.STATUS_UNIT, at=NOW + dt.timedelta(hours=2),
+        ).assert_called_once()
+
+    def test_problem_status_keeps_unit_record(self):
+        self.notify_failure(maintenance.STATUS_UNIT)
+        self.status({'a': STALE}, at=NOW + dt.timedelta(hours=1))
+        self.assertIn('notified_at', self.unit_record(maintenance.STATUS_UNIT))
+
+    def test_status_errors_are_reduced_to_first_line(self):
+        _, notify = self.status({'a': OSError('first line\nsecret second line')})
+        body = notify.call_args.args[2]
+        self.assertIn('first line', body)
+        self.assertNotIn('secret second line', body)
 
     def test_other_units_ignore_status_record(self):
         self.status({'a': STALE}, invocation_id='run-1')
