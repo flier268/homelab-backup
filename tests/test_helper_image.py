@@ -206,8 +206,26 @@ def dockerfile_instructions(text):
         yield instruction.upper(), arguments
 
 
+def apk_add_packages(instructions):
+    packages = []
+    for name, args in instructions:
+        if name != 'RUN':
+            continue
+        for command in re.split(r'&&|;', args):
+            words = command.split()
+            if words[:2] != ['apk', 'add']:
+                continue
+            packages += [word for word in words[2:] if not word.startswith('-')]
+    return packages
+
+
 class HelperDockerfilePinTests(unittest.TestCase):
-    """Every input of the helper image is pinned, so rebuilds are repeatable."""
+    """The base image is pinned by digest; apk packages by major.minor.
+
+    Alpine removes superseded package revisions from its repositories, so
+    exact ``=version`` pins would break automatic rebuilds; ``~major.minor``
+    keeps rebuilds working, and the installed versions are recorded.
+    """
 
     def setUp(self):
         self.instructions = list(dockerfile_instructions(
@@ -223,20 +241,36 @@ class HelperDockerfilePinTests(unittest.TestCase):
                       r'@sha256:[0-9a-f]{64}(\s+AS\s+\S+)?$',
             )
 
-    def test_every_apk_package_has_an_exact_version(self):
-        packages = []
-        for name, args in self.instructions:
-            if name != 'RUN':
-                continue
-            for command in re.split(r'&&|;', args):
-                words = command.split()
-                if words[:2] != ['apk', 'add']:
-                    continue
-                packages += [word for word in words[2:] if not word.startswith('-')]
-        self.assertTrue(packages)
+    def test_every_apk_package_has_a_major_minor_fuzzy_pin(self):
+        packages = apk_add_packages(self.instructions)
+        self.assertEqual(
+            sorted(package.split('~')[0] for package in packages),
+            ['acl', 'attr', 'coreutils', 'rsync'],
+        )
         for package in packages:
             with self.subTest(package=package):
-                self.assertRegex(package, r'^[a-z0-9][a-z0-9._+-]*=[0-9][^=\s]*$')
+                self.assertRegex(package, r'^[a-z0-9][a-z0-9._+-]*~[0-9]+\.[0-9]+$')
+
+    def test_installed_versions_are_recorded_in_the_same_run(self):
+        runs = [
+            args for name, args in self.instructions
+            if name == 'RUN' and 'apk add' in args
+        ]
+        self.assertEqual(len(runs), 1)
+        commands = [command.strip() for command in runs[0].split('&&')]
+        record = '/usr/share/volume-rsync-apk-versions.txt'
+        self.assertIn(f'apk info -v | sort > {record}', commands)
+        self.assertIn(f'cat {record}', commands)
+
+    def test_pin_check_rejects_exact_and_missing_pins(self):
+        text = ('FROM alpine:3.22\nRUN apk add --no-cache \\\n'
+                '    rsync \\\n    acl=1-r0 \\\n    attr~2.5\n')
+        packages = apk_add_packages(dockerfile_instructions(text))
+        pattern = re.compile(r'^[a-z0-9][a-z0-9._+-]*~[0-9]+\.[0-9]+$')
+        self.assertEqual(
+            [package for package in packages if pattern.match(package)],
+            ['attr~2.5'],
+        )
 
     def test_parser_flags_unpinned_input(self):
         text = 'FROM alpine:3.22\nRUN apk add --no-cache \\\n    rsync \\\n    acl=1-r0\n'

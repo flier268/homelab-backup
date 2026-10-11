@@ -788,13 +788,14 @@ class DeploymentScriptTests(unittest.TestCase):
         self.assertNotIn('docker build -t homelab/volume-rsync:1', script)
         self.assertIn("docker image inspect --format '{{.Id}}'", script)
 
-    def test_volume_helper_dependencies_are_fully_pinned(self):
+    def test_volume_helper_dependencies_are_pinned(self):
         dockerfile = (ROOT / 'Dockerfile.volume-rsync').read_text(
             encoding='utf-8',
         )
         self.assertRegex(dockerfile, r'FROM alpine:3\.22@sha256:[0-9a-f]{64}')
+        # major.minor pins: Alpine drops superseded exact package revisions.
         for package in ('acl', 'attr', 'coreutils', 'rsync'):
-            self.assertRegex(dockerfile, rf'\b{package}=[0-9][^\s\\]*')
+            self.assertRegex(dockerfile, rf'\b{package}~[0-9]+\.[0-9]+\s')
 
     def test_installer_keeps_only_current_and_previous_releases(self):
         script = (ROOT / 'install.sh').read_text(encoding='utf-8')
