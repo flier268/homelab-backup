@@ -26,7 +26,7 @@ from .security import (
     path_contains, read_control_text, validate_control_root,
 )
 from .storage import (
-    validate_docker_bind_probe, validate_docker_environment,
+    ensure_volume_helper_image, validate_docker_environment,
 )
 
 
@@ -518,7 +518,7 @@ def cmd_restore(c, args):
                 if args.apply:
                     if requires_docker(m) and not docker_preflight_complete:
                         validate_docker_environment()
-                        validate_docker_bind_probe(c)
+                        ensure_volume_helper_image(c)
                         docker_preflight_complete = True
                     restore_apply.apply_one(c, m, root, start_services=args.start)
                     try:
@@ -589,5 +589,5 @@ def cmd_apply(c, args):
         m = manifest(c, args.service)
         if requires_docker(m):
             validate_docker_environment()
-            validate_docker_bind_probe(c)
+            ensure_volume_helper_image(c)
         restore_apply.apply_one(c, m, root, start_services=args.start)

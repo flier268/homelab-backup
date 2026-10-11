@@ -29,8 +29,8 @@ from .security import (
     clear_control_leaf, validate_control_file, validate_control_root,
 )
 from .storage import (
-    validate_docker_bind_probe, validate_docker_environment,
-    validate_runtime_sources,
+    validate_docker_environment, validate_runtime_sources,
+    volume_helper_dockerfile, volume_helper_image_present,
 )
 from .staging import _check_backup_space, stage_service
 from .types import GlobalConfig, ServiceManifest
@@ -445,7 +445,6 @@ def cmd_validate(c, args):
     if needs_docker and shutil.which('docker'):
         try:
             validate_docker_environment()
-            validate_docker_bind_probe(c)
         except (CommandError, OSError, ValueError, RuntimeError) as err:
             errors.append(format_remediable_error(
                 'Docker environment is unsupported', err,
@@ -455,10 +454,18 @@ def cmd_validate(c, args):
         except CommandError as err:
             _print_command_failure(err, context='Docker Compose is unavailable')
             errors.append('docker compose version failed')
-        try:
-            run(['docker', 'image', 'inspect', c['volume_helper_image']], capture=True)
-        except CommandError:
-            errors.append(f"missing Docker helper image: {c['volume_helper_image']}")
+        if not volume_helper_image_present(c):
+            if volume_helper_dockerfile() is not None:
+                print(
+                    f"WARNING: Docker helper image {c['volume_helper_image']} "
+                    'is missing; it will be rebuilt automatically on the '
+                    'next volume backup',
+                    file=sys.stderr,
+                )
+            else:
+                errors.append(
+                    f"missing Docker helper image: {c['volume_helper_image']}"
+                )
     for key in ('password_file', 'rclone_config'):
         try:
             validate_control_file(c[key])

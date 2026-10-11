@@ -96,19 +96,30 @@ if not (HERE / 'homelab_backup').is_dir():
             f'ERROR: installed helper image metadata is invalid: '
             f'{helper_image_file}: {err}'
         ) from err
-    if not isinstance(parsed_helper_metadata, dict) or set(
+    # image_id is still written by install.sh so an older launcher can be
+    # rolled back to, but it is ignored: pinning the helper by image ID made
+    # every Docker backup fail after `docker image prune -a`. The tag is used
+    # instead and backupctl rebuilds a missing helper from the bundled
+    # Dockerfile.
+    if not isinstance(parsed_helper_metadata, dict) or not set(
         parsed_helper_metadata
-    ) != {'tag', 'image_id'}:
+    ) or not set(parsed_helper_metadata) <= {'tag', 'image_id'} \
+            or 'tag' not in parsed_helper_metadata:
         raise SystemExit(
             f'ERROR: installed helper image metadata is invalid: {helper_image_file}'
         )
     helper_tag = parsed_helper_metadata['tag']
-    release_helper_image = parsed_helper_metadata['image_id']
-    if re.fullmatch(
+    if not isinstance(helper_tag, str) or re.fullmatch(
         r'homelab/volume-rsync:release\.[A-Za-z0-9]+', helper_tag,
-    ) is None or re.fullmatch(r'sha256:[0-9a-f]{64}', release_helper_image) is None:
+    ) is None:
         raise SystemExit(
             f'ERROR: installed helper image metadata is invalid: {helper_image_file}'
+        )
+    release_helper_image = helper_tag
+    helper_dockerfile = release_root / 'Dockerfile.volume-rsync'
+    if helper_dockerfile.is_file() and not helper_dockerfile.is_symlink():
+        os.environ['HOMELAB_BACKUP_RELEASE_VOLUME_HELPER_DOCKERFILE'] = str(
+            helper_dockerfile
         )
     sys.path.insert(0, str(app_root))
 

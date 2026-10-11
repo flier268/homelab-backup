@@ -720,7 +720,7 @@ class DeploymentScriptTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(
                 result.stdout.strip(),
-                f'release.A|sha256:{"a" * 64}',
+                'release.A|homelab/volume-rsync:release.A',
             )
             self.assertEqual(
                 os.readlink(install_root / 'current'),

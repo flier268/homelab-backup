@@ -18,7 +18,7 @@ from .security import (
     paths_overlap,
 )
 from .storage import (
-    compose_identity, resolved_volume_sources, validate_docker_bind_probe,
+    compose_identity, ensure_volume_helper_image, resolved_volume_sources,
     validate_docker_environment, validate_runtime_sources,
 )
 from .types import GlobalConfig, ServiceManifest
@@ -59,12 +59,13 @@ def _build_stage_context(c, m, stage, mode, allow_low_space):
             allow_low_space=allow_low_space,
         )
     validate_docker_environment()
-    validate_docker_bind_probe(c)
     model = compose_model(m)
     validate_runtime_sources(
         c, m, model, allow_missing_paths=mode == 'hooks',
     )
     resolved_volumes = resolved_volume_sources(m, model=model)
+    if resolved_volumes:
+        ensure_volume_helper_image(c)
     return _capture._StageContext(
         config=c,
         manifest=m,
