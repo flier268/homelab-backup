@@ -4,6 +4,8 @@ use std::process::ExitCode;
 use clap::Parser;
 
 #[allow(dead_code)]
+mod actions;
+#[allow(dead_code)]
 mod backup;
 mod cli;
 #[allow(dead_code)]

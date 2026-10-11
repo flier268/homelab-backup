@@ -26,6 +26,7 @@ pub struct BackupDeps<'a> {
     pub repository_id: &'a mut dyn FnMut() -> Result<String, SecurityError>,
     pub run: &'a mut dyn FnMut(BackupCommand) -> Result<(), SecurityError>,
     pub remove_stage: &'a mut dyn FnMut(&PathBuf) -> Result<(), SecurityError>,
+    pub on_failure: &'a mut dyn FnMut(&SecurityError, &str),
 }
 
 pub fn execute_backup(
@@ -139,6 +140,7 @@ fn record_failure(
     error: &SecurityError,
     deps: &mut BackupDeps<'_>,
 ) {
+    (deps.on_failure)(error, "staging");
     if let Some(root) = config.get("staging_root") {
         let partial = PathBuf::from(root).join(label);
         let _ = (deps.remove_stage)(&partial);
@@ -207,6 +209,7 @@ mod tests {
                 Ok(())
             },
             remove_stage: &mut |_| Ok(()),
+            on_failure: &mut |_error, _phase| {},
         };
         let manifest = BTreeMap::from([("service".to_owned(), Yaml::string("demo"))]);
         let config = BTreeMap::from([
