@@ -49,6 +49,10 @@ impl SecurityError {
     pub fn is_runtime(&self) -> bool {
         self.runtime
     }
+
+    pub fn is_missing_path(&self) -> bool {
+        self.message.starts_with("missing path:")
+    }
 }
 
 impl fmt::Display for SecurityError {

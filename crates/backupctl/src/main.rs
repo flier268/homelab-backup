@@ -5,6 +5,8 @@ use clap::Parser;
 
 mod cli;
 #[allow(dead_code)]
+mod storage;
+#[allow(dead_code)]
 mod unix;
 
 fn main() -> ExitCode {

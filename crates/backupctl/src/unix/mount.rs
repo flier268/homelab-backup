@@ -153,10 +153,69 @@ pub fn validate_data_mount_boundary(
     Ok(anchor)
 }
 
+pub fn current_mount_records() -> Result<Vec<MountRecord>, SecurityError> {
+    let text = std::fs::read_to_string("/proc/self/mountinfo").map_err(|error| {
+        SecurityError::runtime(format!("cannot inspect mounted filesystems: {error}"))
+    })?;
+    mount_records(&text, "/proc/self/mountinfo")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MountSnapshot {
+    pub mount_id: i32,
+    pub device: String,
+    pub mount_point: String,
+    pub nested: Vec<String>,
+}
+
+pub fn data_mount_snapshot(path: &str) -> Result<MountSnapshot, SecurityError> {
+    let records = current_mount_records()?;
+    snapshot_from_records(path, &records)
+}
+
+pub fn snapshot_from_records(
+    path: &str,
+    records: &[MountRecord],
+) -> Result<MountSnapshot, SecurityError> {
+    let anchor = validate_data_mount_boundary(path, records)?;
+    let path = absolute(path)?;
+    let mut nested: Vec<String> = records
+        .iter()
+        .filter(|item| {
+            item.mount_point != path && path_contains(&path, &item.mount_point).unwrap_or(false)
+        })
+        .map(|item| item.mount_point.clone())
+        .collect();
+    nested.sort();
+    Ok(MountSnapshot {
+        mount_id: anchor.mount_id,
+        device: anchor.device,
+        mount_point: anchor.mount_point,
+        nested,
+    })
+}
+
+pub fn validate_live_control_root(
+    path: &str,
+    allow_missing: bool,
+) -> Result<String, SecurityError> {
+    let records = current_mount_records()?;
+    validate_control_root_explicit(path, allow_missing, &records, false)
+}
+
 pub fn validate_control_root(
     path: &str,
     allow_missing: bool,
     records: &[MountRecord],
+) -> Result<String, SecurityError> {
+    validate_control_root_explicit(path, allow_missing, records, true)
+}
+
+fn validate_control_root_explicit(
+    path: &str,
+    allow_missing: bool,
+    records: &[MountRecord],
+    explicit_records: bool,
 ) -> Result<String, SecurityError> {
     let path = absolute(path)?;
     let exists = std::fs::symlink_metadata(&path).is_ok();
@@ -170,7 +229,7 @@ pub fn validate_control_root(
             "control root does not exist: {path}"
         )));
     }
-    validate_mount_boundary(&path, records, true)?;
+    validate_mount_boundary(&path, records, explicit_records)?;
     Ok(path)
 }
 

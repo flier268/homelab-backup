@@ -727,7 +727,7 @@ fn validate_path_source(
     Ok(())
 }
 
-fn source_path(
+pub fn source_path(
     manifest: &BTreeMap<String, Yaml>,
     source: &BTreeMap<String, Yaml>,
 ) -> Result<String, PolicyError> {
@@ -743,7 +743,7 @@ fn source_path(
     Ok(join_service_path(directory, value))
 }
 
-fn path_source_control_overlap(
+pub fn path_source_control_overlap(
     manifest: &BTreeMap<String, Yaml>,
     source: &BTreeMap<String, Yaml>,
 ) -> Result<Option<(&'static str, String)>, PolicyError> {

@@ -1,6 +1,7 @@
 //! Control-path ownership and the no-follow directory chain.
 
 use std::os::fd::OwnedFd;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use homelab_backup_domain::paths::lexical_absolute;
@@ -200,6 +201,115 @@ fn existing_prefix(path: &str) -> Result<(String, Vec<String>), SecurityError> {
             }
             Err(error) => return Err(runtime(error)),
         }
+    }
+}
+
+pub fn clear_control_leaf(path: &str) -> Result<(), SecurityError> {
+    let path = absolute(path)?;
+    let parent = open_directory(&parent_path(&path))?;
+    let metadata = fstat(&parent).map_err(runtime)?;
+    match remove_entry(&parent, &file_name(&path), metadata.st_dev) {
+        Ok(()) => {}
+        Err(error) if error.is_missing_path() => {}
+        Err(error) => return Err(error),
+    }
+    fsync(&parent).map_err(runtime)?;
+    Ok(())
+}
+
+fn remove_entry(parent: &OwnedFd, name: &str, device: u64) -> Result<(), SecurityError> {
+    let metadata = match statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(metadata) => metadata,
+        Err(Errno::NOENT) => {
+            return Err(SecurityError::invalid(format!("missing path: {name}")));
+        }
+        Err(error) => return Err(runtime(error)),
+    };
+    if is_dir(mode_of(&metadata)) {
+        if metadata.st_dev != device {
+            return Err(SecurityError::invalid(format!(
+                "refusing to remove cross-device directory: {name}"
+            )));
+        }
+        let child = openat(
+            parent,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(runtime)?;
+        let mut entries = Vec::new();
+        for entry in rustix::fs::Dir::read_from(&child).map_err(runtime)? {
+            let entry = entry.map_err(runtime)?;
+            let entry_name = entry.file_name().to_string_lossy();
+            if entry_name == "." || entry_name == ".." {
+                continue;
+            }
+            entries.push(entry_name.into_owned());
+        }
+        for entry_name in entries {
+            remove_entry(&child, &entry_name, device)?;
+        }
+        rustix::fs::unlinkat(parent, name, AtFlags::REMOVEDIR).map_err(runtime)?;
+    } else {
+        rustix::fs::unlinkat(parent, name, AtFlags::empty()).map_err(runtime)?;
+    }
+    Ok(())
+}
+
+pub fn ensure_private_directory(path: &str, replace: bool) -> Result<String, SecurityError> {
+    let path = absolute(path)?;
+    if is_symlink(&path)? {
+        return Err(SecurityError::invalid(format!(
+            "workspace must not be a symbolic link: {path}"
+        )));
+    }
+    super::mount::validate_live_control_root(&path, true)?;
+    if replace {
+        if is_symlink(&path)? {
+            return Err(SecurityError::invalid(format!(
+                "workspace must not be a symbolic link: {path}"
+            )));
+        }
+        clear_control_leaf(&path)?;
+    }
+    let parent = open_directory(&parent_path(&path))?;
+    let name = file_name(&path);
+    match mkdirat(&parent, name.as_str(), Mode::from_bits_truncate(0o700)) {
+        Ok(()) => {}
+        Err(Errno::EXIST) => {
+            let metadata =
+                statat(&parent, name.as_str(), AtFlags::SYMLINK_NOFOLLOW).map_err(runtime)?;
+            let mut allowed = vec![0];
+            let effective_uid = geteuid().as_raw();
+            if effective_uid != 0 {
+                allowed.push(effective_uid);
+            }
+            if is_lnk(mode_of(&metadata)) {
+                return Err(SecurityError::invalid(format!(
+                    "workspace must not be a symbolic link: {path}"
+                )));
+            }
+            if !is_dir(mode_of(&metadata)) || !allowed.contains(&metadata.st_uid) {
+                return Err(SecurityError::invalid(format!(
+                    "workspace is not a root-owned real directory: {path}"
+                )));
+            }
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+                .map_err(runtime)?;
+        }
+        Err(error) => return Err(runtime(error)),
+    }
+    fsync(&parent).map_err(runtime)?;
+    super::mount::validate_live_control_root(&path, false)?;
+    Ok(path)
+}
+
+fn is_symlink(path: &str) -> Result<bool, SecurityError> {
+    match statat(CWD, path, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(metadata) => Ok(is_lnk(mode_of(&metadata))),
+        Err(Errno::NOENT) => Ok(false),
+        Err(error) => Err(runtime(error)),
     }
 }
 

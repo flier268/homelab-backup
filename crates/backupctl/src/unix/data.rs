@@ -6,6 +6,7 @@ use std::path::Path;
 
 use homelab_backup_domain::paths::lexical_absolute;
 use rustix::fs::{AtFlags, Mode, OFlags, fstat, openat, statat};
+use rustix::io::Errno;
 use rustix::process::geteuid;
 
 use super::control::{is_dir, is_lnk, is_reg, mode_of};
@@ -35,8 +36,15 @@ pub fn open_data_path(path: &Path) -> Result<(OwnedFd, rustix::fs::Stat), Securi
     let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
     for (index, component) in parts.iter().enumerate() {
         let final_component = index + 1 == parts.len();
-        let metadata = statat(&current, *component, AtFlags::SYMLINK_NOFOLLOW)
-            .map_err(|error| SecurityError::runtime(format!("{path}: {error}")))?;
+        let metadata = match statat(&current, *component, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(metadata) => metadata,
+            Err(Errno::NOENT) => {
+                return Err(SecurityError::invalid(format!("missing path: {path}")));
+            }
+            Err(error) => {
+                return Err(SecurityError::runtime(format!("{path}: {error}")));
+            }
+        };
         let mode = mode_of(&metadata);
         let flags = if !final_component {
             if !is_dir(mode) {
