@@ -4,10 +4,16 @@
 //! (`fri-sun`, `5-7`). Occurrence search matches the previous cronsim calls:
 //! the previous hit includes the truncated minute, and the next hit does not.
 
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, TimeZone, Timelike};
 use croner::Cron;
 use croner::parser::CronParser;
 use thiserror::Error;
+
+use crate::duration::parse_duration;
+use crate::error::PolicyError;
+use crate::yaml::{Yaml, python_string_list, unknown_keys};
 
 const SEARCH_MINUTES: i64 = 366 * 24 * 60 * 5;
 
@@ -118,6 +124,98 @@ where
 
 /// `fri-sun` is a descending range when Sunday is only 0. Croner's Sunday is
 /// also 7, and the existing manifests spell the end of the week as `sun`.
+pub fn validate_schedule_value(path: &str, schedule: Option<&Yaml>) -> Result<(), PolicyError> {
+    let Some(Yaml::Map(schedule)) = schedule else {
+        return Err(PolicyError::new(format!(
+            "{path}: schedule must be a mapping"
+        )));
+    };
+    validate_schedule_mapping(path, schedule)
+}
+
+fn validate_schedule_mapping(
+    path: &str,
+    schedule: &BTreeMap<String, Yaml>,
+) -> Result<(), PolicyError> {
+    let allowed = ["cron", "retry_after", "max_lateness", "enabled"];
+    let unknown = unknown_keys(schedule, &allowed);
+    if !unknown.is_empty() {
+        return Err(PolicyError::new(format!(
+            "{path}: unsupported schedule fields: {}; use cron only",
+            python_string_list(unknown)
+        )));
+    }
+    match schedule.get("enabled") {
+        None => {}
+        Some(Yaml::Bool(_)) => {}
+        Some(_) => {
+            return Err(PolicyError::new(format!(
+                "{path}: schedule.enabled must be boolean"
+            )));
+        }
+    }
+    if schedule.get("enabled") == Some(&Yaml::Bool(false)) {
+        return Ok(());
+    }
+    let field = format!("{path}: schedule.cron");
+    let cron = match schedule.get("cron") {
+        Some(value) if !value.is_truthy() => {
+            return Err(PolicyError::new(format!(
+                "{path}: schedule.cron is required"
+            )));
+        }
+        None => {
+            return Err(PolicyError::new(format!(
+                "{path}: schedule.cron is required"
+            )));
+        }
+        Some(Yaml::String(value)) => value.as_str(),
+        Some(_) => {
+            return Err(PolicyError::new(format!(
+                "{field} must be a standard 5-field cron string"
+            )));
+        }
+    };
+    let spec = parse_cron(cron, &field).map_err(|err| PolicyError::new(err.to_string()))?;
+    if !cron_has_occurrence(&spec) {
+        return Err(PolicyError::new(format!(
+            "{path}: schedule.cron never matches a real calendar date"
+        )));
+    }
+    require_duration(
+        schedule.get("retry_after"),
+        Some("30m"),
+        &format!("{path}: schedule.retry_after"),
+    )?;
+    if schedule.contains_key("max_lateness") {
+        require_duration(
+            schedule.get("max_lateness"),
+            None,
+            &format!("{path}: schedule.max_lateness"),
+        )?;
+    }
+    Ok(())
+}
+
+fn require_duration(
+    value: Option<&Yaml>,
+    default: Option<&str>,
+    field: &str,
+) -> Result<(), PolicyError> {
+    let text = match value {
+        None => default.unwrap_or(""),
+        Some(Yaml::String(value)) => value.as_str(),
+        Some(_) => {
+            return Err(PolicyError::new(format!(
+                "{field} must be a duration string such as 30m, 6h, or 1d"
+            )));
+        }
+    };
+    parse_duration(text, field)
+        .map(|_| ())
+        .map_err(|err| PolicyError::new(err.to_string()))
+}
+
 fn replace_sunday_range_end(dow: &str) -> String {
     let mut out = String::with_capacity(dow.len());
     let bytes = dow.as_bytes();
