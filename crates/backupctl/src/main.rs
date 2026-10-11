@@ -10,6 +10,7 @@ mod backup;
 mod capture;
 mod catalog;
 mod cli;
+mod commands;
 mod documents;
 mod due;
 mod files;

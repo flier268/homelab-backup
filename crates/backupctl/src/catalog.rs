@@ -24,6 +24,20 @@ pub fn select_services(
     config: &BTreeMap<String, Yaml>,
     names: &[String],
 ) -> Result<(Vec<SelectedService>, Vec<SelectionFailure>), SecurityError> {
+    select_services_filtered(config, names, false)
+}
+
+pub fn select_every_manifest(
+    config: &BTreeMap<String, Yaml>,
+) -> Result<(Vec<SelectedService>, Vec<SelectionFailure>), SecurityError> {
+    select_services_filtered(config, &[], true)
+}
+
+fn select_services_filtered(
+    config: &BTreeMap<String, Yaml>,
+    names: &[String],
+    include_disabled: bool,
+) -> Result<(Vec<SelectedService>, Vec<SelectionFailure>), SecurityError> {
     let services_root = config
         .get("services_root")
         .and_then(Yaml::as_str)
@@ -92,7 +106,9 @@ pub fn select_services(
             .into_iter()
             .filter(|(service, _)| !duplicates.contains_key(service))
             .flat_map(|(_, manifests)| manifests)
-            .filter(|manifest| manifest.get("enabled").and_then(Yaml::as_bool) != Some(false))
+            .filter(|manifest| {
+                include_disabled || manifest.get("enabled").and_then(Yaml::as_bool) != Some(false)
+            })
             .map(|manifest| SelectedService { manifest })
             .collect();
         return Ok((ready, failures));

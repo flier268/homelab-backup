@@ -169,6 +169,20 @@ pub fn run(cli: Cli) -> Result<(), CliError> {
         Command::Maintenance { dry_run, no_wait } => {
             crate::ops::run_maintenance(crate::documents::CONFIG_PATH, *dry_run, *no_wait)
         }
+        Command::Validate => crate::commands::run_validate(crate::documents::CONFIG_PATH),
+        Command::Docs => crate::commands::run_docs(),
+        Command::DeleteSnapshot {
+            service,
+            snapshot,
+            prune,
+            yes,
+        } => crate::commands::run_delete_snapshot(
+            crate::documents::CONFIG_PATH,
+            service,
+            snapshot,
+            *yes,
+            *prune,
+        ),
         Command::RunDue => crate::ops::run_due(crate::documents::CONFIG_PATH),
         Command::Status { max_age, notify } => {
             crate::ops::run_status(crate::documents::CONFIG_PATH, max_age.as_deref(), *notify)

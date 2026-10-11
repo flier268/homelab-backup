@@ -56,6 +56,24 @@ pub fn load_backup_state(
     validate_state(value, service, &path)
 }
 
+pub fn invalidate_snapshot_fingerprint(
+    state_root: &str,
+    service: &str,
+) -> Result<(), SecurityError> {
+    let mut state = load_backup_state(state_root, service)?;
+    let mut changed = false;
+    for field in ["last_snapshot_fingerprint", "last_snapshot_context"] {
+        if state.get(field).is_some_and(|value| !value.is_null()) {
+            state.remove(field);
+            changed = true;
+        }
+    }
+    if changed {
+        save_backup_state(state_root, service, &state)?;
+    }
+    Ok(())
+}
+
 pub fn save_backup_state(
     state_root: &str,
     service: &str,

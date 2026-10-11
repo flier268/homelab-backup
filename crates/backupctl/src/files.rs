@@ -121,7 +121,13 @@ pub(crate) fn backup_loaded(
         .and_then(|consistency| consistency.get("mode"))
         .and_then(Yaml::as_str)
         .unwrap_or("stop");
-    if mode != "files" {
+    let has_volumes = manifest
+        .get("sources")
+        .and_then(Yaml::as_map)
+        .and_then(|sources| sources.get("volumes"))
+        .and_then(Yaml::as_seq)
+        .is_some_and(|volumes| !volumes.is_empty());
+    if !matches!(mode, "files" | "external" | "hooks") || has_volumes {
         return Err(format!("consistency mode {mode} is not ported yet"));
     }
     for message in legacy_messages(manifest) {
@@ -222,6 +228,12 @@ fn stage_files(
     allow_low_space: bool,
 ) -> Result<PathBuf, SecurityError> {
     let service = manifest.get("service").and_then(Yaml::as_str).unwrap_or("");
+    let mode = manifest
+        .get("consistency")
+        .and_then(Yaml::as_map)
+        .and_then(|consistency| consistency.get("mode"))
+        .and_then(Yaml::as_str)
+        .unwrap_or("stop");
     let label = service_label(manifest);
     let staging_root = config.get("staging_root").map(String::as_str).unwrap_or("");
     let mut protected = vec![
@@ -250,12 +262,37 @@ fn stage_files(
     let captured = (|| {
         let mut before = run_phase(manifest, "backup", "before", &[], &mut |_| None)?;
         let mut check = || ensure_space(&label, &stage, 0, allow_low_space);
+        let capture_method = if mode == "files" {
+            "best-effort"
+        } else {
+            "quiesced-copy"
+        };
         let mut options = SyncOptions {
-            capture_method: "best-effort".to_owned(),
+            capture_method: capture_method.to_owned(),
             before_copy: Some(&mut check),
             ..SyncOptions::default()
         };
-        let paths = sync_paths(config, manifest, Path::new(&stage), &mut options)?;
+        let synced = if mode == "hooks" {
+            let captured = (|| {
+                run_consistency_hooks(manifest, "before")?;
+                sync_paths(config, manifest, Path::new(&stage), &mut options)
+            })();
+            let cleanup = run_consistency_hooks(manifest, "after");
+            match (captured, cleanup) {
+                (Err(error), Err(cleanup)) => {
+                    eprintln!("ERROR: after hook cleanup also failed: {cleanup}");
+                    Err(error)?
+                }
+                (Err(error), Ok(())) => Err(error)?,
+                (Ok(paths), cleanup) => {
+                    cleanup?;
+                    paths
+                }
+            }
+        } else {
+            sync_paths(config, manifest, Path::new(&stage), &mut options)?
+        };
+        let paths = synced;
         ensure_space(&label, &stage, 0, allow_low_space)?;
         before.extend(run_phase(manifest, "backup", "after", &[], &mut |_| None)?);
         Ok::<_, SecurityError>((paths, before))
@@ -353,8 +390,8 @@ fn inventory_value(
         "paths": path_items,
         "volumes": [],
         "consistency": {
-            "mode": "files",
-            "guarantee": "best-effort",
+            "mode": manifest.get("consistency").and_then(Yaml::as_map).and_then(|item| item.get("mode")).and_then(Yaml::as_str).unwrap_or("stop"),
+            "guarantee": overall_guarantee(manifest, paths, failures),
             "optional_action_failures": action_failures,
             "writers": [],
         }
@@ -475,6 +512,79 @@ pub(crate) fn flat_strings(config: &BTreeMap<String, Yaml>) -> BTreeMap<String, 
     flat
 }
 
+fn overall_guarantee(
+    manifest: &BTreeMap<String, Yaml>,
+    paths: &[PathInventory],
+    failures: &[crate::actions::ActionFailure],
+) -> &'static str {
+    let mode = manifest
+        .get("consistency")
+        .and_then(Yaml::as_map)
+        .and_then(|consistency| consistency.get("mode"))
+        .and_then(Yaml::as_str)
+        .unwrap_or("stop");
+    if mode == "files"
+        || !failures.is_empty()
+        || paths
+            .iter()
+            .any(|item| item.capture_method == "best-effort")
+    {
+        "best-effort"
+    } else if !paths.is_empty()
+        && paths
+            .iter()
+            .all(|item| item.capture_method == "btrfs-snapshot")
+    {
+        "btrfs-snapshot"
+    } else {
+        "quiesced-copy"
+    }
+}
+
+fn run_consistency_hooks(
+    manifest: &BTreeMap<String, Yaml>,
+    phase: &str,
+) -> Result<(), SecurityError> {
+    let Some(scripts) = manifest
+        .get("consistency")
+        .and_then(Yaml::as_map)
+        .and_then(|consistency| consistency.get(phase))
+        .and_then(Yaml::as_seq)
+    else {
+        return Ok(());
+    };
+    let directory = manifest.get("_dir").and_then(Yaml::as_str).unwrap_or(".");
+    for script in scripts.iter().filter_map(Yaml::as_str) {
+        let command = [
+            "/bin/bash".to_owned(),
+            "-euo".to_owned(),
+            "pipefail".to_owned(),
+            "-c".to_owned(),
+            script.to_owned(),
+        ];
+        println!(
+            "+ {}",
+            command
+                .iter()
+                .map(|part| shell_quote(part))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let status = std::process::Command::new(&command[0])
+            .args(&command[1..])
+            .current_dir(directory)
+            .status()
+            .map_err(|error| SecurityError::runtime(error.to_string()))?;
+        if !status.success() {
+            return Err(SecurityError::runtime(format!(
+                "command failed with exit code {}",
+                status.code().unwrap_or(1)
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn shell_quote(value: &str) -> String {
     if value.chars().all(|ch| {
         ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | ':' | '=' | ',')
@@ -551,6 +661,43 @@ mod tests {
         assert_eq!(state["last_result"], "success");
         assert!(state["last_error"].is_null());
         assert!(!root.join("staging").join("demo").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn hooks_mode_copies_paths_and_runs_the_after_hook() {
+        let root = temp_root("hooks");
+        let services = root.join("services");
+        let demo = services.join("demo");
+        let data = demo.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        for path in [&services, &demo, &data] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::write(data.join("payload.txt"), "snapshot").unwrap();
+        let manifest = demo.join("backup.yaml");
+        std::fs::write(
+            &manifest,
+            "version: 1\nservice: demo\nschedule:\n  cron: '0 0 * * *'\nretention:\n  keep_last: 1\nconsistency:\n  mode: hooks\n  before:\n    - 'true'\n  after:\n    - 'touch hooked-after'\nsources:\n  paths:\n    - id: data\n      path: data\n  volumes: []\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&manifest, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let config_path = write_config(&root, &services);
+        let inventory = root.join("inventory.json");
+        let program = fake_restic(&root, &root.join("restic.log"), &inventory);
+        run_backup(
+            &config_path.to_string_lossy(),
+            &[],
+            false,
+            &program.to_string_lossy(),
+        )
+        .unwrap();
+        assert!(demo.join("hooked-after").is_file());
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&inventory).unwrap()).unwrap();
+        assert_eq!(saved["consistency"]["mode"], "hooks");
+        assert_eq!(saved["consistency"]["guarantee"], "quiesced-copy");
+        assert_eq!(saved["paths"][0]["capture_method"], "quiesced-copy");
         let _ = std::fs::remove_dir_all(&root);
     }
 
