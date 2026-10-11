@@ -5,14 +5,15 @@ use clap::Parser;
 
 #[allow(dead_code)]
 mod actions;
-#[allow(dead_code)]
 mod backup;
 #[allow(dead_code)]
 mod capture;
+mod catalog;
 mod cli;
-#[allow(dead_code)]
+mod documents;
+mod files;
 mod fingerprint;
-#[allow(dead_code)]
+mod state;
 mod storage;
 #[allow(dead_code)]
 mod unix;
@@ -22,7 +23,10 @@ fn main() -> ExitCode {
     match cli::run(command) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            let _ = writeln!(io::stderr(), "ERROR: {error}");
+            let text = error.to_string();
+            if !text.is_empty() {
+                let _ = writeln!(io::stderr(), "ERROR: {text}");
+            }
             ExitCode::from(1)
         }
     }

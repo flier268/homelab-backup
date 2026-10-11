@@ -12,7 +12,7 @@ use rustix::process::geteuid;
 use crate::storage::policy::build_path_filter_args;
 use crate::storage::policy::validate_path_source_policy;
 use crate::unix::control::{clear_control_leaf, is_dir, is_lnk, is_reg, mode_of};
-use crate::unix::data::{current_euid, open_data_path, validate_payload};
+use crate::unix::data::{Ancestor, current_euid, open_data_path, validate_payload};
 use crate::unix::error::SecurityError;
 use crate::unix::mount::{MountSnapshot, data_mount_snapshot};
 
@@ -25,6 +25,7 @@ pub struct PathInventory {
     pub kind: Option<String>,
     pub present: bool,
     pub capture_method: String,
+    pub ancestors: Vec<Ancestor>,
 }
 
 type RunHook<'a> = Option<&'a mut dyn FnMut(&[String]) -> Result<(), SecurityError>>;
@@ -34,6 +35,9 @@ type MountHook<'a> = Option<&'a mut dyn FnMut(&str) -> Result<MountSnapshot, Sec
 pub struct SyncOptions<'a> {
     pub run: RunHook<'a>,
     pub mounts: MountHook<'a>,
+    /// Empty means the quiesced-copy method used by stop, hooks, and external.
+    pub capture_method: String,
+    pub before_copy: Option<&'a mut dyn FnMut() -> Result<(), SecurityError>>,
 }
 
 pub fn sync_paths(
@@ -52,8 +56,16 @@ pub fn sync_paths(
             return Err(SecurityError::invalid("sources.paths must be a list"));
         }
     };
+    let capture_method = if options.capture_method.is_empty() {
+        "quiesced-copy".to_owned()
+    } else {
+        options.capture_method.clone()
+    };
     let mut inventory = Vec::new();
     for source in paths {
+        if let Some(before_copy) = options.before_copy.as_mut() {
+            before_copy()?;
+        }
         let Some(source) = source.as_map() else {
             return Err(SecurityError::invalid("path source must be a mapping"));
         };
@@ -66,12 +78,13 @@ pub fn sync_paths(
         let resolved = validate_path_source_policy(config, manifest, source)?;
         let destination = stage.join("paths").join(id);
         match copy_one(&resolved, &destination, source, options) {
-            Ok(kind) => inventory.push(PathInventory {
+            Ok((kind, ancestors)) => inventory.push(PathInventory {
                 id: id.to_owned(),
                 path: declared.to_owned(),
                 kind: Some(kind),
                 present: true,
-                capture_method: "quiesced-copy".to_owned(),
+                capture_method: capture_method.clone(),
+                ancestors,
             }),
             Err(error) if error.is_missing_path() && !required => {
                 if let Some(parent) = destination.parent() {
@@ -84,7 +97,8 @@ pub fn sync_paths(
                     path: declared.to_owned(),
                     kind: None,
                     present: false,
-                    capture_method: "quiesced-copy".to_owned(),
+                    capture_method: capture_method.clone(),
+                    ancestors: Vec::new(),
                 });
             }
             Err(error) if error.is_missing_path() => {
@@ -101,8 +115,8 @@ fn copy_one(
     destination: &Path,
     source: &BTreeMap<String, Yaml>,
     options: &mut SyncOptions<'_>,
-) -> Result<String, SecurityError> {
-    let (fd, metadata) = open_data_path(Path::new(source_path))?;
+) -> Result<(String, Vec<Ancestor>), SecurityError> {
+    let (fd, metadata, ancestors) = open_data_path(Path::new(source_path))?;
     let mode = mode_of(&metadata);
     let include = string_list(source.get("include"));
     if !include.is_empty() && !is_dir(mode) {
@@ -151,7 +165,7 @@ fn copy_one(
             "unsupported path source type: {source_path}"
         )));
     };
-    let (_reopened, current) = open_data_path(Path::new(source_path))?;
+    let (_reopened, current, _ignored) = open_data_path(Path::new(source_path))?;
     if metadata.st_dev != current.st_dev
         || metadata.st_ino != current.st_ino
         || (mode & 0o170000) != (mode_of(&current) & 0o170000)
@@ -166,7 +180,7 @@ fn copy_one(
             "mount topology changed during backup: {source_path}"
         )));
     }
-    Ok(kind.to_owned())
+    Ok((kind.to_owned(), ancestors))
 }
 
 fn archive_symlink(

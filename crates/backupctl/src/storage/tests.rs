@@ -286,6 +286,8 @@ fn directory_copy_records_one_file_system_and_mount_change() {
         &mut SyncOptions {
             run: Some(&mut run),
             mounts: Some(&mut mounts),
+            capture_method: String::new(),
+            before_copy: None,
         },
     )
     .unwrap_err();

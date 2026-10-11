@@ -124,9 +124,29 @@ pub enum Command {
 pub enum CliError {
     #[error("{command} is not ported yet")]
     NotPorted { command: &'static str },
+    #[error("{0}")]
+    Failed(String),
+    #[error("")]
+    Reported,
 }
 
 pub fn run(cli: Cli) -> Result<(), CliError> {
+    if let Command::Backup {
+        services,
+        allow_low_space,
+    } = cli.command
+    {
+        return crate::files::run_backup(
+            crate::documents::CONFIG_PATH,
+            &services,
+            allow_low_space,
+            "restic",
+        )
+        .map_err(|error| match error {
+            crate::files::CommandError::Text(message) => CliError::Failed(message),
+            crate::files::CommandError::Reported => CliError::Reported,
+        });
+    }
     let name = match cli.command {
         Command::List => "list",
         Command::Status { .. } => "status",

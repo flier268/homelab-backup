@@ -7,6 +7,7 @@ use homelab_backup_domain::yaml::Yaml;
 
 use crate::unix::error::SecurityError;
 
+#[allow(dead_code)]
 pub fn snapshots_command(host_id: &str, filters: &[String]) -> Vec<String> {
     let mut command = vec![
         "restic".to_owned(),
@@ -19,6 +20,7 @@ pub fn snapshots_command(host_id: &str, filters: &[String]) -> Vec<String> {
     command
 }
 
+#[allow(dead_code)]
 pub fn retention_command(
     host_id: &str,
     service: &str,
@@ -67,6 +69,7 @@ pub fn parse_repository_id(stdout: &str) -> Result<String, SecurityError> {
     }
 }
 
+#[allow(dead_code)]
 pub fn parse_snapshots(
     stdout: &str,
 ) -> Result<Vec<serde_json::Map<String, serde_json::Value>>, SecurityError> {

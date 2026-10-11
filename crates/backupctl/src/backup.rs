@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, FixedOffset, SecondsFormat};
 use homelab_backup_domain::manifest::service_label;
 use homelab_backup_domain::yaml::Yaml;
 
@@ -17,15 +17,19 @@ pub struct BackupCommand {
     pub cwd: Option<PathBuf>,
 }
 
+type SaveState<'a> =
+    &'a mut dyn FnMut(&BTreeMap<String, serde_json::Value>) -> Result<(), SecurityError>;
+
 pub struct BackupDeps<'a> {
-    pub now: &'a mut dyn FnMut() -> DateTime<Utc>,
+    pub now: &'a mut dyn FnMut() -> DateTime<FixedOffset>,
     pub load_state: &'a mut dyn FnMut() -> BTreeMap<String, serde_json::Value>,
-    pub save_state: &'a mut dyn FnMut(&BTreeMap<String, serde_json::Value>),
+    pub save_state: SaveState<'a>,
     pub stage: &'a mut dyn FnMut() -> Result<PathBuf, SecurityError>,
     pub fingerprint: &'a mut dyn FnMut(&PathBuf) -> Result<String, SecurityError>,
     pub repository_id: &'a mut dyn FnMut() -> Result<String, SecurityError>,
     pub run: &'a mut dyn FnMut(BackupCommand) -> Result<(), SecurityError>,
     pub remove_stage: &'a mut dyn FnMut(&PathBuf) -> Result<(), SecurityError>,
+    pub on_success: &'a mut dyn FnMut() -> Result<(), SecurityError>,
     pub on_failure: &'a mut dyn FnMut(&SecurityError, &str),
 }
 
@@ -52,24 +56,37 @@ pub fn execute_backup(
     state
         .entry("first_seen_at".to_owned())
         .or_insert_with(|| json_time(started));
-    (deps.save_state)(&state);
+    if let Err(error) = (deps.save_state)(&state) {
+        (deps.on_failure)(&error, "state");
+        return Err(error);
+    }
+    let _ = allow_low_space;
 
     let stage = match (deps.stage)() {
         Ok(stage) => stage,
         Err(error) => {
-            record_failure(config, &label, started, &mut state, &error, deps);
+            record_failure(
+                config, service, started, &mut state, &error, "staging", deps,
+            );
             return Err(error);
         }
     };
-    let _ = allow_low_space;
     let fingerprint = match (deps.fingerprint)(&stage) {
         Ok(fingerprint) => fingerprint,
         Err(error) => {
-            record_failure(config, &label, started, &mut state, &error, deps);
+            record_failure(
+                config, service, started, &mut state, &error, "staging", deps,
+            );
             return Err(error);
         }
     };
-    let repository_id = (deps.repository_id)()?;
+    let repository_id = match (deps.repository_id)() {
+        Ok(repository_id) => repository_id,
+        Err(error) => {
+            record_failure(config, service, started, &mut state, &error, "restic", deps);
+            return Err(error);
+        }
+    };
     let host_id = config.get("host_id").map(String::as_str).unwrap_or("");
     let snapshot_context = snapshot_context_fingerprint(host_id, &repository_id);
     let unchanged = state
@@ -100,7 +117,10 @@ pub fn execute_backup(
             ],
             cwd: Some(stage.clone()),
         };
-        (deps.run)(command)?;
+        if let Err(error) = (deps.run)(command) {
+            record_failure(config, service, started, &mut state, &error, "restic", deps);
+            return Err(error);
+        }
         state.insert(
             "last_snapshot_fingerprint".to_owned(),
             serde_json::Value::String(fingerprint),
@@ -111,10 +131,22 @@ pub fn execute_backup(
         );
         true
     };
+    let mut postcommit = None;
     if let Err(error) = (deps.remove_stage)(&stage) {
         eprintln!(
-            "ERROR: Restic backup for {label} completed, but staging cleanup failed: {error}"
+            "ERROR: Restic backup for {label} completed, but staging cleanup failed: RuntimeError: {error}"
         );
+        (deps.on_failure)(&error, "cleanup");
+        postcommit = Some(error);
+    }
+    if let Err(error) = (deps.on_success)() {
+        eprintln!(
+            "ERROR: Restic backup for {label} completed, but on_success actions failed: RuntimeError: {error}"
+        );
+        (deps.on_failure)(&error, "on_success");
+        if postcommit.is_none() {
+            postcommit = Some(error);
+        }
     }
     let finished = (deps.now)();
     state.insert("last_success_at".to_owned(), json_time(finished));
@@ -128,21 +160,31 @@ pub fn execute_backup(
         "last_duration_seconds".to_owned(),
         serde_json::json!((finished - started).num_milliseconds() as f64 / 1000.0),
     );
-    (deps.save_state)(&state);
+    if let Err(error) = (deps.save_state)(&state) {
+        eprintln!(
+            "ERROR: Restic backup for {label} completed, but state update failed: RuntimeError: {error}"
+        );
+        (deps.on_failure)(&error, "state");
+        return Err(postcommit.unwrap_or(error));
+    }
+    if let Some(error) = postcommit {
+        return Err(error);
+    }
     Ok(committed)
 }
 
 fn record_failure(
     config: &BTreeMap<String, String>,
-    label: &str,
-    started: DateTime<Utc>,
+    service: &str,
+    started: DateTime<FixedOffset>,
     state: &mut BTreeMap<String, serde_json::Value>,
     error: &SecurityError,
+    phase: &str,
     deps: &mut BackupDeps<'_>,
 ) {
-    (deps.on_failure)(error, "staging");
+    (deps.on_failure)(error, phase);
     if let Some(root) = config.get("staging_root") {
-        let partial = PathBuf::from(root).join(label);
+        let partial = PathBuf::from(root).join(service);
         let _ = (deps.remove_stage)(&partial);
     }
     let finished = (deps.now)();
@@ -159,10 +201,10 @@ fn record_failure(
         "last_duration_seconds".to_owned(),
         serde_json::json!((finished - started).num_milliseconds() as f64 / 1000.0),
     );
-    (deps.save_state)(state);
+    let _ = (deps.save_state)(state);
 }
 
-fn json_time(value: DateTime<Utc>) -> serde_json::Value {
+fn json_time(value: DateTime<FixedOffset>) -> serde_json::Value {
     serde_json::Value::String(value.to_rfc3339_opts(SecondsFormat::Secs, false))
 }
 
@@ -197,10 +239,12 @@ mod tests {
                     "2026-01-01T00:00:05Z"
                 })
                 .unwrap()
-                .with_timezone(&Utc)
             },
             load_state: &mut || saved.clone(),
-            save_state: &mut |next| state = next.clone(),
+            save_state: &mut |next| {
+                state = next.clone();
+                Ok(())
+            },
             stage: &mut || Ok(PathBuf::from("/tmp/stage")),
             fingerprint: &mut |_| Ok(fingerprint.clone()),
             repository_id: &mut || Ok(repository_id.clone()),
@@ -209,6 +253,7 @@ mod tests {
                 Ok(())
             },
             remove_stage: &mut |_| Ok(()),
+            on_success: &mut || Ok(()),
             on_failure: &mut |_error, _phase| {},
         };
         let manifest = BTreeMap::from([("service".to_owned(), Yaml::string("demo"))]);

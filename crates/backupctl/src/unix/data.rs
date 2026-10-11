@@ -19,7 +19,18 @@ pub struct CapturedCommand {
     pub stdout: String,
 }
 
-pub fn open_data_path(path: &Path) -> Result<(OwnedFd, rustix::fs::Stat), SecurityError> {
+/// One real directory between `/` and the payload, as recorded for restore.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ancestor {
+    pub path: String,
+    pub uid: u32,
+    pub gid: u32,
+    pub mode: u32,
+}
+
+pub fn open_data_path(
+    path: &Path,
+) -> Result<(OwnedFd, rustix::fs::Stat, Vec<Ancestor>), SecurityError> {
     let path = absolute(path)?;
     if path == "/" {
         return Err(SecurityError::invalid(
@@ -34,6 +45,7 @@ pub fn open_data_path(path: &Path) -> Result<(OwnedFd, rustix::fs::Stat), Securi
     )
     .map_err(|error| SecurityError::runtime(error.to_string()))?;
     let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    let mut ancestors = Vec::new();
     for (index, component) in parts.iter().enumerate() {
         let final_component = index + 1 == parts.len();
         let metadata = match statat(&current, *component, AtFlags::SYMLINK_NOFOLLOW) {
@@ -76,10 +88,18 @@ pub fn open_data_path(path: &Path) -> Result<(OwnedFd, rustix::fs::Stat), Securi
                 "data path changed while being opened: {path}"
             )));
         }
+        if !final_component {
+            ancestors.push(Ancestor {
+                path: parts[..=index].join("/"),
+                uid: opened.st_uid,
+                gid: opened.st_gid,
+                mode: mode_of(&opened) & 0o7777,
+            });
+        }
         current = next;
     }
     let metadata = fstat(&current).map_err(|error| SecurityError::runtime(error.to_string()))?;
-    Ok((current, metadata))
+    Ok((current, metadata, ancestors))
 }
 
 type PayloadRunner<'a> = &'a mut dyn FnMut(&[String]) -> CapturedCommand;
@@ -214,8 +234,13 @@ mod tests {
             std::fs::Permissions::from_mode(0o777),
         )
         .unwrap();
-        let (fd, metadata) = open_data_path(&saved).unwrap();
+        let (fd, metadata, ancestors) = open_data_path(&saved).unwrap();
         assert!(is_dir(mode_of(&metadata)));
+        assert!(
+            ancestors
+                .iter()
+                .any(|item| item.path.ends_with("Pal") && item.mode == 0o777)
+        );
         drop(fd);
         let _ = std::fs::set_permissions(
             root.join("palworld").join("Pal"),
