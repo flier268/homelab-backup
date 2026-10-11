@@ -115,7 +115,7 @@ class LauncherTests(unittest.TestCase):
         class TrackingLock:
             paths = []
 
-            def __init__(self, path, nonblocking=False):
+            def __init__(self, path, nonblocking=False, retries=0):
                 self.path = path
 
             def __enter__(self):
@@ -143,7 +143,7 @@ class LauncherTests(unittest.TestCase):
 
     def test_no_wait_does_not_block_while_loading_consistent_config(self):
         class BusyLock:
-            def __init__(self, _path, nonblocking=False):
+            def __init__(self, _path, nonblocking=False, retries=0):
                 self.nonblocking = nonblocking
 
             def __enter__(self):

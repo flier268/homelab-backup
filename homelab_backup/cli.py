@@ -9,7 +9,8 @@ from .backup import (
     cmd_validate,
 )
 from .common import (
-    CommandError, GlobalLock, _print_command_failure, format_remediable_error,
+    RUN_DUE_LOCK_RETRIES, CommandError, GlobalLock, _print_command_failure,
+    format_remediable_error,
 )
 from .config import cfg, config_lock_file
 from .docs import DocsError, cmd_docs
@@ -45,6 +46,12 @@ def _nonblocking_requested(args):
     if args.cmd in ('run-due', 'unlock'):
         return True
     return args.cmd in ('maintenance', 'check') and args.no_wait
+
+
+def _lock_retries(args):
+    # A timer-driven run-due that collides with a just-finishing run would
+    # otherwise skip a whole interval; retry briefly first.
+    return RUN_DUE_LOCK_RETRIES if args.cmd == 'run-due' else 0
 
 
 def _report_unavailable_lock(command):
@@ -133,11 +140,14 @@ def build_parser():
         'notify-failure',
         help='send a failure notification for a systemd unit (OnFailure=); '
              'the push includes the last 30 journal lines of the unit and '
-             'is repeated at most once per alert.renotify_after',
+             'is repeated at most once per alert.renotify_after while the '
+             'failure is unchanged',
         description='Log an ALERT line for UNIT and push a notification '
                     'including the last 30 journal lines of the unit to '
                     'alert.notify_url_file. Repeated failures of the same '
-                    'unit are pushed at most once per alert.renotify_after.',
+                    'unit are pushed at most once per alert.renotify_after '
+                    'unless the set of failed services changes; a successful '
+                    'run of the unit resets this.',
     )
     command.add_argument('unit')
     sub.add_parser('docs')
@@ -173,6 +183,7 @@ def main(argv=None):
             selected_lock = config_lock_file()
             with GlobalLock(
                 selected_lock, nonblocking=_nonblocking_requested(args),
+                retries=_lock_retries(args),
             ) as acquired:
                 if not acquired:
                     _report_unavailable_lock(args.cmd)

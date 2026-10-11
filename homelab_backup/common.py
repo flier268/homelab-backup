@@ -5,6 +5,7 @@ import shlex
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import yaml
@@ -233,12 +234,26 @@ def global_lock_holder(path):
     }
 
 
+RUN_DUE_LOCK_RETRIES = 3
+LOCK_RETRY_SECONDS = 0.1
+
+
+def lock_retry_sleep(seconds):
+    time.sleep(seconds)
+
+
 class GlobalLock:
+    """Process-wide backup lock; reentrant within one process.
+
+    With ``nonblocking=True`` a busy lock is retried ``retries`` more times,
+    ``LOCK_RETRY_SECONDS`` apart, before giving up (``__enter__`` -> False).
+    """
     _held = {}
 
-    def __init__(self, path, nonblocking=False):
+    def __init__(self, path, nonblocking=False, retries=0):
         self.path = Path(path)
         self.nonblocking = nonblocking
+        self.retries = retries
         self.handle = None
         self._key = (os.getpid(), os.path.abspath(self.path))
         self._nested = False
@@ -267,12 +282,18 @@ class GlobalLock:
         os.fchmod(fd, 0o600)
         self.handle = os.fdopen(fd, 'a+', encoding='utf-8')
         flags = fcntl.LOCK_EX | (fcntl.LOCK_NB if self.nonblocking else 0)
-        try:
-            fcntl.flock(self.handle.fileno(), flags)
-        except BlockingIOError:
-            self.handle.close()
-            self.handle = None
-            return False
+        attempt = 0
+        while True:
+            try:
+                fcntl.flock(self.handle.fileno(), flags)
+                break
+            except BlockingIOError:
+                if attempt >= self.retries:
+                    self.handle.close()
+                    self.handle = None
+                    return False
+                attempt += 1
+                lock_retry_sleep(LOCK_RETRY_SECONDS)
         self.handle.seek(0)
         self.handle.truncate()
         self.handle.write(f'pid={os.getpid()} started={dt.datetime.now().astimezone().isoformat()}\n')
@@ -289,5 +310,12 @@ class GlobalLock:
             return
         self._held.pop(self._key, None)
         handle = held['handle']
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        handle.close()
+        try:
+            # Clear the holder line first so a stale pid/started never
+            # survives a release.
+            handle.seek(0)
+            handle.truncate()
+            handle.flush()
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            handle.close()

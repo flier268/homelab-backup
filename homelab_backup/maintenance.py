@@ -1,19 +1,22 @@
 import datetime as dt
+import hashlib
 import json
 import os
 import sys
 
 from .backup import backup_one, retention_cmd
 from .alerting import (
-    load_alert_state, notified_within, notify, save_alert_state,
+    alert_state_transaction, load_alert_state, notified_within, notify,
+    parse_timestamp,
 )
 from .backup_state import (
     due_status, load_state, save_state, success_staleness,
 )
 from .btrfs_snapshot import cleanup_snapshot_state, snapshot_state_services
 from .common import (
-    CommandError, FailureSummary, GlobalLock, _print_command_failure,
-    clear_stale_restic_locks, die, global_lock_holder, restic_env, run,
+    RUN_DUE_LOCK_RETRIES, CommandError, FailureSummary, GlobalLock,
+    _print_command_failure, clear_stale_restic_locks, die, global_lock_holder,
+    restic_env, run,
 )
 from .manifest import (
     manifest, manifests, service_label, valid_service_name, validate_manifest,
@@ -66,10 +69,14 @@ DEFAULT_MAX_LOCK_AGE = '13h'
 
 
 def _stalled_lock_alert(c, now):
-    """Report the global lock holder; return an alert line if it is stalled."""
+    """Report the global lock holder.
+
+    Returns ``(alert line, holder)`` when the lock is stalled, otherwise
+    ``(None, None)``.
+    """
     lock_file = c.get('lock_file')
     if not lock_file:
-        return None
+        return None, None
     try:
         holder = global_lock_holder(lock_file)
     except OSError as err:
@@ -77,9 +84,9 @@ def _stalled_lock_alert(c, now):
             f'WARNING: could not inspect global lock {lock_file}: {err}',
             file=sys.stderr,
         )
-        return None
+        return None, None
     if holder is None:
-        return None
+        return None, None
     try:
         started = dt.datetime.fromisoformat(holder['started'])
         if started.tzinfo is None:
@@ -90,7 +97,7 @@ def _stalled_lock_alert(c, now):
             f"start time ({holder['started']!r}); cannot tell if it is stalled",
             file=sys.stderr,
         )
-        return None
+        return None, None
     held_seconds = int((now - started).total_seconds())
     print(json.dumps({
         'lock_holder': {
@@ -101,30 +108,67 @@ def _stalled_lock_alert(c, now):
     max_age = (c.get('alert') or {}).get('max_lock_age', DEFAULT_MAX_LOCK_AGE)
     max_age_seconds = parse_duration(max_age, 'alert.max_lock_age')
     if held_seconds <= max_age_seconds:
-        return None
+        return None, None
     return (
         f"global lock held by pid={holder['pid']} since {holder['started']} "
         f"({held_seconds}s > {max_age_seconds}s); backup or check may be stalled"
-    )
+    ), holder
 
 
-def _status_signature(stale, lock_alert, status_errors):
+def _digest(value):
+    text = json.dumps(value, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(text.encode('utf-8')).hexdigest()
+
+
+def _status_signature(stale, lock_holder, status_errors):
+    """Identify a status problem; any change in content re-notifies."""
     return json.dumps({
         'stale': sorted(service for service, _, _ in stale),
-        'lock_stalled': bool(lock_alert),
-        'status_errors': bool(status_errors),
+        'lock_holder': (
+            {'pid': lock_holder.get('pid'), 'started': lock_holder.get('started')}
+            if lock_holder else None
+        ),
+        'status_errors': (
+            _digest(sorted([str(op), str(error)] for op, error in status_errors))
+            if status_errors else None
+        ),
     }, sort_keys=True)
 
 
-def _notify_status(c, now, stale, lock_alert, status_errors):
+def _status_title(stale, lock_alert, status_errors):
+    problems = []
+    if stale:
+        problems.append('backups are stale')
+    if lock_alert:
+        problems.append('backup appears stalled')
+    if status_errors:
+        problems.append('status check failed')
+    return '; '.join(problems)
+
+
+def _record_status_alert(c, fields):
+    """Store status alert fields, dropping any older handled-run record."""
+    with alert_state_transaction(c) as alert_state:
+        entry = alert_state.get('status')
+        entry = dict(entry) if isinstance(entry, dict) else {}
+        entry.pop('handled_at', None)
+        entry.pop('invocation_id', None)
+        entry.update({key: value for key, value in fields.items() if value})
+        if entry or 'status' in alert_state:
+            alert_state['status'] = entry
+
+
+def _notify_status(c, now, stale, lock_alert, lock_holder, status_errors):
     """Notify on change only; repeat an unchanged problem after renotify_after.
 
     healthchecks OK pings are heartbeats and go out on every OK run; ntfy gets
-    a single recovery message when a notified problem clears.
+    a single recovery message when a notified problem clears. A stale/stalled
+    problem that was delivered or deliberately suppressed is recorded as
+    handled by this run (systemd INVOCATION_ID) so notify-failure does not
+    push the same failed run twice.
     """
     host = c.get('host_id', '?')
-    alert_state = load_alert_state(c)
-    previous = alert_state.get('status')
+    previous = load_alert_state(c).get('status')
     previous = previous if isinstance(previous, dict) else {}
     if not (stale or lock_alert or status_errors):
         recovered = bool(previous.get('signature'))
@@ -134,10 +178,16 @@ def _notify_status(c, now, stale, lock_alert, status_errors):
             'all scheduled backups are fresh', ok=True, recovered=recovered,
         )
         if recovered and delivered:
-            alert_state.pop('status', None)
-            save_alert_state(c, alert_state)
+            with alert_state_transaction(c) as alert_state:
+                alert_state.pop('status', None)
         return
-    signature = _status_signature(stale, lock_alert, status_errors)
+    # Status' own errors exit 1 and must always reach the notify-failure
+    # push, so such a run is never marked as handled.
+    handled = {} if status_errors else {
+        'handled_at': now.isoformat(),
+        'invocation_id': os.environ.get('INVOCATION_ID'),
+    }
+    signature = _status_signature(stale, lock_holder, status_errors)
     if previous.get('signature') == signature \
             and notified_within(previous, c, now):
         print(
@@ -145,6 +195,7 @@ def _notify_status(c, now, stale, lock_alert, status_errors):
             'not notifying again before alert.renotify_after',
             file=sys.stderr,
         )
+        _record_status_alert(c, handled)
         return
     lines = [
         f"{service}: last success {state.get('last_success_at') or 'never'}"
@@ -153,15 +204,15 @@ def _notify_status(c, now, stale, lock_alert, status_errors):
     ]
     if lock_alert:
         lines.append(lock_alert)
-    if status_errors:
-        lines.append('status itself reported errors; see journal')
-    problem = 'backups are stale' if stale or not lock_alert else \
-        'backup appears stalled'
-    if notify(c, f'homelab-backup on {host}: {problem}', '\n'.join(lines)):
-        alert_state['status'] = {
-            'signature': signature, 'notified_at': now.isoformat(),
-        }
-        save_alert_state(c, alert_state)
+    lines.extend(
+        f'status error: {operation}: {error}'
+        for operation, error in status_errors
+    )
+    title = _status_title(stale, lock_alert, status_errors)
+    if notify(c, f'homelab-backup on {host}: {title}', '\n'.join(lines)):
+        _record_status_alert(c, {
+            'signature': signature, 'notified_at': now.isoformat(), **handled,
+        })
 
 
 def cmd_status(c, args):
@@ -219,51 +270,128 @@ def cmd_status(c, args):
             f"last error: {state.get('last_error') or '-'})",
             file=sys.stderr,
         )
-    lock_alert = _stalled_lock_alert(c, now)
+    lock_alert, lock_holder = _stalled_lock_alert(c, now)
     if lock_alert:
         print(f'ALERT: {lock_alert}', file=sys.stderr)
     if getattr(args, 'notify', False) is True:
-        _notify_status(c, now, stale, lock_alert, failures.has_failures())
+        _notify_status(c, now, stale, lock_alert, lock_holder, failures.items)
     failures.raise_if_any('STATUS FAILURES')
     if stale or lock_alert:
         raise SystemExit(STALE_EXIT_CODE)
 
 
+BACKUP_UNIT = 'homelab-backup.service'
+MAINTENANCE_UNIT = 'homelab-backup-maintenance.service'
+CHECK_UNIT = 'homelab-backup-check.service'
 STATUS_UNIT = 'homelab-backup-status.service'
+STATUS_HANDLED_WINDOW = dt.timedelta(minutes=20)
 
 
 def print_unit_failure_alert(unit):
     print(f'ALERT: systemd unit failed: {unit}', file=sys.stderr)
 
 
+def _unit_record(alert_state, unit):
+    units = alert_state.get('units')
+    record = units.get(unit) if isinstance(units, dict) else None
+    return record if isinstance(record, dict) else {}
+
+
+def _update_unit_record(c, unit, update):
+    """Apply ``update(record)`` to ``units[unit]`` under the alert lock."""
+    with alert_state_transaction(c) as alert_state:
+        units = alert_state.get('units')
+        units = units if isinstance(units, dict) else {}
+        record = units.get(unit)
+        record = dict(record) if isinstance(record, dict) else {}
+        update(record)
+        units[unit] = record
+        alert_state['units'] = units
+
+
+def _record_unit_failures(c, unit, failures):
+    """Remember which operations failed so a changed set re-notifies."""
+    signature = sorted({str(operation) for operation, _ in failures.items})
+    _update_unit_record(
+        c, unit, lambda record: record.update(failure_signature=signature),
+    )
+
+
+def _clear_unit_alert(c, unit):
+    """A successful run resets throttling, so the next failure pushes."""
+    if not _unit_record(load_alert_state(c), unit):
+        return
+    with alert_state_transaction(c) as alert_state:
+        units = alert_state.get('units')
+        if isinstance(units, dict):
+            units.pop(unit, None)
+
+
+def _status_handled_failed_run(alert_state, record, now):
+    """True when ``status --notify`` already handled the run that failed."""
+    status = alert_state.get('status')
+    if not isinstance(status, dict):
+        return False
+    handled_at = parse_timestamp(status.get('handled_at'))
+    if handled_at is None or handled_at > now:
+        return False
+    handled_id = status.get('invocation_id')
+    # systemd >= 251 passes the failed run's id to OnFailure= units.
+    failed_id = os.environ.get('MONITOR_INVOCATION_ID')
+    if handled_id and failed_id:
+        return handled_id == failed_id
+    # Without both ids, only a recent record that no earlier notify-failure
+    # has already consumed can belong to this failure.
+    if now - handled_at > STATUS_HANDLED_WINDOW:
+        return False
+    last_failure = parse_timestamp(record.get('last_failure_at'))
+    return last_failure is None or handled_at > last_failure
+
+
 def cmd_notify_failure(c, args):
     """Entry point for systemd OnFailure= (homelab-backup-notify@.service).
 
-    The ALERT line always reaches the journal; the push is throttled per unit
-    by alert.renotify_after. ``status --notify`` already pushes its own
-    problem, so a failed status unit is not pushed again while that
-    notification is recent.
+    The ALERT line always reaches the journal. The push is throttled per unit
+    by alert.renotify_after while the recorded failure signature (the failed
+    services of run-due) is unchanged; a successful run clears the record. A
+    failed status run whose problem ``status --notify`` already handled is
+    not pushed again; status' own errors always are.
     """
     unit = args.unit
     if getattr(args, 'alert_printed', False) is not True:
         print_unit_failure_alert(unit)
     now = local_now()
     alert_state = load_alert_state(c)
-    if unit == STATUS_UNIT and notified_within(alert_state.get('status'), c, now):
+    record = _unit_record(alert_state, unit)
+    signature = record.get('failure_signature')
+    delivered = False
+    if unit == STATUS_UNIT and _status_handled_failed_run(alert_state, record, now):
         print(
-            'status already notified this problem; not pushing it again',
+            'status already handled this problem; not pushing it again',
             file=sys.stderr,
         )
-        return
-    units = alert_state.get('units')
-    units = units if isinstance(units, dict) else {}
-    if notified_within(units.get(unit), c, now):
+    elif notified_within(record, c, now) \
+            and record.get('notified_signature') == signature:
         print(
-            f"{unit} failure already notified at {units[unit]['notified_at']}; "
+            f"{unit} failure already notified at {record['notified_at']}; "
             'not pushing again before alert.renotify_after',
             file=sys.stderr,
         )
-        return
+    else:
+        delivered = _push_unit_failure(c, unit, signature)
+
+    def update(current):
+        current['last_failure_at'] = now.isoformat()
+        if delivered:
+            current['notified_at'] = now.isoformat()
+            current.pop('notified_signature', None)
+            if signature is not None:
+                current['notified_signature'] = signature
+
+    _update_unit_record(c, unit, update)
+
+
+def _push_unit_failure(c, unit, signature):
     detail = ''
     try:
         detail = run(
@@ -273,24 +401,25 @@ def cmd_notify_failure(c, args):
         ).stdout or ''
     except Exception as err:  # noqa: BLE001 - journal is optional context
         detail = f'(journal unavailable: {err})'
+    if signature:
+        detail = 'failed: ' + ', '.join(signature) + '\n\n' + detail
     delivered = notify(
         c, f"homelab-backup on {c.get('host_id', '?')}: {unit} failed",
         detail[-3500:] or 'see journalctl for details',
     )
-    if delivered:
-        units[unit] = {'notified_at': now.isoformat()}
-        alert_state['units'] = units
-        save_alert_state(c, alert_state)
-    else:
+    if not delivered:
         print(
             'WARNING: failure notification was not delivered '
             '(alert.notify_url_file not configured or unreachable)',
             file=sys.stderr,
         )
+    return delivered
 
 
 def cmd_run_due(c, args):
-    with GlobalLock(c['lock_file'], nonblocking=True) as acquired:
+    with GlobalLock(
+        c['lock_file'], nonblocking=True, retries=RUN_DUE_LOCK_RETRIES,
+    ) as acquired:
         if not acquired:
             print('SKIP: another backup or maintenance process is still running')
             return
@@ -335,6 +464,11 @@ def cmd_run_due(c, args):
                 )
                 if os.environ.get('BACKUPCTL_DEBUG') == '1':
                     raise
+        if failures.has_failures():
+            _record_unit_failures(c, BACKUP_UNIT, failures)
+        elif due:
+            # "No backups are due" proves nothing; keep the record then.
+            _clear_unit_alert(c, BACKUP_UNIT)
         failures.raise_if_any('SCHEDULED BACKUP FAILURES')
 
 
@@ -446,6 +580,8 @@ def cmd_maintenance(c, args):
                 )
                 if os.environ.get('BACKUPCTL_DEBUG') == '1':
                     raise
+        if not args.dry_run and not failures.has_failures():
+            _clear_unit_alert(c, MAINTENANCE_UNIT)
         failures.raise_if_any('MAINTENANCE FAILURES')
 
 
@@ -460,6 +596,7 @@ def cmd_check(c, args):
         if subset:
             cmd += ['--read-data-subset', str(subset)]
         run(cmd, env=restic_env(c))
+        _clear_unit_alert(c, CHECK_UNIT)
 
 
 def cmd_unlock(c, args):

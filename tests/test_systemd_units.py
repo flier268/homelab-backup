@@ -76,13 +76,26 @@ class SystemdUnitTests(unittest.TestCase):
 
     def test_backup_timeout_stays_below_default_max_lock_age(self):
         from homelab_backup import maintenance, schedule
-        timeout = unit('homelab-backup.service')['Service']['TimeoutStartSec']
-        self.assertLess(
-            schedule.parse_duration(timeout, 'TimeoutStartSec'),
-            schedule.parse_duration(
-                maintenance.DEFAULT_MAX_LOCK_AGE, 'alert.max_lock_age',
-            ),
+        max_lock_age = schedule.parse_duration(
+            maintenance.DEFAULT_MAX_LOCK_AGE, 'alert.max_lock_age',
         )
+        # Every unit that holds the global lock must time out first.
+        for name in (
+            'homelab-backup.service',
+            'homelab-backup-maintenance.service',
+            'homelab-backup-check.service',
+        ):
+            with self.subTest(unit=name):
+                timeout = unit(name)['Service']['TimeoutStartSec']
+                self.assertLess(
+                    schedule.parse_duration(timeout, 'TimeoutStartSec'),
+                    max_lock_age,
+                )
+
+    def test_check_timeout_documents_its_reasoning(self):
+        text = (SYSTEMD / 'homelab-backup-check.service').read_text()
+        for phrase in ('read_data_subset', 'alert.max_lock_age', 'raise both'):
+            self.assertIn(phrase, text)
 
     def test_notify_template_does_not_recurse(self):
         notify = unit(NOTIFY)

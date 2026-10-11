@@ -7,14 +7,20 @@ root-owned file holding a single https URL.
 Delivered alerts are remembered in ``<state_root>/_alerts.json`` so repeated
 runs only notify on change or after ``alert.renotify_after``. Service state
 files must start with an alphanumeric character, so this name never collides.
-Alert state is best effort: read/write problems only warn and never prevent a
+Every read-modify-write holds ``<state_root>/_alerts.lock`` (never the global
+backup lock, so alerting keeps working while a backup is stuck). Alert state
+is best effort: read/write/lock problems only warn and never prevent a
 notification from being sent.
 """
+import contextlib
+import copy
 import datetime as dt
+import fcntl
 import json
 import os
 import stat
 import sys
+import time
 import urllib.parse
 import urllib.request
 
@@ -26,6 +32,9 @@ from .security import (
 
 NOTIFY_TIMEOUT_SECONDS = 10
 ALERT_STATE_NAME = '_alerts.json'
+ALERT_LOCK_NAME = '_alerts.lock'
+ALERT_LOCK_TIMEOUT_SECONDS = 10
+ALERT_LOCK_RETRY_SECONDS = 0.1
 DEFAULT_RENOTIFY_AFTER = '24h'
 
 
@@ -80,7 +89,70 @@ def save_alert_state(c, state):
         print(f'WARNING: could not save alert state: {err}', file=sys.stderr)
 
 
-def _timestamp(value):
+def alert_lock_sleep(seconds):
+    time.sleep(seconds)
+
+
+def _acquire_alert_lock(c):
+    """Return a descriptor holding the alert lock, or None (fail open)."""
+    root = lexical_absolute(c['state_root'])
+    path = root / ALERT_LOCK_NAME
+    fd = -1
+    try:
+        ensure_control_directory(root)
+        fd = os.open(
+            path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600,
+        )
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError('not a regular file')
+        os.fchmod(fd, 0o600)
+        deadline = time.monotonic() + ALERT_LOCK_TIMEOUT_SECONDS
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return fd
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f'still held after {ALERT_LOCK_TIMEOUT_SECONDS}s',
+                    ) from None
+                alert_lock_sleep(ALERT_LOCK_RETRY_SECONDS)
+    except (OSError, ValueError) as err:
+        if fd >= 0:
+            os.close(fd)
+        print(
+            f'WARNING: could not lock alert state {path}: {err}; '
+            'continuing without the lock',
+            file=sys.stderr,
+        )
+        return None
+
+
+@contextlib.contextmanager
+def alert_state_transaction(c):
+    """Yield the alert state under ``_alerts.lock`` and save it on exit.
+
+    The state is saved only when the block changed it and did not raise.
+    Lock problems fail open with a warning so notifications still go out.
+    Not reentrant: flock conflicts between descriptors of one process too.
+    """
+    if not c.get('state_root'):
+        yield {}
+        return
+    fd = _acquire_alert_lock(c)
+    try:
+        state = load_alert_state(c)
+        original = copy.deepcopy(state)
+        yield state
+        if state != original:
+            save_alert_state(c, state)
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def parse_timestamp(value):
+    """Return an aware datetime parsed from an ISO string, or None."""
     if not isinstance(value, str):
         return None
     try:
@@ -94,7 +166,7 @@ def notified_within(entry, c, now):
     """True when ``entry['notified_at']`` lies within alert.renotify_after."""
     if not isinstance(entry, dict):
         return False
-    notified_at = _timestamp(entry.get('notified_at'))
+    notified_at = parse_timestamp(entry.get('notified_at'))
     if notified_at is None or notified_at > now:
         return False
     return (now - notified_at).total_seconds() < renotify_after_seconds(c)
