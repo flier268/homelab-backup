@@ -267,7 +267,9 @@ class BackupStateTests(unittest.TestCase):
                     mock.patch.object(backup, 'stage_service', return_value=root), \
                     mock.patch.object(backup, 'restic_env', return_value={}), \
                     mock.patch.object(backup, 'run', side_effect=fake_run):
-                self.assertTrue(backup.backup_one(config, value))
+                self.assertTrue(backup.backup_one(
+                    config, value, apply_retention=True,
+                ))
 
             self.assertEqual(saved[-1]['last_result'], 'success')
             self.assertIn('temporary failure', saved[-1]['last_retention_error'])
@@ -293,7 +295,9 @@ class BackupStateTests(unittest.TestCase):
                     ), mock.patch.object(
                         backup, 'restic_env', return_value={},
                     ), mock.patch.object(backup, 'run', side_effect=fake_run):
-                self.assertTrue(backup.backup_one({'host_id': 'host'}, value))
+                self.assertTrue(backup.backup_one(
+                    {'host_id': 'host'}, value, apply_retention=True,
+                ))
 
             self.assertEqual(len(saved), 2)
             self.assertEqual(saved[-1]['last_result'], 'success')
@@ -338,9 +342,46 @@ class BackupStateTests(unittest.TestCase):
             ), mock.patch.object(
                 backup, 'restic_env', return_value={},
             ), mock.patch.object(backup, 'run'):
-                self.assertTrue(backup.backup_one({'host_id': 'host'}, value))
+                self.assertTrue(backup.backup_one(
+                    {'host_id': 'host'}, value, apply_retention=True,
+                ))
 
             self.assertIsNone(saved[-1]['last_retention_error'])
+
+    def test_default_backup_never_runs_retention(self):
+        # Stop-the-bleeding change 2: forget is weekly maintenance only, so a
+        # slow or locked repository cannot make a fresh snapshot look failed.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            value = manifest(root)
+            saved = []
+            commands = []
+
+            def fake_run(cmd, **_kwargs):
+                commands.append(list(cmd))
+                return mock.Mock(stdout='')
+
+            with mock.patch.object(backup, 'load_state', return_value={
+                'last_retention_error': 'forget still pending',
+            }), mock.patch.object(
+                backup, 'save_state',
+                side_effect=lambda _c, _s, state:
+                saved.append(copy.deepcopy(state)),
+            ), mock.patch.object(
+                backup, 'stage_service', return_value=root,
+            ), mock.patch.object(
+                backup, 'restic_env', return_value={},
+            ), mock.patch.object(
+                backup, 'restic_repository_id', return_value='a' * 64,
+            ), mock.patch.object(backup, 'run', side_effect=fake_run):
+                self.assertTrue(backup.backup_one({'host_id': 'host'}, value))
+
+            self.assertTrue(any(c[:2] == ['restic', 'backup'] for c in commands))
+            self.assertFalse(any(c[:2] == ['restic', 'forget'] for c in commands))
+            self.assertEqual(saved[-1]['last_result'], 'success')
+            self.assertEqual(
+                saved[-1]['last_retention_error'], 'forget still pending',
+            )
 
     def test_final_state_save_failure_does_not_preserve_committed_stage(self):
         with tempfile.TemporaryDirectory() as tmp:

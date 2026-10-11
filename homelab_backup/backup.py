@@ -124,7 +124,7 @@ class BackupDependencies:
 class BackupWorkflow:
     def __init__(
             self, c: GlobalConfig, m: ServiceManifest, *,
-            dependencies: BackupDependencies, apply_retention=True,
+            dependencies: BackupDependencies, apply_retention=False,
             allow_low_space=False,
     ):
         self.c = c
@@ -365,7 +365,7 @@ class BackupWorkflow:
 
 
 def backup_one(
-        c: GlobalConfig, m: ServiceManifest, *, apply_retention=True,
+        c: GlobalConfig, m: ServiceManifest, *, apply_retention=False,
         allow_low_space=False, dependencies=None,
 ):
     workflow = BackupWorkflow(
