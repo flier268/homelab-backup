@@ -1,0 +1,15 @@
+[package]
+name = "backupctl"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "backupctl"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+homelab-backup-domain = { path = "../domain" }
+thiserror.workspace = true

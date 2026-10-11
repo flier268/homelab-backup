@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["crates/domain", "crates/backupctl"]
+
+[workspace.package]
+version = "1.0.11"
+edition = "2024"
+rust-version = "1.96"
+publish = false
+
+[workspace.dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+chrono-tz = "0.10"
+clap = { version = "4", features = ["derive"] }
+croner = { version = "4", features = ["chrono"] }
+humantime = "2"
+thiserror = "2"
