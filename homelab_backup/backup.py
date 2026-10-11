@@ -124,13 +124,11 @@ class BackupDependencies:
 class BackupWorkflow:
     def __init__(
             self, c: GlobalConfig, m: ServiceManifest, *,
-            dependencies: BackupDependencies, apply_retention=False,
-            allow_low_space=False,
+            dependencies: BackupDependencies, allow_low_space=False,
     ):
         self.c = c
         self.m = m
         self.dependencies = dependencies
-        self.apply_retention = apply_retention
         self.allow_low_space = allow_low_space
         self.label = service_label(m)
         self.started = None
@@ -156,9 +154,8 @@ class BackupWorkflow:
         success_action_error = self._run_success_actions()
         if success_action_error is not None:
             postcommit_errors.append(success_action_error)
-        retention_error = self._apply_retention()
         try:
-            self._mark_success(retention_error)
+            self._mark_success()
         except Exception as err:
             postcommit_errors.append(err)
         if postcommit_errors:
@@ -296,32 +293,9 @@ class BackupWorkflow:
             return err
         return None
 
-    def _apply_retention(self):
-        deps = self.dependencies
-        retention_error = self.state.get('last_retention_error')
-        if not self.apply_retention:
-            return retention_error
-        try:
-            deps.run_command(
-                retention_cmd(self.c, self.m),
-                env=deps.restic_environment(self.c),
-            )
-            return None
-        except Exception as err:
-            context = (
-                f"Backup for {self.label} completed, but retention failed; "
-                'maintenance will retry it later'
-            )
-            if isinstance(err, CommandError):
-                deps.print_command_failure(err, context=context)
-                return err.stderr.strip() or str(err)
-            print(
-                f'ERROR: {context}: {type(err).__name__}: {err}',
-                file=sys.stderr,
-            )
-            return f'{type(err).__name__}: {err}'
-
-    def _mark_success(self, retention_error):
+    def _mark_success(self):
+        # Retention runs only in weekly maintenance, so last_retention_error
+        # is left exactly as maintenance recorded it.
         deps = self.dependencies
         finished = deps.now()
         self.state.update({
@@ -334,7 +308,6 @@ class BackupWorkflow:
                 (finished - self.started).total_seconds(), 3,
             ),
             'last_error': None,
-            'last_retention_error': retention_error,
         })
         try:
             deps.save_state(self.c, self.m['service'], self.state)
@@ -365,13 +338,12 @@ class BackupWorkflow:
 
 
 def backup_one(
-        c: GlobalConfig, m: ServiceManifest, *, apply_retention=False,
+        c: GlobalConfig, m: ServiceManifest, *,
         allow_low_space=False, dependencies=None,
 ):
     workflow = BackupWorkflow(
         c, m,
         dependencies=dependencies or BackupDependencies.production(),
-        apply_retention=apply_retention,
         allow_low_space=allow_low_space,
     )
     return workflow.execute()
