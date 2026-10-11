@@ -7,7 +7,8 @@ Docker Compose 服務的 Restic + OneDrive 備份工具。
 - 支援由受保護 manifest 精確授權、可由容器 UID/GID 擁有的任意深層路徑，以及本機 rootful
   Docker named volume；中間 symlink 不會被跟隨，leaf symlink 只備份 link 本身。
 - `backup.yaml` 會自動保存到每份 snapshot 的 `_meta/backup.yaml`，不必列入 `sources.paths`。
-- 單一 systemd timer 每 5 分鐘掃描到期服務。
+- 備份 systemd timer 每 5 分鐘掃描到期服務；另有每週 maintenance／check 與每 6 小時
+  的 status timer，unit 失敗或太久沒有成功備份時記錄 ALERT，並可選擇推送 ntfy／healthchecks。
 - 還原時可使用互動式選單，所有 repository 服務預設全選。
 - 批次備份與還原會隔離各服務錯誤；單一服務失敗不會跳過後續服務，最後
   統一列出失敗摘要並回傳非零狀態。

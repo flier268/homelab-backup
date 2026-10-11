@@ -109,7 +109,7 @@ sudo systemctl enable --now homelab-backup-status.timer
 
 systemctl list-timers 'homelab-backup*'
 systemctl status homelab-backup.timer</code></pre>
-    <p>每 5 分鐘 timer 執行 <code>backupctl run-due</code>，只備份當下到期的服務。每週 maintenance 執行 retention 與 prune，check timer 另外執行 <code>restic check</code>；status timer 每 6 小時檢查是否太久沒有成功備份。任一 service 失敗都會觸發 <code>homelab-backup-notify@</code>，在 journal 記錄 ALERT，並在設定 <code>alert.notify_url_file</code> 時推送通知。</p>
+    <p>每 5 分鐘 timer 執行 <code>backupctl run-due</code>，只備份當下到期的服務。每週 maintenance 執行 retention 與 prune，check timer 另外執行 <code>restic check</code>；status timer 每 6 小時執行 <code>backupctl status --notify</code>（不等全域鎖），服務太久沒有成功備份、或全域鎖被持有超過 <code>alert.max_lock_age</code>（預設 13h）時回傳 2；同一問題只在變化或超過 <code>alert.renotify_after</code>（預設 24h）後才再推送，healthchecks 另會收到成功 ping。任一 service 失敗都會觸發 <code>homelab-backup-notify@</code>，在 journal 記錄 ALERT，並在設定 <code>alert.notify_url_file</code>（root 擁有、0600、https）時推送含該 unit 最後 30 行 journal 的通知；這些內容會離開主機，請使用私人 topic 或信任的服務。</p>
   </section>
 
   <section id="monitor">
