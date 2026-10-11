@@ -76,11 +76,14 @@ alert:
   從第一次被看到的時間起算。
 - `max_lock_age`：全域鎖被同一個 backup／check 持有超過此值就告警。請保持大於
   `homelab-backup.service` 的 `TimeoutStartSec=12h`。
-- `renotify_after`：同一個問題沒有變化時，至少隔這麼久才再推送一次。
+- `renotify_after`：同一個問題沒有變化時，至少隔這麼久才再推送一次（run-due 的
+  失敗是每個服務各自計算，見步驟 7）。
 
-> **注意：通知內容會離開主機。** `homelab-backup-notify@` 推送時會附上失敗 unit
-> 最後 30 行 journal（`journalctl --unit <unit> --lines 30 --output cat`，最多約
-> 3500 字元），可能包含服務名稱、路徑、容器名稱與錯誤訊息。ntfy 請用私人或自架
+> **注意：通知內容會離開主機。** 通知內文會列出每個失敗服務（run-due）或每個
+> status 錯誤／過期服務的 `last error` 的**第一行**（截斷為 200 字元）；
+> `homelab-backup-notify@` 推送時另外附上失敗 unit 最後 30 行 journal
+> （`journalctl --unit <unit> --lines 30 --output cat`，最多約 3000 字元）。
+> 這些內容可能包含服務名稱、路徑、容器名稱與錯誤訊息。ntfy 請用私人或自架
 > server、夠長的隨機 topic（公開 ntfy.sh 上知道 topic 的人都能讀），或改用你信任的
 > healthchecks 服務。
 
@@ -206,18 +209,39 @@ systemctl status 'homelab-backup-notify@homelab-backup-status.service.service' -
 推送是節流的，測試時要知道：
 
 - 已送出的告警記在 `<state_root>/_alerts.json`（預設
-  `/var/lib/homelab-backup/state/_alerts.json`）。同一個 unit 的失敗、或內容相同的
-  `status` 問題（相同的過期服務集合／鎖卡住／status 本身出錯），在
-  `alert.renotify_after`（預設 24h）內不會再推送，只在 journal 記錄；問題內容改變時
-  立即推送。測試想重複觸發時可刪掉這個檔案。
+  `/var/lib/homelab-backup/state/_alerts.json`）。同一個問題在
+  `alert.renotify_after`（預設 24h）內不會再推送，只在 journal 記錄。測試想重複觸發
+  時可刪掉這個檔案。
 - 讀寫 `_alerts.json` 時都會持有 `<state_root>/_alerts.lock`（不是全域鎖，所以
   backup 卡住時告警照常運作），多個 notify／status 同時執行也不會互相覆蓋狀態。
-- 某個 unit 成功跑完一次，就會清掉該 unit 的節流紀錄；下次再失敗會立即推送。
-- `homelab-backup.service`（run-due）失敗時，若失敗的服務集合和上次推送的不同，
-  即使還在 `renotify_after` 內也會立即再推送。
+- **`homelab-backup.service`（run-due）依服務分別節流。** run-due 結束時記下這一輪
+  失敗的服務（含錯誤第一行）與本次的 `INVOCATION_ID`。`notify-failure` 只推送
+  「剛進入失敗」（沒有紀錄）或上次推送已超過 `renotify_after` 的服務；同一則通知
+  可列出多個服務，其他仍在失敗但已通知過的服務只附註名稱。某服務備份**成功**只清掉
+  該服務的紀錄；這一輪沒排到的服務保留紀錄；「No backups are due」或其他服務成功
+  都不會清掉別人的紀錄。所以一個服務持續失敗、其他服務照常成功時，24h 內只推送
+  一次；修好後再壞會立即推送。
+- **run-due 沒做完紀錄就結束**（crash、逾時、OOM、被 kill、設定錯誤）時，
+  `notify-failure` 不採用舊的失敗紀錄：只有紀錄裡的 invocation id 等於 systemd
+  傳來的 `MONITOR_INVOCATION_ID` 才採用。否則以獨立問題推送，標題如
+  `homelab-backup.service failed (timeout)`，內文附 `MONITOR_SERVICE_RESULT`／
+  `MONITOR_EXIT_CODE`／`MONITOR_EXIT_STATUS`。這類推送依結果類型（`crash:<result>`）
+  分別節流：第一次或換成新的結果類型時立即推送，持續發生時每 `renotify_after`
+  最多一次（沒推送成功的那次不算）。每次 crash 都會更新該類型的 `last_seen_at`；
+  只有某一輪 run-due 有實際嘗試備份、沒有任何服務失敗，且距上次看到該 crash 已滿
+  1 小時，才清掉該筆紀錄，所以「每小時被 OOM kill 一次、中間各輪正常」24h 內只推送
+  一次；安靜超過 1 小時後再 crash 會立即推送。systemd 低於 251（沒有 `MONITOR_INVOCATION_ID`）時，
+  改採 20 分鐘內、尚未被前一次 notify-failure 用過的紀錄。
+- maintenance／check 依 unit 節流；成功跑完一次會清掉該 unit 的紀錄，下次再失敗
+  立即推送。`status` 跑完且一切正常（沒有過期、沒有鎖卡住、沒有 status 錯誤）時
+  也會清掉 `homelab-backup-status.service` 的紀錄。
+- `status` 問題內容（過期服務集合／鎖卡住／status 本身出錯）改變時立即推送。
 - `homelab-backup-status.service` 失敗時，若 `status --notify` 剛推送過同一個問題
   （exit 2），`notify@` 只記 `ALERT:` 行而不再重複推送；所以 c) 可能只在 journal
-  看到。`status` 本身出錯（exit 1）則一律由 `notify-failure` 推送。
+  看到。判斷依據是 status 記下的 `INVOCATION_ID` 必須等於 `MONITOR_INVOCATION_ID`；
+  有 `MONITOR_INVOCATION_ID` 但紀錄沒有 id 時一律推送，只有 systemd 沒提供
+  `MONITOR_INVOCATION_ID` 時才退回 20 分鐘時間窗。`status` 本身出錯（exit 1）則一律
+  由 `notify-failure` 推送。
 - `run-due` 拿不到全域鎖時，會先以 100 ms 間隔重試 3 次，仍拿不到
   才印 `SKIP:` 跳過這一輪（避免剛好撞上前一輪收尾而白白錯過 5 分鐘）。
 - `status --notify` 在一切正常時：healthchecks 每次都送成功 ping（dead-man's switch）；
@@ -251,16 +275,19 @@ sudo systemctl disable --now homelab-backup.timer homelab-backup-maintenance.tim
 **第二步：等執行中的 unit 結束。** `disable --now` 只停 timer，不會中斷已經在跑的
 service；**不要**強制停止執行中的備份，等它自己跑完。這些都是 `Type=oneshot`，
 執行中顯示為 `activating`（不是 `active`），所以不能只看 `is-active --quiet` 的
-exit code：
+exit code。除了 backup／maintenance／check，也要等 `homelab-backup-status.service`
+與所有 `homelab-backup-notify@*.service` instance（它們會讀寫 `_alerts.json`，也會
+讀設定）。`systemctl is-active` 不會替沒載入的 unit 展開萬用字元，所以改用
+`list-units`，只要它還列出任何東西就繼續等：
 
 ```bash
 systemctl list-jobs 'homelab-backup*'              # 執行中的 oneshot 會列出 start job
-while systemctl is-active homelab-backup.service homelab-backup-maintenance.service \
-    homelab-backup-check.service | grep -qvE '^(inactive|failed)$'; do
+while [ -n "$(systemctl list-units --type=service --state=activating,active \
+    'homelab-backup*' --no-legend)" ]; do
   sleep 30
 done
-systemctl is-active homelab-backup.service homelab-backup-maintenance.service \
-  homelab-backup-check.service                     # 三個都應為 inactive（或 failed）
+systemctl list-units --type=service --all 'homelab-backup*' --no-legend
+#   所有 homelab-backup*.service（含 status 與 notify@*）都應為 inactive 或 failed
 ```
 
 **第三步：移除舊版不認得的新設定欄位。** 舊版會對未知欄位報
