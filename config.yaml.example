@@ -15,12 +15,15 @@ rclone:
 check:
   read_data_subset: 5%
 # Optional alerting (stop-the-bleeding). `backupctl status` exits 2 when a
-# scheduled service has no successful backup within max_success_age (default:
-# two schedule periods + 1h). notify_url_file holds a single ntfy topic URL or
-# healthchecks.io ping URL; keep it root-owned 0600 and out of git.
-# max_lock_age (default 13h) also alerts when a backup or check has held the
-# global lock longer than that, i.e. appears stalled.
+# scheduled service has no successful backup within the larger of
+# max_success_age and two schedule periods + 1h. notify_url_file holds a single
+# https ntfy topic URL or healthchecks.io ping URL; it must be root-owned 0600
+# (group/other access is refused) and kept out of git.
+# max_lock_age (default 13h, keep it above the 12h backup unit timeout) also
+# alerts when a backup or check has held the global lock longer than that.
+# An unchanged problem is pushed again only after renotify_after (default 24h).
 #alert:
 #  max_success_age: 36h
 #  max_lock_age: 13h
+#  renotify_after: 24h
 #  notify_url_file: /etc/homelab-backup/notify-url

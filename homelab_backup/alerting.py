@@ -3,16 +3,101 @@
 The URL itself is a secret (ntfy topics and healthchecks UUIDs grant access),
 so it is never stored in config.yaml. ``alert.notify_url_file`` names a
 root-owned file holding a single https URL.
+
+Delivered alerts are remembered in ``<state_root>/_alerts.json`` so repeated
+runs only notify on change or after ``alert.renotify_after``. Service state
+files must start with an alphanumeric character, so this name never collides.
+Alert state is best effort: read/write problems only warn and never prevent a
+notification from being sent.
 """
-import socket
+import datetime as dt
+import json
+import os
+import stat
 import sys
-import urllib.error
 import urllib.parse
 import urllib.request
 
-from .security import read_control_text
+from .schedule import parse_duration
+from .security import (
+    atomic_write_json, ensure_control_directory, lexical_absolute,
+    read_control_text,
+)
 
 NOTIFY_TIMEOUT_SECONDS = 10
+ALERT_STATE_NAME = '_alerts.json'
+DEFAULT_RENOTIFY_AFTER = '24h'
+
+
+def renotify_after_seconds(c):
+    value = (c.get('alert') or {}).get('renotify_after', DEFAULT_RENOTIFY_AFTER)
+    return parse_duration(value, 'alert.renotify_after')
+
+
+def alert_state_path(c):
+    return lexical_absolute(c['state_root']) / ALERT_STATE_NAME
+
+
+def load_alert_state(c):
+    """Return the remembered alert state, or {} when it is unusable."""
+    if not c.get('state_root'):
+        return {}
+    path = alert_state_path(c)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return {}
+    except OSError as err:
+        print(f'WARNING: could not open alert state {path}: {err}', file=sys.stderr)
+        return {}
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError('not a regular file')
+        with os.fdopen(fd, encoding='utf-8') as source:
+            fd = -1
+            data = json.load(source)
+        if not isinstance(data, dict):
+            raise ValueError('not a JSON mapping')
+    except (OSError, ValueError) as err:
+        print(
+            f'WARNING: ignoring unreadable alert state {path}: {err}',
+            file=sys.stderr,
+        )
+        return {}
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    return data
+
+
+def save_alert_state(c, state):
+    if not c.get('state_root'):
+        return
+    try:
+        ensure_control_directory(c['state_root'])
+        atomic_write_json(alert_state_path(c), state)
+    except (OSError, ValueError) as err:
+        print(f'WARNING: could not save alert state: {err}', file=sys.stderr)
+
+
+def _timestamp(value):
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def notified_within(entry, c, now):
+    """True when ``entry['notified_at']`` lies within alert.renotify_after."""
+    if not isinstance(entry, dict):
+        return False
+    notified_at = _timestamp(entry.get('notified_at'))
+    if notified_at is None or notified_at > now:
+        return False
+    return (now - notified_at).total_seconds() < renotify_after_seconds(c)
 
 
 def notification_url(c):
@@ -20,11 +105,14 @@ def notification_url(c):
     if not path:
         return None
     try:
-        text = read_control_text(path)
+        # private=True: the URL is a secret, so the file must be mode 0600
+        # (or stricter), checked on the same descriptor that is read.
+        text = read_control_text(path, private=True)
     except FileNotFoundError:
         print(f'WARNING: notification URL file is missing: {path}', file=sys.stderr)
         return None
     except (OSError, ValueError) as err:
+        # The error text names only the path and mode, never the content.
         print(
             f'WARNING: notification URL file is unusable: {path}: {err}',
             file=sys.stderr,
@@ -33,9 +121,9 @@ def notification_url(c):
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     url = lines[0] if lines else ''
     parsed = urllib.parse.urlsplit(url)
-    if parsed.scheme not in ('https', 'http') or not parsed.netloc:
+    if parsed.scheme != 'https' or not parsed.netloc:
         print(
-            f'WARNING: notification URL file does not contain an http(s) URL: '
+            f'WARNING: notification URL file does not contain an https URL: '
             f'{path}',
             file=sys.stderr,
         )
@@ -60,12 +148,14 @@ def _request(url, data, headers):
         return response.status
 
 
-def notify(c, title, message, *, ok=False, opener=None):
+def notify(c, title, message, *, ok=False, recovered=False, opener=None):
     """Send one notification; returns True when delivered.
 
-    ntfy receives only problems (``ok=False``). healthchecks.io receives
-    both: success pings keep its dead-man's switch quiet and failures go to
-    ``<url>/fail``. Delivery problems are warnings, never exceptions.
+    ntfy receives problems (``ok=False``) and, with ``recovered=True``, one
+    normal-priority recovery message; plain OK heartbeats are skipped.
+    healthchecks.io receives both: success pings keep its dead-man's switch
+    quiet (and mark recovery) and failures go to ``<url>/fail``. Delivery
+    problems are warnings, never exceptions.
     """
     url = notification_url(c)
     if url is None:
@@ -77,18 +167,22 @@ def notify(c, title, message, *, ok=False, opener=None):
         target = url.rstrip('/') + ('' if ok else '/fail')
         headers = {'Content-Type': 'text/plain; charset=utf-8'}
     else:
-        if ok:
+        if ok and not recovered:
             return False
         target = url
         headers = {
             'Title': title.encode('ascii', 'replace').decode('ascii'),
-            'Priority': 'high',
-            'Tags': 'warning',
+            'Priority': 'default' if ok else 'high',
+            'Tags': 'white_check_mark' if ok else 'warning',
             'Content-Type': 'text/plain; charset=utf-8',
         }
     try:
         opener(target, body, headers)
         return True
-    except (urllib.error.URLError, OSError, socket.timeout, ValueError) as err:
-        print(f'WARNING: notification delivery failed: {err}', file=sys.stderr)
+    except Exception as err:  # noqa: BLE001 - delivery must never raise
+        # Only the type name: messages may embed the secret URL.
+        print(
+            f'WARNING: notification delivery failed: {type(err).__name__}',
+            file=sys.stderr,
+        )
         return False

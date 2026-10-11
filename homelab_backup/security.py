@@ -167,8 +167,14 @@ def validate_control_directory(path, *, allow_missing=False, owner_uid=None):
     return path
 
 
-def read_control_text(path, *, encoding='utf-8', require_protected=True):
-    """Read a protected regular file without following its leaf symlink."""
+def read_control_text(
+        path, *, encoding='utf-8', require_protected=True, private=False,
+):
+    """Read a protected regular file without following its leaf symlink.
+
+    ``private`` additionally refuses files readable by group or others
+    (``mode & 0o077``), checked with fstat on the descriptor that is read.
+    """
     path = lexical_absolute(path)
     if require_protected:
         validate_control_directory(path.parent)
@@ -205,6 +211,12 @@ def read_control_text(path, *, encoding='utf-8', require_protected=True):
                     f'control file is group/world writable: {path}',
                     'chmod', path,
                 )
+        if private and metadata.st_mode & 0o077:
+            raise RemediableValidationError(
+                f'control file must not be accessible by group/others '
+                f'(mode {stat.S_IMODE(metadata.st_mode):04o}): {path}',
+                suggested_command=('sudo', 'chmod', '600', '--', str(path)),
+            )
         with io.TextIOWrapper(os.fdopen(fd, 'rb', closefd=False), encoding=encoding) as source:
             return source.read()
     finally:

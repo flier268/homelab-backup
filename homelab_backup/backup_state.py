@@ -182,24 +182,29 @@ DEFAULT_SUCCESS_GRACE_SECONDS = 3600
 def success_age_threshold(c: GlobalConfig, m: ServiceManifest, now=None):
     """Seconds after which a missing successful backup must alert.
 
-    ``alert.max_success_age`` in the global config wins. Otherwise two full
-    schedule periods plus one hour of grace are allowed, so one failed or
-    missed run is tolerated but a second one is not (daily -> 49h).
+    Two full schedule periods plus one hour of grace are allowed, so one
+    failed or missed run is tolerated but a second one is not (daily -> 49h).
+    ``alert.max_success_age`` in the global config can only raise that floor,
+    so a global 36h never makes a weekly job alert between its runs. Without
+    a usable schedule the global value (or None) applies.
     """
     alert = c.get('alert') or {}
-    if alert.get('max_success_age'):
-        return parse_duration(alert['max_success_age'], 'alert.max_success_age')
+    configured = (
+        parse_duration(alert['max_success_age'], 'alert.max_success_age')
+        if alert.get('max_success_age') else None
+    )
     now = now or local_now()
     cron = (m.get('schedule') or {}).get('cron')
     if cron is None:
-        return None
+        return configured
     spec = parse_cron(cron, 'schedule.cron')
     previous = cron_previous(spec, now)
     following = cron_next(spec, previous) if previous is not None else None
     if previous is None or following is None:
-        return None
+        return configured
     period = (following - previous).total_seconds()
-    return int(2 * period + DEFAULT_SUCCESS_GRACE_SECONDS)
+    derived = int(2 * period + DEFAULT_SUCCESS_GRACE_SECONDS)
+    return derived if configured is None else max(configured, derived)
 
 
 def success_staleness(

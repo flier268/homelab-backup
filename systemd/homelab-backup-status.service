@@ -8,5 +8,8 @@ OnFailure=homelab-backup-notify@%n.service
 Type=oneshot
 TimeoutStartSec=15min
 # Exits 2 when a scheduled service is stale or the global lock has been held
-# longer than alert.max_lock_age; OnFailure= then notifies.
-ExecStart=/usr/local/sbin/backupctl status
+# longer than alert.max_lock_age. --notify pushes the problem itself (only on
+# change or after alert.renotify_after) and sends healthchecks success pings;
+# OnFailure= still logs an ALERT but skips a duplicate push while that
+# status notification is recent.
+ExecStart=/usr/local/sbin/backupctl status --notify

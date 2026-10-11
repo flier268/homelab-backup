@@ -41,7 +41,7 @@ class SystemdUnitTests(unittest.TestCase):
 
     def test_oneshot_services_time_out(self):
         expected = {
-            'homelab-backup.service': '6h',
+            'homelab-backup.service': '12h',
             'homelab-backup-maintenance.service': '12h',
             'homelab-backup-check.service': '12h',
             'homelab-backup-status.service': '15min',
@@ -68,8 +68,21 @@ class SystemdUnitTests(unittest.TestCase):
 
     def test_status_timer_runs_stale_alert(self):
         service = unit('homelab-backup-status.service')['Service']
-        self.assertEqual(service['ExecStart'], '/usr/local/sbin/backupctl status')
+        # --notify so healthchecks receives success pings.
+        self.assertEqual(
+            service['ExecStart'], '/usr/local/sbin/backupctl status --notify',
+        )
         self.assertIn('OnCalendar', unit('homelab-backup-status.timer')['Timer'])
+
+    def test_backup_timeout_stays_below_default_max_lock_age(self):
+        from homelab_backup import maintenance, schedule
+        timeout = unit('homelab-backup.service')['Service']['TimeoutStartSec']
+        self.assertLess(
+            schedule.parse_duration(timeout, 'TimeoutStartSec'),
+            schedule.parse_duration(
+                maintenance.DEFAULT_MAX_LOCK_AGE, 'alert.max_lock_age',
+            ),
+        )
 
     def test_notify_template_does_not_recurse(self):
         notify = unit(NOTIFY)

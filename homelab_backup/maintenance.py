@@ -4,7 +4,9 @@ import os
 import sys
 
 from .backup import backup_one, retention_cmd
-from .alerting import notify
+from .alerting import (
+    load_alert_state, notified_within, notify, save_alert_state,
+)
 from .backup_state import (
     due_status, load_state, save_state, success_staleness,
 )
@@ -106,6 +108,62 @@ def _stalled_lock_alert(c, now):
     )
 
 
+def _status_signature(stale, lock_alert, status_errors):
+    return json.dumps({
+        'stale': sorted(service for service, _, _ in stale),
+        'lock_stalled': bool(lock_alert),
+        'status_errors': bool(status_errors),
+    }, sort_keys=True)
+
+
+def _notify_status(c, now, stale, lock_alert, status_errors):
+    """Notify on change only; repeat an unchanged problem after renotify_after.
+
+    healthchecks OK pings are heartbeats and go out on every OK run; ntfy gets
+    a single recovery message when a notified problem clears.
+    """
+    host = c.get('host_id', '?')
+    alert_state = load_alert_state(c)
+    previous = alert_state.get('status')
+    previous = previous if isinstance(previous, dict) else {}
+    if not (stale or lock_alert or status_errors):
+        recovered = bool(previous.get('signature'))
+        delivered = notify(
+            c, f'homelab-backup on {host}: '
+               f"{'recovered' if recovered else 'OK'}",
+            'all scheduled backups are fresh', ok=True, recovered=recovered,
+        )
+        if recovered and delivered:
+            alert_state.pop('status', None)
+            save_alert_state(c, alert_state)
+        return
+    signature = _status_signature(stale, lock_alert, status_errors)
+    if previous.get('signature') == signature \
+            and notified_within(previous, c, now):
+        print(
+            f"status alert unchanged since {previous['notified_at']}; "
+            'not notifying again before alert.renotify_after',
+            file=sys.stderr,
+        )
+        return
+    lines = [
+        f"{service}: last success {state.get('last_success_at') or 'never'}"
+        f"; last error {state.get('last_error') or '-'}"
+        for service, state, _ in stale
+    ]
+    if lock_alert:
+        lines.append(lock_alert)
+    if status_errors:
+        lines.append('status itself reported errors; see journal')
+    problem = 'backups are stale' if stale or not lock_alert else \
+        'backup appears stalled'
+    if notify(c, f'homelab-backup on {host}: {problem}', '\n'.join(lines)):
+        alert_state['status'] = {
+            'signature': signature, 'notified_at': now.isoformat(),
+        }
+        save_alert_state(c, alert_state)
+
+
 def cmd_status(c, args):
     now = local_now()
     failures = FailureSummary()
@@ -164,36 +222,48 @@ def cmd_status(c, args):
     lock_alert = _stalled_lock_alert(c, now)
     if lock_alert:
         print(f'ALERT: {lock_alert}', file=sys.stderr)
-    notify_requested = getattr(args, 'notify', False) is True
-    if notify_requested and (stale or lock_alert or failures.has_failures()):
-        lines = [
-            f"{service}: last success {state.get('last_success_at') or 'never'}"
-            f"; last error {state.get('last_error') or '-'}"
-            for service, state, _ in stale
-        ]
-        if lock_alert:
-            lines.append(lock_alert)
-        if failures.has_failures():
-            lines.append('status itself reported errors; see journal')
-        problem = 'backups are stale' if stale or not lock_alert else \
-            'backup appears stalled'
-        notify(
-            c, f"homelab-backup on {c.get('host_id', '?')}: {problem}",
-            '\n'.join(lines),
-        )
-    elif notify_requested:
-        notify(
-            c, f"homelab-backup on {c.get('host_id', '?')}: OK",
-            'all scheduled backups are fresh', ok=True,
-        )
+    if getattr(args, 'notify', False) is True:
+        _notify_status(c, now, stale, lock_alert, failures.has_failures())
     failures.raise_if_any('STATUS FAILURES')
     if stale or lock_alert:
         raise SystemExit(STALE_EXIT_CODE)
 
 
+STATUS_UNIT = 'homelab-backup-status.service'
+
+
+def print_unit_failure_alert(unit):
+    print(f'ALERT: systemd unit failed: {unit}', file=sys.stderr)
+
+
 def cmd_notify_failure(c, args):
-    """Entry point for systemd OnFailure= (homelab-backup-notify@.service)."""
+    """Entry point for systemd OnFailure= (homelab-backup-notify@.service).
+
+    The ALERT line always reaches the journal; the push is throttled per unit
+    by alert.renotify_after. ``status --notify`` already pushes its own
+    problem, so a failed status unit is not pushed again while that
+    notification is recent.
+    """
     unit = args.unit
+    if getattr(args, 'alert_printed', False) is not True:
+        print_unit_failure_alert(unit)
+    now = local_now()
+    alert_state = load_alert_state(c)
+    if unit == STATUS_UNIT and notified_within(alert_state.get('status'), c, now):
+        print(
+            'status already notified this problem; not pushing it again',
+            file=sys.stderr,
+        )
+        return
+    units = alert_state.get('units')
+    units = units if isinstance(units, dict) else {}
+    if notified_within(units.get(unit), c, now):
+        print(
+            f"{unit} failure already notified at {units[unit]['notified_at']}; "
+            'not pushing again before alert.renotify_after',
+            file=sys.stderr,
+        )
+        return
     detail = ''
     try:
         detail = run(
@@ -203,12 +273,15 @@ def cmd_notify_failure(c, args):
         ).stdout or ''
     except Exception as err:  # noqa: BLE001 - journal is optional context
         detail = f'(journal unavailable: {err})'
-    print(f'ALERT: systemd unit failed: {unit}', file=sys.stderr)
     delivered = notify(
         c, f"homelab-backup on {c.get('host_id', '?')}: {unit} failed",
         detail[-3500:] or 'see journalctl for details',
     )
-    if not delivered:
+    if delivered:
+        units[unit] = {'notified_at': now.isoformat()}
+        alert_state['units'] = units
+        save_alert_state(c, alert_state)
+    else:
         print(
             'WARNING: failure notification was not delivered '
             '(alert.notify_url_file not configured or unreachable)',

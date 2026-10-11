@@ -7,7 +7,9 @@ OnFailure=homelab-backup-notify@%n.service
 [Service]
 Type=oneshot
 # A timeout counts as failure, so a hung run still triggers OnFailure=.
-TimeoutStartSec=6h
+# Generous because the first catch-up backup after an outage may be large;
+# keep alert.max_lock_age (default 13h) above this value.
+TimeoutStartSec=12h
 ExecStart=/usr/local/sbin/backupctl run-due
 Nice=10
 IOSchedulingClass=best-effort

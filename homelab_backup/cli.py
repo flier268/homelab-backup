@@ -15,7 +15,7 @@ from .config import cfg, config_lock_file
 from .docs import DocsError, cmd_docs
 from .maintenance import (
     cmd_check, cmd_list, cmd_maintenance, cmd_notify_failure, cmd_run_due,
-    cmd_snapshots, cmd_status, cmd_unlock,
+    cmd_snapshots, cmd_status, cmd_unlock, print_unit_failure_alert,
 )
 from .restore import (
     cmd_apply, cmd_cleanup_restores, cmd_delete_snapshot, cmd_restore,
@@ -131,7 +131,13 @@ def build_parser():
     sub.add_parser('unlock')
     command = sub.add_parser(
         'notify-failure',
-        help='send a failure notification for a systemd unit (OnFailure=)',
+        help='send a failure notification for a systemd unit (OnFailure=); '
+             'the push includes the last 30 journal lines of the unit and '
+             'is repeated at most once per alert.renotify_after',
+        description='Log an ALERT line for UNIT and push a notification '
+                    'including the last 30 journal lines of the unit to '
+                    'alert.notify_url_file. Repeated failures of the same '
+                    'unit are pushed at most once per alert.renotify_after.',
     )
     command.add_argument('unit')
     sub.add_parser('docs')
@@ -152,7 +158,10 @@ def main(argv=None):
             cmd_upgrade(args)
             return
         if args.cmd == 'notify-failure':
-            # Must not wait behind a running backup/maintenance lock.
+            # Log first so the journal shows the failure even when the
+            # config cannot be loaded. Must not wait behind the global lock.
+            print_unit_failure_alert(args.unit)
+            args.alert_printed = True
             cmd_notify_failure(cfg(), args)
             return
         if args.cmd == 'status':

@@ -64,7 +64,10 @@ def _validate_optional_sections(c):
     optional_sections = {
         'rclone': {'bwlimit'},
         'check': {'read_data_subset'},
-        'alert': {'max_success_age', 'max_lock_age', 'notify_url_file'},
+        'alert': {
+            'max_success_age', 'max_lock_age', 'notify_url_file',
+            'renotify_after',
+        },
     }
     for section_name, section_fields in optional_sections.items():
         if section_name not in c:
@@ -83,7 +86,7 @@ def _validate_optional_sections(c):
         if not isinstance(subset, str) or not subset:
             die(f'{CFG}: check.read_data_subset must be a non-empty string')
     alert = c.get('alert', {})
-    for field in ('max_success_age', 'max_lock_age'):
+    for field in ('max_success_age', 'max_lock_age', 'renotify_after'):
         if field in alert:
             try:
                 parse_duration(alert[field], f'alert.{field}')
