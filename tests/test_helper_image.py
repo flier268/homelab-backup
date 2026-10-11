@@ -1,6 +1,7 @@
 """Stop-the-bleeding change 1: no bind probe, no image-ID pinned helper."""
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -184,6 +185,66 @@ class LauncherHelperMetadataTests(unittest.TestCase):
             '"$RELEASE_NEXT/Dockerfile.volume-rsync"',
             script,
         )
+
+
+def dockerfile_instructions(text):
+    """Yield (instruction, arguments) with continuation lines joined."""
+    logical = ''
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not logical and (not stripped or stripped.startswith('#')):
+            continue
+        if stripped.endswith('\\'):
+            logical += stripped[:-1] + ' '
+            continue
+        logical += stripped
+        instruction, _, arguments = ' '.join(logical.split()).partition(' ')
+        yield instruction.upper(), arguments
+        logical = ''
+    if logical:
+        instruction, _, arguments = ' '.join(logical.split()).partition(' ')
+        yield instruction.upper(), arguments
+
+
+class HelperDockerfilePinTests(unittest.TestCase):
+    """Every input of the helper image is pinned, so rebuilds are repeatable."""
+
+    def setUp(self):
+        self.instructions = list(dockerfile_instructions(
+            (ROOT / 'Dockerfile.volume-rsync').read_text(encoding='utf-8'),
+        ))
+
+    def test_base_image_is_pinned_by_tag_and_digest(self):
+        bases = [args for name, args in self.instructions if name == 'FROM']
+        self.assertTrue(bases)
+        for base in bases:
+            self.assertRegex(
+                base, r'^[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+'
+                      r'@sha256:[0-9a-f]{64}(\s+AS\s+\S+)?$',
+            )
+
+    def test_every_apk_package_has_an_exact_version(self):
+        packages = []
+        for name, args in self.instructions:
+            if name != 'RUN':
+                continue
+            for command in re.split(r'&&|;', args):
+                words = command.split()
+                if words[:2] != ['apk', 'add']:
+                    continue
+                packages += [word for word in words[2:] if not word.startswith('-')]
+        self.assertTrue(packages)
+        for package in packages:
+            with self.subTest(package=package):
+                self.assertRegex(package, r'^[a-z0-9][a-z0-9._+-]*=[0-9][^=\s]*$')
+
+    def test_parser_flags_unpinned_input(self):
+        text = 'FROM alpine:3.22\nRUN apk add --no-cache \\\n    rsync \\\n    acl=1-r0\n'
+        instructions = list(dockerfile_instructions(text))
+        self.assertEqual(instructions, [
+            ('FROM', 'alpine:3.22'),
+            ('RUN', 'apk add --no-cache rsync acl=1-r0'),
+        ])
 
 
 if __name__ == '__main__':
