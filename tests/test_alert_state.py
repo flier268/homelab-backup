@@ -14,7 +14,7 @@ from io import StringIO
 from pathlib import Path
 from unittest import mock
 
-from homelab_backup import alerting, maintenance
+from homelab_backup import alerting, backup_state, maintenance
 
 ROOT = Path(__file__).resolve().parents[1]
 TZ = dt.timezone(dt.timedelta(hours=8))
@@ -154,12 +154,67 @@ class RunDueAlertResetTests(AlertFixture):
         notify = self.round({'a': RuntimeError('x'), 'b': RuntimeError('y')}, 5)
         notify.assert_called_once()
         body = notify.call_args.args[2]
-        self.assertIn('failed: b\n- b: y', body)
+        self.assertIn(
+            'failed: b\nstill failing (already notified): a\n- b: y', body,
+        )
         self.assertNotIn('- a:', body)
-        self.assertIn('still failing (already notified): a', body)
         self.round(
             {'a': RuntimeError('x'), 'b': RuntimeError('y')}, 10,
         ).assert_not_called()
+
+    def test_still_failing_line_survives_an_oversized_summary(self):
+        self.round({'a': RuntimeError('x')}, 0)
+        failing = {'a': RuntimeError('x')}
+        failing.update(
+            (f'svc-{i:02d}', RuntimeError('錯誤' * 200)) for i in range(40)
+        )
+        notify = self.round(failing, 5)
+        title, body = notify.call_args.args[1:3]
+        size = len(f'{title}\n\n{body}'.encode('utf-8'))
+        self.assertLessEqual(size, maintenance.NOTIFY_BODY_LIMIT)
+        self.assertTrue(body.endswith('…'))
+        self.assertIn('\nstill failing (already notified): a\n- svc-00: ', body)
+
+    def save_backup_state(self, service, state):
+        backup_state.save_state(self.c, service, {'service': service, **state})
+
+    def crash(self, minutes, services=('a', 'b', 'c')):
+        manifests = [{'service': name} for name in services]
+        with mock.patch.object(maintenance, 'manifests', return_value=manifests):
+            return self.notify_failure(
+                maintenance.BACKUP_UNIT, monitor_id=f'run-{minutes}',
+                at=NOW + dt.timedelta(minutes=minutes),
+            )
+
+    def test_crash_records_running_services_as_a_union(self):
+        started = NOW.isoformat()
+        self.save_backup_state(
+            'a', {'last_result': 'running', 'last_attempt_at': started},
+        )
+        self.state_root.joinpath('b.json').write_text('{not json')
+        self.crash(0)                    # 'c' has no state at all
+        entry = self.unit_record(maintenance.BACKUP_UNIT)['crashes']['crash:unknown']
+        self.assertEqual(entry['running'], ['a'])
+        self.save_backup_state('a', {'last_result': 'success'})
+        self.save_backup_state(
+            'c', {'last_result': 'running', 'last_attempt_at': started},
+        )
+        self.crash(5)
+        entry = self.unit_record(maintenance.BACKUP_UNIT)['crashes']['crash:unknown']
+        self.assertEqual(entry['running'], ['a', 'c'])
+
+    def test_crash_without_running_services_has_no_list(self):
+        self.crash(0)
+        entry = self.unit_record(maintenance.BACKUP_UNIT)['crashes']['crash:unknown']
+        self.assertNotIn('running', entry)
+
+    def test_crash_while_manifests_fail_has_no_list(self):
+        with mock.patch.object(
+            maintenance, 'manifests', side_effect=ValueError('bad config'),
+        ):
+            self.notify_failure(maintenance.BACKUP_UNIT, monitor_id='run-x')
+        entry = self.unit_record(maintenance.BACKUP_UNIT)['crashes']['crash:unknown']
+        self.assertNotIn('running', entry)
 
     def test_success_removes_only_that_service(self):
         self.round({'a': RuntimeError('x'), 'b': RuntimeError('y')}, 0)
@@ -546,6 +601,19 @@ class StatusTitleAndSignatureTests(AlertFixture):
         title = notify.call_args.args[1]
         self.assertIn('backup appears stalled', title)
         self.assertNotIn('stale;', title)
+
+    def test_long_status_push_is_cut_to_the_byte_limit(self):
+        stale = {**STALE, 'last_error': '備份失敗，無法連線到儲存庫' * 50}
+        states = {f'svc-{i:02d}': stale for i in range(60)}
+        _, notify = self.status(states)
+        title, body = notify.call_args.args[1:3]
+        data = f'{title}\n\n{body}'.encode('utf-8')
+        self.assertLessEqual(len(data), maintenance.NOTIFY_BODY_LIMIT)
+        self.assertGreater(len(data), maintenance.NOTIFY_BODY_LIMIT - 4)
+        data.decode('utf-8')             # valid UTF-8, nothing replaced
+        self.assertNotIn('�', body)
+        self.assertTrue(body.startswith('svc-00: last success '))
+        self.assertTrue(body.endswith('…'))
 
     def test_different_status_error_renotifies(self):
         self.status({'a': OSError('first')})

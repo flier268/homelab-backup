@@ -63,6 +63,7 @@ class Simulation:
         self.round = 0
         self.failing = set()
         self.crash = None
+        self.states = {}
         self.pushes = []
         stack = ExitStack()
         testcase.addCleanup(stack.close)
@@ -74,6 +75,7 @@ class Simulation:
             'manifests': self.manifests,
             'due_status': self.due_status,
             'backup_one': self.backup_one,
+            'load_state': self.load_state,
             'clear_stale_restic_locks': lambda _c: None,
             'run': lambda *_a, **_k: SimpleNamespace(stdout='journal tail\n'),
             'notify': self.notify,
@@ -94,11 +96,22 @@ class Simulation:
         due = minute >= offset and (minute - offset) % period == 0
         return due, 'due' if due else 'not due', None
 
+    def load_state(self, _c, service):
+        return dict(self.states.get(service, {}))
+
     def backup_one(self, _c, m):
+        """Update the service's backup state the way a real backup does.
+
+        The state stays 'running' when the backup is killed.
+        """
+        state = self.states.setdefault(m['service'], {})
+        state.update(last_attempt_at=self.now().isoformat(), last_result='running')
         if self.crash in ('timeout', 'oom-kill'):
             raise SimulatedKill(self.crash)
         if m['service'] in self.failing:
+            state['last_result'] = 'failed'
             raise RuntimeError(f"{m['service']} broke\nlong detail")
+        state.update(last_result='success', last_success_at=self.now().isoformat())
 
     def notify(self, _c, title, message, **_kwargs):
         self.pushes.append((self.round, title, message))
@@ -352,15 +365,30 @@ class CrashScenarios(unittest.TestCase):
     def test_e3_same_crash_while_a_service_keeps_failing(self):
         sim = Simulation(self, {'svc-a': (5, 0), 'svc-b': (60, 0)})
         sim.run(6, failing={'svc-a'})
-        sim.run(1, crash='timeout')
+        sim.run(1, crash='timeout')      # kills svc-a's backup
         sim.run(HOUR, failing={'svc-a'})
-        self.assertNotIn('crashes', sim.backup_record())
+        # svc-a has not had a successful backup since, so the entry stays
+        # until it has been quiet for renotify_after.
+        entry = sim.backup_record()['crashes']['crash:timeout']
+        self.assertEqual(entry['running'], ['svc-a'])
         sim.run(1, crash='timeout')
         sim.run(DAY - HOUR - 8, failing={'svc-a'})
         report('E3 A keeps failing, crash, 1h, same crash, 24h', sim)
         self.assertEqual(sim.pushed_services(), {'svc-a': [0]})
+        self.assertEqual(sim.crash_pushes(), [(6, 'timeout')])
+        self.assertEqual(len(sim.pushes), 2)
+
+    def test_e3_crash_outside_a_backup_while_a_service_keeps_failing(self):
+        sim = Simulation(self, {'svc-a': (5, 0), 'svc-b': (60, 0)})
+        sim.run(6, failing={'svc-a'})
+        sim.run(1, crash='exit-code')    # no backup was running
+        sim.run(HOUR, failing={'svc-a'})
+        self.assertNotIn('crashes', sim.backup_record())
+        sim.run(1, crash='exit-code')
+        sim.run(DAY - HOUR - 8, failing={'svc-a'})
+        report('E3 A keeps failing, exit-code crash, 1h, same crash, 24h', sim)
         self.assertEqual(
-            sim.crash_pushes(), [(6, 'timeout'), (HOUR + 7, 'timeout')],
+            sim.crash_pushes(), [(6, 'exit-code'), (HOUR + 7, 'exit-code')],
         )
         self.assertEqual(len(sim.pushes), 3)
 
@@ -386,6 +414,73 @@ class CrashScenarios(unittest.TestCase):
         report('daily service, exit-code crash hourly, nothing due, 24h', sim)
         self.assertEqual(sim.crash_pushes(), [(1, 'exit-code')])
         self.assertEqual(len(sim.pushes), 1)
+
+
+class CrashDuringBackupScenarios(unittest.TestCase):
+    """run-due killed while backing up a service, which stays 'running'."""
+
+    def test_daily_service_oom_killed_every_night(self):
+        sim = Simulation(self, {'svc-d': (24 * 60, 0)})
+        sim.run(DAY, crash='oom-kill')   # only round 0 runs a backup
+        report('daily service OOM-killed mid-backup, nothing due, 24h', sim)
+        self.assertEqual(sim.crash_pushes(), [(0, 'oom-kill')])
+        entry = sim.backup_record()['crashes']['crash:oom-kill']
+        self.assertEqual(entry['running'], ['svc-d'])
+        sim.run(2 * DAY, crash='oom-kill')
+        report('daily service OOM-killed mid-backup every night, 72h', sim)
+        # Not cleared in between, so only renotify_after repeats it.
+        self.assertEqual(
+            sim.crash_pushes(),
+            [(0, 'oom-kill'), (DAY, 'oom-kill'), (2 * DAY, 'oom-kill')],
+        )
+        self.assertEqual(len(sim.pushes), 3)
+
+    def test_service_oom_killed_every_few_hours(self):
+        for hours in (2, 6):
+            with self.subTest(hours=hours):
+                sim = Simulation(self, {'svc-x': (hours * 60, 0)})
+                sim.run(DAY, crash='oom-kill')
+                report(f'service OOM-killed mid-backup every {hours}h, 24h', sim)
+                self.assertEqual(sim.crash_pushes(), [(0, 'oom-kill')])
+                self.assertEqual(len(sim.pushes), 1)
+
+    def test_same_crash_after_the_service_succeeded_is_pushed_again(self):
+        sim = Simulation(self, {'svc-x': (6 * 60, 0)})
+        sim.run(1, crash='oom-kill')
+        sim.run(6 * HOUR)                # svc-x succeeds at round 72
+        self.assertNotIn('crashes', sim.backup_record())
+        sim.run(6 * HOUR - 1)
+        sim.run(1, crash='oom-kill')
+        report('crash mid-backup, service succeeds, same crash', sim)
+        self.assertEqual(
+            sim.crash_pushes(), [(0, 'oom-kill'), (12 * HOUR, 'oom-kill')],
+        )
+        self.assertEqual(len(sim.pushes), 2)
+
+    def test_same_crash_after_renotify_after_of_nothing_due(self):
+        # Due every 6h05m, so 6h of "No backups are due" follow the crash.
+        sim = Simulation(self, {'svc-x': (6 * 60 + 5, 0)}, renotify_after='6h')
+        sim.run(1, crash='oom-kill')
+        sim.run(6 * HOUR - 1)
+        self.assertIn('crashes', sim.backup_record())
+        sim.run(1)
+        self.assertNotIn('crashes', sim.backup_record())
+        sim.run(1, crash='oom-kill')
+        report('crash mid-backup, renotify_after of nothing due, same crash', sim)
+        self.assertEqual(
+            sim.crash_pushes(), [(0, 'oom-kill'), (6 * HOUR + 1, 'oom-kill')],
+        )
+        self.assertEqual(len(sim.pushes), 2)
+
+    def test_removed_service_does_not_pin_the_crash(self):
+        sim = Simulation(self, {'svc-x': (24 * 60, 0), 'svc-a': (5, 0)})
+        sim.run(1, crash='oom-kill')     # kills svc-x's backup
+        del sim.schedules['svc-x']
+        sim.run(1)
+        entry = sim.backup_record()['crashes']['crash:oom-kill']
+        self.assertNotIn('running', entry)
+        sim.run(HOUR - 1)
+        self.assertNotIn('crashes', sim.backup_record())
 
 
 class StatusScenarios(unittest.TestCase):
