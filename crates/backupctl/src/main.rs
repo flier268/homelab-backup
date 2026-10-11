@@ -4,6 +4,8 @@ use std::process::ExitCode;
 use clap::Parser;
 
 mod cli;
+#[allow(dead_code)]
+mod unix;
 
 fn main() -> ExitCode {
     let command = cli::Cli::parse();

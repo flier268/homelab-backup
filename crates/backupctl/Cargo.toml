@@ -10,6 +10,9 @@ name = "backupctl"
 path = "src/main.rs"
 
 [dependencies]
+chrono.workspace = true
 clap.workspace = true
 homelab-backup-domain = { path = "../domain" }
+rustix.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
