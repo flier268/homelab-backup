@@ -468,6 +468,13 @@ def _validate_actions(m, path):
                 )
             for index, action in enumerate(entries):
                 field = f'{path}: actions.{prefix}{phase}[{index}]'
+                if operation == 'restore' and isinstance(action, dict) \
+                        and 'skip_if_not_running' in action:
+                    # A restore must never silently skip a step.
+                    raise ValueError(
+                        f'{field}.skip_if_not_running is only supported for '
+                        'backup actions'
+                    )
                 try:
                     _validate_action_definition(action, field, seen)
                 except ValueError as err:
