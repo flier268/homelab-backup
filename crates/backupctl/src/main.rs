@@ -7,6 +7,8 @@ use clap::Parser;
 mod actions;
 #[allow(dead_code)]
 mod backup;
+#[allow(dead_code)]
+mod capture;
 mod cli;
 #[allow(dead_code)]
 mod fingerprint;
