@@ -82,10 +82,11 @@ alert:
 > **注意：通知內容會離開主機。** 通知內文會列出每個失敗服務（run-due）或每個
 > status 錯誤／過期服務的 `last error` 的**第一行**（截斷為 200 字元）；
 > `homelab-backup-notify@` 推送時另外附上失敗 unit 最後 30 行 journal
-> （`journalctl --unit <unit> --lines 30 --output cat`）。標題加內文以 UTF-8 計
-> 最多 3900 bytes（ntfy 單則上限 4096 bytes）：摘要放最前面，放不下時從 journal
-> 開頭裁掉、只保留結尾（摘要本身過長時截斷摘要、不附 journal），一律在字元邊界
-> 切開，不會產生不合法的 UTF-8；被裁掉處以 `…` 標示。
+> （`journalctl --unit <unit> --lines 30 --output cat`）。每則推送（`notify@` 與
+> `status --notify` 皆同）標題加內文以 UTF-8 計最多 3900 bytes（ntfy 單則上限
+> 4096 bytes）：摘要放最前面，放不下時從 journal 開頭裁掉、只保留結尾（摘要本身
+> 過長時截斷摘要結尾、不附 journal；`status --notify` 沒有 journal，只會截斷摘要），
+> 一律在字元邊界切開，不會產生不合法的 UTF-8；被裁掉處以 `…` 標示。
 > 這些內容可能包含服務名稱、路徑、容器名稱與錯誤訊息。ntfy 請用私人或自架
 > server、夠長的隨機 topic（公開 ntfy.sh 上知道 topic 的人都能讀），或改用你信任的
 > healthchecks 服務。
@@ -220,12 +221,15 @@ systemctl status 'homelab-backup-notify@homelab-backup-status.service.service' -
 - **`homelab-backup.service`（run-due）依服務分別節流。** run-due 結束時記下這一輪
   失敗的服務（含錯誤第一行）與本次的 `INVOCATION_ID`。`notify-failure` 只推送
   「剛進入失敗」（沒有紀錄）或上次推送已超過 `renotify_after` 的服務；同一則通知
-  可列出多個服務，其他仍在失敗但已通知過的服務只附註名稱。某服務備份**成功**只清掉
+  可列出多個服務，其他仍在失敗但已通知過的服務只在 `failed: ...` 行下方附註名稱
+  （在各服務明細之前，內文過長被截斷時也不會被切掉）。某服務備份**成功**只清掉
   該服務的紀錄；這一輪沒排到的服務保留紀錄；「No backups are due」或其他服務成功
   都不會清掉別人的紀錄。所以一個服務持續失敗、其他服務照常成功時，24h 內只推送
   一次；修好後再壞會立即推送。節流只看服務名稱（每個服務只記 `notified_at`）：
   仍在失敗的服務即使錯誤訊息變了，在 `renotify_after` 內也不會再推送，新的錯誤
-  只出現在 journal 與 `status` 的 `last_error`。
+  只出現在 journal 與 `status` 的 `last_error`。已從 manifest 移除的服務，其紀錄
+  只會在有嘗試備份或有服務失敗的一輪被清掉（「No backups are due」的一輪不會），
+  所以清理會延後到下一次有備份排到的一輪。
 - **run-due 沒做完紀錄就結束**（crash、逾時、OOM、被 kill、設定錯誤）時，
   `notify-failure` 不採用舊的失敗紀錄：只有紀錄裡的 invocation id 等於 systemd
   傳來的 `MONITOR_INVOCATION_ID` 才採用。否則以獨立問題推送，標題如
@@ -233,13 +237,27 @@ systemctl status 'homelab-backup-notify@homelab-backup-status.service.service' -
   `MONITOR_EXIT_CODE`／`MONITOR_EXIT_STATUS`。這類推送依結果類型（`crash:<result>`）
   分別節流：第一次或換成新的結果類型時立即推送，持續發生時每 `renotify_after`
   最多一次（沒推送成功的那次不算）。每次 crash（不論有沒有推送）都會更新該類型的
-  `last_seen_at`。任何一輪做完紀錄的 run-due——包括「No backups are due」的一輪
-  與有服務失敗的一輪——都會清掉 `last_seen_at` 已滿 1 小時的 `crash:<result>`
-  紀錄（「No backups are due」的一輪不動各服務的紀錄，沒有可清的 crash 時也不會
-  建立或改寫 `_alerts.json`）。crash 的那一輪本身沒做完紀錄，不會清任何東西。
+  `last_seen_at`，並把當下備份狀態（`last_result`）仍是 `running` 的服務名稱
+  併入該紀錄的 `running` 清單（同一類型重複 crash 時取聯集；讀不到或損壞的備份
+  狀態略過，manifest 讀不到時清單為空）。任何一輪做完紀錄的 run-due——包括
+  「No backups are due」的一輪與有服務失敗的一輪——都會檢查 `crash:<result>` 紀錄：
+  - 有 `running` 清單時：清單中的服務在之後某一輪備份**成功**、或已從 manifest
+    移除，就從清單拿掉；`last_seen_at` 已滿 `renotify_after` 時整筆清掉。清單
+    拿空後改用下一條規則。
+  - 沒有（或已拿空）`running` 清單時（crash 不在備份途中，或舊版寫的紀錄）：
+    `last_seen_at` 已滿 1 小時就清掉。
+  （「No backups are due」的一輪不動各服務的紀錄，沒有要改的 crash 紀錄時也不會
+  建立或改寫 `_alerts.json`。）crash 的那一輪本身沒做完紀錄，不會清任何東西。
   所以「每小時（或每 30 分鐘）被 OOM kill 一次、中間各輪正常」24h 內只推送一次；
-  同一種 crash 停了至少 1 小時（期間至少有一輪正常結束）後再發生會立即推送，
-  即使只有每日排程的服務、或有服務一直在失敗也一樣。systemd 低於 251（沒有 `MONITOR_INVOCATION_ID`）時，
+  在某服務備份途中 crash、之後該服務一直沒有成功備份（例如每天同一個服務都被
+  OOM kill，中間只有「No backups are due」，或該服務一直在失敗）時，紀錄保留到
+  安靜滿 `renotify_after`，所以同一種 crash 每 `renotify_after` 最多推送一次
+  （預設 24h：每天被 kill 一次的每日服務 72h 內推送 3 次，每 2h 或 6h 被 kill
+  一次則 24h 內只推送 1 次）。被 kill 的服務之後成功備份過、且 crash 停了至少
+  1 小時後再發生，或 crash 停了 `renotify_after` 後再發生，都會立即推送。
+  不在備份途中的 crash（例如設定錯誤）停了至少 1 小時（期間至少有一輪正常結束）
+  後再發生會立即推送，即使只有每日排程的服務、或有服務一直在失敗也一樣。
+  systemd 低於 251（沒有 `MONITOR_INVOCATION_ID`）時，
   改採 20 分鐘內、尚未被前一次 notify-failure 用過的紀錄。
 - maintenance／check 依 unit 節流；成功跑完一次會清掉該 unit 的紀錄，下次再失敗
   立即推送。`status` 跑完且一切正常（沒有過期、沒有鎖卡住、沒有 status 錯誤）時

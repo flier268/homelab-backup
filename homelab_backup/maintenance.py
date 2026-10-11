@@ -8,7 +8,7 @@ import sys
 from .backup import backup_one, retention_cmd
 from .alerting import (
     alert_state_transaction, load_alert_state, notified_within, notify,
-    parse_timestamp,
+    parse_timestamp, renotify_after_seconds,
 )
 from .backup_state import (
     due_status, load_state, save_state, success_staleness,
@@ -209,8 +209,9 @@ def _notify_status(c, now, stale, lock_alert, lock_holder, status_errors):
         f'status error: {operation}: {_first_line(error)}'
         for operation, error in status_errors
     )
-    title = _status_title(stale, lock_alert, status_errors)
-    if notify(c, f'homelab-backup on {host}: {title}', '\n'.join(lines)):
+    title = f'homelab-backup on {host}: ' \
+        + _status_title(stale, lock_alert, status_errors)
+    if notify(c, title, _notification_body(title, '\n'.join(lines), '')):
         _record_status_alert(c, {
             'signature': signature, 'notified_at': now.isoformat(), **handled,
         })
@@ -346,10 +347,11 @@ def _record_run_due(c, now, attempted, failures, known_services):
     The failed set is stored with this run's INVOCATION_ID so notify-failure
     can tell it apart from a stale record of an older run. Every completed
     round, including "No backups are due" and rounds with failed services,
-    clears the crash entries not seen for CRASH_QUIET_PERIOD; a crashing
-    round never gets here, so a crash recurring within that period stays
-    throttled. A round that attempted nothing and failed nothing changes
-    nothing else (and does not rewrite the state when nothing is cleared).
+    updates the crash entries (see ``_crash_after_round``); a crashing round
+    never gets here, so its crash is not cleared by itself. A round that
+    attempted nothing and failed nothing changes nothing else: it keeps the
+    ``run`` record and ``last_failure_at`` and does not prune entries of
+    removed services (nor rewrites the state when no crash entry changes).
     """
     failed = {}
     for operation, error in failures.items:
@@ -361,8 +363,12 @@ def _record_run_due(c, now, attempted, failures, known_services):
 
     def update(record):
         crashes = _record_dict(record, 'crashes')
-        for key in [k for k, v in crashes.items() if _crash_quiet(v, now)]:
-            crashes.pop(key)
+        for key, entry in list(crashes.items()):
+            entry = _crash_after_round(c, entry, now, succeeded, known_services)
+            if entry is None:
+                crashes.pop(key)
+            else:
+                crashes[key] = entry
         if crashes:
             record['crashes'] = crashes
         else:
@@ -396,15 +402,43 @@ def _record_run_due(c, now, attempted, failures, known_services):
     _update_unit_record(c, BACKUP_UNIT, update)
 
 
-def _crash_quiet(entry, now):
-    """True when a crash entry was last seen CRASH_QUIET_PERIOD ago or more."""
+def _crash_after_round(c, entry, now, succeeded, known_services):
+    """A crash entry after a completed round, or None when it is cleared.
+
+    An entry listing the services that were running when it crashed is
+    cleared once it has been quiet for alert.renotify_after, so a crash that
+    recurs each time the same backup runs stays throttled even with "No
+    backups are due" rounds in between. A listed service drops out of the
+    list once it has a successful backup or is removed from the manifests;
+    an entry whose list is empty, or that never had one (crash outside a
+    backup, or from older releases), is cleared once quiet for
+    CRASH_QUIET_PERIOD.
+    """
+    running = entry.get('running') if isinstance(entry, dict) else None
+    if isinstance(running, list) and running:
+        left = [
+            name for name in running
+            if isinstance(name, str) and name not in succeeded
+            and (known_services is None or name in known_services)
+        ]
+        period = dt.timedelta(seconds=renotify_after_seconds(c))
+        if _crash_quiet(entry, now, period):
+            return None
+        if left:
+            return {**entry, 'running': left}
+        entry = {key: value for key, value in entry.items() if key != 'running'}
+    return None if _crash_quiet(entry, now) else entry
+
+
+def _crash_quiet(entry, now, period=CRASH_QUIET_PERIOD):
+    """True when a crash entry was last seen ``period`` ago or more."""
     if not isinstance(entry, dict):
         return True
     # Entries from older releases only carry notified_at.
     last_seen = parse_timestamp(entry.get('last_seen_at') or entry.get('notified_at'))
     if last_seen is None:
         return True
-    return last_seen <= now and now - last_seen >= CRASH_QUIET_PERIOD
+    return last_seen <= now and now - last_seen >= period
 
 
 def _clear_unit_alert(c, unit):
@@ -526,7 +560,9 @@ def _notify_run_due_failure(c, now):
     When run-due did not finish its bookkeeping (crash, timeout, OOM, kill,
     config error) the failure is pushed as ``crash:<result>``, throttled per
     result type by its last push. Every crash, pushed or not, refreshes the
-    entry's last_seen_at, which ``_record_run_due`` uses to clear it.
+    entry's last_seen_at and adds the services whose backup state is still
+    'running' to the entry's ``running`` list (a union over repeated crashes
+    of that type); ``_record_run_due`` uses both to clear it.
     """
     record = _unit_record(load_alert_state(c), BACKUP_UNIT)
     run_record = _trusted_run_due_record(record, now)
@@ -543,11 +579,12 @@ def _notify_run_due_failure(c, now):
         known = sorted(set(failed) - set(pending))
         if pending:
             lines = ['failed: ' + ', '.join(pending)]
-            lines += [f'- {name}: {failed[name]}' for name in pending]
+            # Before the detail lines, which are cut first when too long.
             if known:
                 lines.append(
                     'still failing (already notified): ' + ', '.join(known),
                 )
+            lines += [f'- {name}: {failed[name]}' for name in pending]
             delivered = _push_unit_failure(
                 c, BACKUP_UNIT, f'{BACKUP_UNIT} failed', '\n'.join(lines),
             )
@@ -585,18 +622,43 @@ def _notify_run_due_failure(c, now):
             f'({details}); it crashed, timed out, was killed or could not '
             'start. Check the journal.',
         )
+    running = _running_services(c)
 
     def update(current):
         current['last_failure_at'] = now.isoformat()
         stored = _record_dict(current, 'crashes')
         entry = _record_dict(stored, key)
         entry.update(last_seen_at=now.isoformat(), details=details)
+        previous = entry.get('running')
+        merged = set(running) | (
+            {name for name in previous if isinstance(name, str)}
+            if isinstance(previous, list) else set()
+        )
+        if merged:
+            entry['running'] = sorted(merged)
         if delivered:
             entry['notified_at'] = now.isoformat()
         stored[key] = entry
         current['crashes'] = stored
 
     _update_unit_record(c, BACKUP_UNIT, update)
+
+
+def _running_services(c):
+    """Services whose backup state is 'running'; unreadable ones are skipped."""
+    try:
+        found = manifests(c, on_error=lambda _path, _err: None)
+    except Exception:  # noqa: BLE001 - the crash may be a config error
+        return []
+    running = []
+    for m in found:
+        try:
+            service = _service_name(m)
+            if load_state(c, service).get('last_result') == 'running':
+                running.append(service)
+        except Exception:  # noqa: BLE001 - missing or corrupt state
+            continue
+    return sorted(running)
 
 
 def _push_unit_failure(c, unit, title, summary):
