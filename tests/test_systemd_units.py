@@ -39,6 +39,20 @@ class SystemdUnitTests(unittest.TestCase):
                     'homelab-backup-notify@%n.service',
                 )
 
+    def test_oneshot_services_time_out(self):
+        expected = {
+            'homelab-backup.service': '6h',
+            'homelab-backup-maintenance.service': '12h',
+            'homelab-backup-check.service': '12h',
+            'homelab-backup-status.service': '15min',
+            NOTIFY: '5min',
+        }
+        for name, timeout in expected.items():
+            with self.subTest(unit=name):
+                service = unit(name)['Service']
+                self.assertEqual(service['Type'], 'oneshot')
+                self.assertEqual(service['TimeoutStartSec'], timeout)
+
     def test_check_has_its_own_service_and_timer(self):
         service = unit('homelab-backup-check.service')['Service']
         self.assertEqual(service['ExecStart'], '/usr/local/sbin/backupctl check')

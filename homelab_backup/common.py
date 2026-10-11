@@ -2,6 +2,7 @@ import datetime as dt
 import fcntl
 import os
 import shlex
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -194,6 +195,42 @@ def clear_stale_restic_locks(c):
             file=sys.stderr,
         )
         return False
+
+
+def global_lock_holder(path):
+    """Describe who holds the global lock, without blocking or writing.
+
+    Returns None when the lock file is missing or no other process holds it;
+    otherwise ``{'pid': int|None, 'started': str|None}`` parsed from the
+    ``pid=... started=...`` line GlobalLock writes. Never creates the file.
+    """
+    try:
+        fd = os.open(
+            path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+        )
+    except FileNotFoundError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            pass
+        else:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return None
+        content = os.read(fd, 4096).decode('utf-8', errors='replace')
+    finally:
+        os.close(fd)
+    fields = dict(
+        item.split('=', 1) for item in content.split() if '=' in item
+    )
+    pid = fields.get('pid')
+    return {
+        'pid': int(pid) if pid and pid.isdigit() else None,
+        'started': fields.get('started'),
+    }
 
 
 class GlobalLock:

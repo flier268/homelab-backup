@@ -155,6 +155,11 @@ def main(argv=None):
             # Must not wait behind a running backup/maintenance lock.
             cmd_notify_failure(cfg(), args)
             return
+        if args.cmd == 'status':
+            # Reads only state files; must still alert while a backup or
+            # check holds (or is stuck holding) the global lock.
+            cmd_status(cfg(), args)
+            return
         while True:
             selected_lock = config_lock_file()
             with GlobalLock(

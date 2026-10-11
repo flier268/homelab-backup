@@ -18,6 +18,9 @@ check:
 # scheduled service has no successful backup within max_success_age (default:
 # two schedule periods + 1h). notify_url_file holds a single ntfy topic URL or
 # healthchecks.io ping URL; keep it root-owned 0600 and out of git.
+# max_lock_age (default 13h) also alerts when a backup or check has held the
+# global lock longer than that, i.e. appears stalled.
 #alert:
 #  max_success_age: 36h
+#  max_lock_age: 13h
 #  notify_url_file: /etc/homelab-backup/notify-url

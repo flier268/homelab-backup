@@ -6,5 +6,7 @@ OnFailure=homelab-backup-notify@%n.service
 
 [Service]
 Type=oneshot
-# Exits 2 when a scheduled service is stale; OnFailure= then notifies.
+TimeoutStartSec=15min
+# Exits 2 when a scheduled service is stale or the global lock has been held
+# longer than alert.max_lock_age; OnFailure= then notifies.
 ExecStart=/usr/local/sbin/backupctl status

@@ -1,3 +1,4 @@
+import datetime as dt
 import json
 import os
 import sys
@@ -10,7 +11,7 @@ from .backup_state import (
 from .btrfs_snapshot import cleanup_snapshot_state, snapshot_state_services
 from .common import (
     CommandError, FailureSummary, GlobalLock, _print_command_failure,
-    clear_stale_restic_locks, die, restic_env, run,
+    clear_stale_restic_locks, die, global_lock_holder, restic_env, run,
 )
 from .manifest import (
     manifest, manifests, service_label, valid_service_name, validate_manifest,
@@ -59,6 +60,50 @@ def cmd_list(c, args):
 
 
 STALE_EXIT_CODE = 2
+DEFAULT_MAX_LOCK_AGE = '13h'
+
+
+def _stalled_lock_alert(c, now):
+    """Report the global lock holder; return an alert line if it is stalled."""
+    lock_file = c.get('lock_file')
+    if not lock_file:
+        return None
+    try:
+        holder = global_lock_holder(lock_file)
+    except OSError as err:
+        print(
+            f'WARNING: could not inspect global lock {lock_file}: {err}',
+            file=sys.stderr,
+        )
+        return None
+    if holder is None:
+        return None
+    try:
+        started = dt.datetime.fromisoformat(holder['started'])
+        if started.tzinfo is None:
+            raise ValueError('timestamp has no timezone')
+    except (TypeError, ValueError):
+        print(
+            f"WARNING: global lock held by pid={holder['pid']} with unknown "
+            f"start time ({holder['started']!r}); cannot tell if it is stalled",
+            file=sys.stderr,
+        )
+        return None
+    held_seconds = int((now - started).total_seconds())
+    print(json.dumps({
+        'lock_holder': {
+            'pid': holder['pid'], 'started': holder['started'],
+            'held_seconds': held_seconds,
+        },
+    }), file=sys.stderr)
+    max_age = (c.get('alert') or {}).get('max_lock_age', DEFAULT_MAX_LOCK_AGE)
+    max_age_seconds = parse_duration(max_age, 'alert.max_lock_age')
+    if held_seconds <= max_age_seconds:
+        return None
+    return (
+        f"global lock held by pid={holder['pid']} since {holder['started']} "
+        f"({held_seconds}s > {max_age_seconds}s); backup or check may be stalled"
+    )
 
 
 def cmd_status(c, args):
@@ -116,17 +161,24 @@ def cmd_status(c, args):
             f"last error: {state.get('last_error') or '-'})",
             file=sys.stderr,
         )
+    lock_alert = _stalled_lock_alert(c, now)
+    if lock_alert:
+        print(f'ALERT: {lock_alert}', file=sys.stderr)
     notify_requested = getattr(args, 'notify', False) is True
-    if notify_requested and (stale or failures.has_failures()):
+    if notify_requested and (stale or lock_alert or failures.has_failures()):
         lines = [
             f"{service}: last success {state.get('last_success_at') or 'never'}"
             f"; last error {state.get('last_error') or '-'}"
             for service, state, _ in stale
         ]
+        if lock_alert:
+            lines.append(lock_alert)
         if failures.has_failures():
             lines.append('status itself reported errors; see journal')
+        problem = 'backups are stale' if stale or not lock_alert else \
+            'backup appears stalled'
         notify(
-            c, f"homelab-backup on {c.get('host_id', '?')}: backups are stale",
+            c, f"homelab-backup on {c.get('host_id', '?')}: {problem}",
             '\n'.join(lines),
         )
     elif notify_requested:
@@ -135,7 +187,7 @@ def cmd_status(c, args):
             'all scheduled backups are fresh', ok=True,
         )
     failures.raise_if_any('STATUS FAILURES')
-    if stale:
+    if stale or lock_alert:
         raise SystemExit(STALE_EXIT_CODE)
 
 

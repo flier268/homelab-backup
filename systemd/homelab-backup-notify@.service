@@ -5,6 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+TimeoutStartSec=5min
 # Always logs an ALERT line to the journal; additionally pushes to the URL in
 # alert.notify_url_file (ntfy or healthchecks) when one is configured.
 ExecStart=/usr/local/sbin/backupctl notify-failure %i
