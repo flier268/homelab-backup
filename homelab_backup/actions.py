@@ -7,7 +7,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from .common import CommandError, _print_command_failure
+from .common import CommandError, _print_command_failure, run
 from .identity import account, action_user, fixed_environment, subprocess_identity
 
 ACTION_OPERATIONS = ('backup', 'restore')
@@ -180,9 +180,73 @@ def _run_action(
         print(stderr, end='', file=sys.stderr)
 
 
+_MISSING_CONTAINER_MARKERS = ('no such container', 'no such object')
+
+
+def container_running(name):
+    """Return True/False when Docker answered, None when the state is unknown.
+
+    Only a definite answer may cause an action to be skipped; an unreachable
+    daemon or missing docker binary must not hide a real failure.
+    """
+    try:
+        result = run(
+            ['docker', 'inspect', '--type', 'container', '--format',
+             '{{.State.Running}}', name],
+            capture=True,
+        )
+    except CommandError as err:
+        output = f'{err.stderr}\n{err.stdout}'.lower()
+        if any(marker in output for marker in _MISSING_CONTAINER_MARKERS):
+            return False
+        return None
+    except OSError:
+        return None
+    state = (result.stdout or '').strip()
+    if state == 'true':
+        return True
+    if state == 'false':
+        return False
+    return None
+
+
+def stopped_containers(action):
+    containers = action.get('skip_if_not_running')
+    if not containers:
+        return []
+    if isinstance(containers, str):
+        containers = [containers]
+    stopped = []
+    for name in containers:
+        running = container_running(name)
+        if running is None:
+            print(
+                f'WARNING: could not determine whether container {name!r} is '
+                f'running; running action {action["name"]!r} anyway',
+                file=sys.stderr,
+            )
+        elif not running:
+            stopped.append(name)
+    return stopped
+
+
 def run_actions(m, operation, phase, *, extra_env=None):
     failures = []
     for action in action_entries(m, operation, phase):
+        stopped = stopped_containers(action)
+        if stopped:
+            print(
+                f'WARNING: skipping {phase} action {action["name"]!r} for '
+                f'{m["service"]}: container not running: {", ".join(stopped)}',
+                file=sys.stderr,
+            )
+            # Recorded like an optional failure so the snapshot is marked
+            # best-effort. 'failed' (not a new value) keeps inventories
+            # readable by older releases during a rollback restore.
+            failures.append({
+                'phase': phase, 'name': action['name'], 'result': 'failed',
+            })
+            continue
         try:
             _run_action(
                 action, m, operation=operation, phase=phase,

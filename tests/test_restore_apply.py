@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import os
 import stat
@@ -781,6 +783,70 @@ class RestoreApplyLifecycleTests(unittest.TestCase):
         self.assertEqual([
             'before', 'after', 'finally', 'on_failure', 'reconcile',
         ], events)
+
+    def _apply_with_optional_failures(self, *, fail_after=False):
+        root = Path('/restore')
+        value = {
+            'service': 'demo',
+            'consistency': {'mode': 'files'},
+            'actions': {'restore': {
+                phase: [{
+                    'name': phase, 'command': ['/usr/bin/true'],
+                    'run_as': 'root', 'required': False,
+                }]
+                for phase in ('before', 'after', 'finally', 'on_failure')
+            }},
+        }
+        plan = restore_plan.RestorePlan(
+            root, {}, value, 'existing', (), (), (), (), 'demo',
+        )
+        results = {'before': 'failed', 'finally': 'timeout'}
+
+        def action_phase(_plan, _root, phase, **_kwargs):
+            if fail_after and phase == 'after':
+                raise RuntimeError('import failed')
+            if phase in results:
+                return [{
+                    'phase': phase, 'name': f'{phase}-hook',
+                    'result': results[phase],
+                }]
+            return []
+
+        err = io.StringIO()
+        with mock.patch.object(
+            restore_apply, 'prepare_restore_plan', return_value=plan,
+        ), mock.patch.object(
+            restore_apply, '_stop_running_services', return_value=[],
+        ), mock.patch.object(
+            restore_apply, '_dynamic_preflight',
+        ), mock.patch.object(
+            restore_apply, '_restore_data',
+        ), mock.patch.object(
+            restore_apply, '_publish_controls',
+        ), mock.patch.object(
+            restore_apply, '_restart_services',
+        ), mock.patch.object(
+            restore_apply, '_run_restore_actions', side_effect=action_phase,
+        ), mock.patch.object(
+            restore_apply, '_stop_hook_started_services',
+        ), contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            try:
+                restore_apply.apply_one({}, value, root)
+            except RuntimeError:
+                if not fail_after:
+                    raise
+        return err.getvalue()
+
+    def test_optional_restore_action_failures_are_summarized(self):
+        err = self._apply_with_optional_failures()
+        self.assertIn('WARNING: 2 optional restore action(s)', err)
+        self.assertIn("restore.before 'before-hook': failed", err)
+        self.assertIn("restore.finally 'finally-hook': timeout", err)
+
+    def test_optional_restore_failures_are_summarized_when_restore_fails(self):
+        err = self._apply_with_optional_failures(fail_after=True)
+        self.assertIn("restore.before 'before-hook': failed", err)
+        self.assertIn("restore.finally 'finally-hook': timeout", err)
 
     def test_restore_failure_environment_uses_triggering_phase(self):
         root = Path('/restore')

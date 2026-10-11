@@ -720,7 +720,7 @@ class DeploymentScriptTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(
                 result.stdout.strip(),
-                f'release.A|sha256:{"a" * 64}',
+                'release.A|homelab/volume-rsync:release.A',
             )
             self.assertEqual(
                 os.readlink(install_root / 'current'),
@@ -788,13 +788,14 @@ class DeploymentScriptTests(unittest.TestCase):
         self.assertNotIn('docker build -t homelab/volume-rsync:1', script)
         self.assertIn("docker image inspect --format '{{.Id}}'", script)
 
-    def test_volume_helper_dependencies_are_fully_pinned(self):
+    def test_volume_helper_dependencies_are_pinned(self):
         dockerfile = (ROOT / 'Dockerfile.volume-rsync').read_text(
             encoding='utf-8',
         )
         self.assertRegex(dockerfile, r'FROM alpine:3\.22@sha256:[0-9a-f]{64}')
+        # major.minor pins: Alpine drops superseded exact package revisions.
         for package in ('acl', 'attr', 'coreutils', 'rsync'):
-            self.assertRegex(dockerfile, rf'\b{package}=[0-9][^\s\\]*')
+            self.assertRegex(dockerfile, rf'\b{package}~[0-9]+\.[0-9]+\s')
 
     def test_installer_keeps_only_current_and_previous_releases(self):
         script = (ROOT / 'install.sh').read_text(encoding='utf-8')
@@ -1076,14 +1077,15 @@ class DeploymentScriptTests(unittest.TestCase):
         ).read_text(encoding='utf-8')
         self.assertNotIn('--no-wait', unit)
 
-    def test_repository_check_runs_as_maintenance_cleanup(self):
+    def test_repository_check_is_not_maintenance_cleanup(self):
+        # Stop-the-bleeding change 4: restic check has its own service so a
+        # failing check is visible and alerting instead of hidden in
+        # ExecStopPost of maintenance.
         unit = (
             ROOT / 'systemd' / 'homelab-backup-maintenance.service'
         ).read_text(encoding='utf-8')
-        self.assertIn(
-            'ExecStopPost=/usr/local/sbin/backupctl check',
-            unit,
-        )
+        self.assertNotIn('ExecStopPost', unit)
+        self.assertNotIn('backupctl check', unit)
         self.assertEqual(unit.count('ExecStart='), 1)
 
 

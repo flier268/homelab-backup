@@ -42,7 +42,7 @@ class CaptureModeTests(unittest.TestCase):
             mock.patch.object(staging, 'cleanup_snapshot_state'),
             mock.patch.object(staging, 'ensure_private_directory', side_effect=self._ensure),
             mock.patch.object(staging, 'validate_docker_environment'),
-            mock.patch.object(staging, 'validate_docker_bind_probe'),
+            mock.patch.object(staging, 'ensure_volume_helper_image'),
             mock.patch.object(staging, 'compose_model', return_value={
                 'name': 'demo', 'services': {'app': {}}, 'volumes': {},
             }),

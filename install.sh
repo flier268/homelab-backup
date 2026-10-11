@@ -51,6 +51,11 @@ UNIT_NAMES=(
   homelab-backup.timer
   homelab-backup-maintenance.service
   homelab-backup-maintenance.timer
+  homelab-backup-check.service
+  homelab-backup-check.timer
+  homelab-backup-status.service
+  homelab-backup-status.timer
+  homelab-backup-notify@.service
 )
 UNIT_NEXT_PATHS=()
 CURRENT_PUBLISHED=0
@@ -192,6 +197,8 @@ if [[ ! -f /etc/homelab-backup/config.yaml ]]; then
   install -m 0600 config.yaml.example /etc/homelab-backup/config.yaml
 fi
 docker build -t "$HELPER_IMAGE" -f Dockerfile.volume-rsync .
+# Bundled so backupctl can rebuild the helper after `docker image prune -a`.
+install -m 0644 Dockerfile.volume-rsync "$RELEASE_NEXT/Dockerfile.volume-rsync"
 HELPER_IMAGE_ID="$(docker image inspect --format '{{.Id}}' "$HELPER_IMAGE")"
 if [[ ! "$HELPER_IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]]; then
   echo "ERROR: Docker returned an invalid helper image ID: $HELPER_IMAGE_ID" >&2

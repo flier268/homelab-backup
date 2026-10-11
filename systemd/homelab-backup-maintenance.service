@@ -1,12 +1,14 @@
 [Unit]
-Description=Homelab backup retention, prune, and repository check
+Description=Homelab backup retention and prune
 After=network-online.target
 Wants=network-online.target
+OnFailure=homelab-backup-notify@%n.service
 
 [Service]
 Type=oneshot
+# A timeout counts as failure, so a hung run still triggers OnFailure=.
+TimeoutStartSec=12h
 ExecStart=/usr/local/sbin/backupctl maintenance
-ExecStopPost=/usr/local/sbin/backupctl check
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7

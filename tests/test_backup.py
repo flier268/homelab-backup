@@ -284,8 +284,8 @@ class StagingLifecycleTests(unittest.TestCase):
         self.writer_patch = mock.patch.object(
             capture, 'validate_no_docker_writers', return_value=None,
         )
-        self.bind_probe_patch = mock.patch.object(
-            staging, 'validate_docker_bind_probe', return_value=None,
+        self.helper_image_patch = mock.patch.object(
+            staging, 'ensure_volume_helper_image', return_value=None,
         )
         self.snapshot_patch = mock.patch.object(
             staging, 'cleanup_snapshot_state', return_value=None,
@@ -293,14 +293,14 @@ class StagingLifecycleTests(unittest.TestCase):
         self.docker_patch.start()
         self.compose_patch.start()
         self.writer_patch.start()
-        self.bind_probe_patch.start()
+        self.helper_image_patch.start()
         self.snapshot_patch.start()
 
     def tearDown(self):
         self.compose_patch.stop()
         self.docker_patch.stop()
         self.writer_patch.stop()
-        self.bind_probe_patch.stop()
+        self.helper_image_patch.stop()
         self.snapshot_patch.stop()
         self.temp.cleanup()
 

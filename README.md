@@ -7,7 +7,8 @@ Docker Compose 服務的 Restic + OneDrive 備份工具。
 - 支援由受保護 manifest 精確授權、可由容器 UID/GID 擁有的任意深層路徑，以及本機 rootful
   Docker named volume；中間 symlink 不會被跟隨，leaf symlink 只備份 link 本身。
 - `backup.yaml` 會自動保存到每份 snapshot 的 `_meta/backup.yaml`，不必列入 `sources.paths`。
-- 單一 systemd timer 每 5 分鐘掃描到期服務。
+- 備份 systemd timer 每 5 分鐘掃描到期服務；另有每週 maintenance／check 與每 6 小時
+  的 status timer，unit 失敗或太久沒有成功備份時記錄 ALERT，並可選擇推送 ntfy／healthchecks。
 - 還原時可使用互動式選單，所有 repository 服務預設全選。
 - 批次備份與還原會隔離各服務錯誤；單一服務失敗不會跳過後續服務，最後
   統一列出失敗摘要並回傳非零狀態。
@@ -216,6 +217,11 @@ timestamped 密文。
 - Actions 依 `actions.backup`／`actions.restore` 分組；每項必須擇一使用不經
   shell 的 `command` argv，或由 `/bin/bash -euo pipefail -c` 執行的 inline
   `script`，並指定 `run_as`。密碼或 token 不可放入 argv。
+  `actions.backup` 可選的 `skip_if_not_running: <容器名稱>`（或名稱清單）會在
+  執行前檢查容器；只有確定容器不存在或未執行時才略過該 action 並記錄警告，備份照常
+  進行但標記為 best-effort，例如服務已停用時的 `docker exec ... pg_dump`。無法判斷
+  容器狀態（例如 Docker daemon 無回應）時仍會執行 action 並警告。`actions.restore`
+  不接受此欄位。
   完整欄位、writer 判定與 Btrfs 限制請見 `GUIDE.html`。
 
 從預設加密檔放回系統，依提示貼入 SSH 私鑰並解密：

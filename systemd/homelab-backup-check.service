@@ -1,0 +1,18 @@
+[Unit]
+Description=Homelab backup repository check (restic check)
+After=network-online.target
+Wants=network-online.target
+OnFailure=homelab-backup-notify@%n.service
+
+[Service]
+Type=oneshot
+# A timeout counts as failure, so a hung run still triggers OnFailure=.
+# restic check downloads check.read_data_subset (default 5%) of all pack data
+# through rclone; 12h covers that even on a slow or bwlimit-ed uplink. Keep it
+# below alert.max_lock_age (default 13h): the check holds the global lock. If a
+# check legitimately needs longer, raise both, or lower read_data_subset.
+TimeoutStartSec=12h
+ExecStart=/usr/local/sbin/backupctl check
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

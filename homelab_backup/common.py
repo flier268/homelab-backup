@@ -2,8 +2,10 @@ import datetime as dt
 import fcntl
 import os
 import shlex
+import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import yaml
@@ -82,6 +84,9 @@ class FailureSummary:
         else:
             print(message.format(error=error), file=sys.stderr)
         self.append(operation, summary_error or str(error))
+
+    def has_failures(self):
+        return bool(self.items)
 
     def raise_if_any(self, title):
         if not self.items:
@@ -172,12 +177,83 @@ def restic_env(c):
     return env
 
 
+def clear_stale_restic_locks(c):
+    """Remove stale restic locks once our own flock is held.
+
+    Deliberately runs plain ``restic unlock`` (never ``--remove-all``): restic
+    only deletes locks whose owner is gone or that are older than its stale
+    threshold, so a live backup from another host is never broken. A failure
+    is reported but does not abort the caller; the real restic command will
+    surface any lasting repository problem.
+    """
+    try:
+        run(['restic', 'unlock'], env=restic_env(c))
+        return True
+    except Exception as err:  # noqa: BLE001 - best effort by design
+        print(
+            f'WARNING: could not clear stale restic locks: '
+            f'{type(err).__name__}: {err}',
+            file=sys.stderr,
+        )
+        return False
+
+
+def global_lock_holder(path):
+    """Describe who holds the global lock, without blocking or writing.
+
+    Returns None when the lock file is missing or no other process holds it;
+    otherwise ``{'pid': int|None, 'started': str|None}`` parsed from the
+    ``pid=... started=...`` line GlobalLock writes. Never creates the file.
+    """
+    try:
+        fd = os.open(
+            path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+        )
+    except FileNotFoundError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            pass
+        else:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return None
+        content = os.read(fd, 4096).decode('utf-8', errors='replace')
+    finally:
+        os.close(fd)
+    fields = dict(
+        item.split('=', 1) for item in content.split() if '=' in item
+    )
+    pid = fields.get('pid')
+    return {
+        'pid': int(pid) if pid and pid.isdigit() else None,
+        'started': fields.get('started'),
+    }
+
+
+RUN_DUE_LOCK_RETRIES = 3
+LOCK_RETRY_SECONDS = 0.1
+
+
+def lock_retry_sleep(seconds):
+    time.sleep(seconds)
+
+
 class GlobalLock:
+    """Process-wide backup lock; reentrant within one process.
+
+    With ``nonblocking=True`` a busy lock is retried ``retries`` more times,
+    ``LOCK_RETRY_SECONDS`` apart, before giving up (``__enter__`` -> False).
+    """
     _held = {}
 
-    def __init__(self, path, nonblocking=False):
+    def __init__(self, path, nonblocking=False, retries=0):
         self.path = Path(path)
         self.nonblocking = nonblocking
+        self.retries = retries
         self.handle = None
         self._key = (os.getpid(), os.path.abspath(self.path))
         self._nested = False
@@ -206,12 +282,18 @@ class GlobalLock:
         os.fchmod(fd, 0o600)
         self.handle = os.fdopen(fd, 'a+', encoding='utf-8')
         flags = fcntl.LOCK_EX | (fcntl.LOCK_NB if self.nonblocking else 0)
-        try:
-            fcntl.flock(self.handle.fileno(), flags)
-        except BlockingIOError:
-            self.handle.close()
-            self.handle = None
-            return False
+        attempt = 0
+        while True:
+            try:
+                fcntl.flock(self.handle.fileno(), flags)
+                break
+            except BlockingIOError:
+                if attempt >= self.retries:
+                    self.handle.close()
+                    self.handle = None
+                    return False
+                attempt += 1
+                lock_retry_sleep(LOCK_RETRY_SECONDS)
         self.handle.seek(0)
         self.handle.truncate()
         self.handle.write(f'pid={os.getpid()} started={dt.datetime.now().astimezone().isoformat()}\n')
@@ -228,5 +310,12 @@ class GlobalLock:
             return
         self._held.pop(self._key, None)
         handle = held['handle']
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        handle.close()
+        try:
+            # Clear the holder line first so a stale pid/started never
+            # survives a release.
+            handle.seek(0)
+            handle.truncate()
+            handle.flush()
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            handle.close()

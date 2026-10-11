@@ -770,7 +770,7 @@ class RestoreCommandTests(unittest.TestCase):
             ), mock.patch.object(
                 backupctl, 'validate_docker_environment',
             ), mock.patch.object(
-                backupctl, 'validate_docker_bind_probe',
+                backupctl, 'ensure_volume_helper_image',
             ), mock.patch.object(restore_apply, 'apply_one'):
                 backupctl.cmd_restore(config_data, args)
 
@@ -880,7 +880,7 @@ class ApplyCommandTests(unittest.TestCase):
             }
 
             with mock.patch.object(backupctl, 'validate_docker_environment'), \
-                    mock.patch.object(backupctl, 'validate_docker_bind_probe'), \
+                    mock.patch.object(backupctl, 'ensure_volume_helper_image'), \
                     mock.patch.object(backupctl, 'manifest', return_value=mock.Mock()), \
                     mock.patch.object(restore_apply, 'apply_one') as apply_mock:
                 with self.assertRaises(ValueError):
@@ -943,7 +943,7 @@ class ApplyCommandTests(unittest.TestCase):
 
             with mock.patch.object(backupctl, 'GlobalLock', TrackingLock), \
                     mock.patch.object(backupctl, 'validate_docker_environment'), \
-                    mock.patch.object(backupctl, 'validate_docker_bind_probe'), \
+                    mock.patch.object(backupctl, 'ensure_volume_helper_image'), \
                     mock.patch.object(
                         backupctl, 'validate_control_root',
                         side_effect=require_lock,

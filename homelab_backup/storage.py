@@ -2,6 +2,7 @@ import re
 import stat
 import json
 import os
+import sys
 import tempfile
 from pathlib import Path
 
@@ -56,23 +57,54 @@ def validate_docker_environment():
     return endpoint
 
 
-def validate_docker_bind_probe(c):
-    """Prove the local daemon resolves the same existing host hierarchy."""
-    root = ensure_private_directory(c['staging_root'])
-    probe = Path(tempfile.mkdtemp(prefix='.docker-bind-probe-', dir=root))
-    probe.chmod(0o700)
-    token = f'homelab-backup-{os.getpid()}'
-    (probe / 'token').write_text(token, encoding='utf-8')
+HELPER_DOCKERFILE_ENV = 'HOMELAB_BACKUP_RELEASE_VOLUME_HELPER_DOCKERFILE'
+
+
+def volume_helper_dockerfile():
+    """Return the release-bundled helper Dockerfile, if one is available."""
+    value = os.environ.get(HELPER_DOCKERFILE_ENV)
+    if not value:
+        return None
+    path = Path(value)
+    return path if path.is_absolute() and path.is_file() else None
+
+
+def volume_helper_image_present(c):
     try:
-        result = run([
-            'docker', 'run', '--rm', '--network', 'none',
-            '--mount', f'type=bind,src={probe},dst=/probe,readonly',
-            c['volume_helper_image'], 'cat', '/probe/token',
-        ], capture=True)
-        if result.stdout.strip() != token:
-            raise RuntimeError('Docker daemon bind probe saw different host data')
-    finally:
-        run_cleanup(lambda: clear_control_leaf(probe), 'Docker bind probe')
+        run(['docker', 'image', 'inspect', c['volume_helper_image']], capture=True)
+        return True
+    except CommandError:
+        return False
+
+
+def ensure_volume_helper_image(c):
+    """Make sure the rsync helper image exists, rebuilding it when pruned.
+
+    The helper used to be pinned by image ID, so a routine
+    ``docker image prune -a`` silently broke every Docker-backed backup.
+    It is now referenced by tag and rebuilt from the release-bundled
+    Dockerfile when missing.
+    """
+    image = c['volume_helper_image']
+    if volume_helper_image_present(c):
+        return image
+    dockerfile = volume_helper_dockerfile()
+    if dockerfile is None:
+        raise RuntimeError(
+            f'Docker helper image is missing: {image}; rebuild it with '
+            f'`docker build -t {image} -f Dockerfile.volume-rsync .` '
+            'from the homelab-backup source or rerun install.sh'
+        )
+    print(
+        f'WARNING: Docker helper image {image} is missing; rebuilding it '
+        f'from {dockerfile}',
+        file=sys.stderr,
+    )
+    with tempfile.TemporaryDirectory(prefix='homelab-backup-helper-') as ctx:
+        run([
+            'docker', 'build', '--tag', image, '--file', str(dockerfile), ctx,
+        ])
+    return image
 
 
 def docker_volume_details(name):

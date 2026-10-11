@@ -832,6 +832,21 @@ def _run_restore_actions(
     )
 
 
+def _warn_optional_restore_failures(failures):
+    if not failures:
+        return
+    print(
+        f'WARNING: {len(failures)} optional restore action(s) did not succeed:',
+        file=sys.stderr,
+    )
+    for failure in failures:
+        print(
+            f"  - restore.{failure['phase']} {failure['name']!r}: "
+            f"{failure['result']}",
+            file=sys.stderr,
+        )
+
+
 def _stop_hook_started_services(plan):
     if not requires_docker(plan.manifest) or not _has_restore_actions(plan.manifest):
         return
@@ -942,6 +957,18 @@ class RestoreApplyWorkflow:
                     'service recovery after failed Compose stop',
                 )
             raise
+        optional_failures = []
+        try:
+            self._apply_stopped(
+                c, m, root, plan, targets, start_services, optional_failures,
+            )
+        finally:
+            _warn_optional_restore_failures(optional_failures)
+
+    def _apply_stopped(
+            self, c, m, root, plan, targets, start_services, optional_failures,
+    ):
+        deps = self.dependencies
         mutation_started = False
         changes = RestoreChanges()
         primary_error = None
@@ -950,7 +977,9 @@ class RestoreApplyWorkflow:
         try:
             deps.dynamic_preflight(c, plan)
             active_phase = 'before'
-            _run_restore_actions(plan, root, 'before')
+            optional_failures.extend(
+                _run_restore_actions(plan, root, 'before'),
+            )
             mutation_started = True
             operation_id = deps.operation_id()
             active_phase = 'restore'
@@ -961,12 +990,16 @@ class RestoreApplyWorkflow:
                 deps.restore_data(c, plan, changes, operation_id)
                 deps.publish_controls(c, m, plan, changes)
             active_phase = 'after'
-            _run_restore_actions(plan, root, 'after')
+            optional_failures.extend(
+                _run_restore_actions(plan, root, 'after'),
+            )
         except Exception as err:
             primary_error = err
             primary_phase = active_phase
         try:
-            _run_restore_actions(plan, root, 'finally')
+            optional_failures.extend(
+                _run_restore_actions(plan, root, 'finally'),
+            )
         except Exception as err:
             if primary_error is None:
                 primary_error = err
@@ -1039,7 +1072,9 @@ class RestoreApplyWorkflow:
             )
             raise
         try:
-            _run_restore_actions(plan, root, 'on_success')
+            optional_failures.extend(
+                _run_restore_actions(plan, root, 'on_success'),
+            )
         except Exception as err:
             deps.cleanup(
                 lambda: _run_restore_actions(

@@ -1,0 +1,16 @@
+[Unit]
+Description=Alert when homelab backups have not succeeded recently
+After=network-online.target
+Wants=network-online.target
+OnFailure=homelab-backup-notify@%n.service
+
+[Service]
+Type=oneshot
+TimeoutStartSec=15min
+# Exits 2 when a scheduled service is stale or the global lock has been held
+# longer than alert.max_lock_age. --notify pushes the problem itself (only on
+# change or after alert.renotify_after) and sends healthchecks success pings;
+# OnFailure= still logs an ALERT but skips a duplicate push only for the run
+# whose stale/stalled problem status itself handled. Status' own errors
+# (exit 1) are always pushed.
+ExecStart=/usr/local/sbin/backupctl status --notify

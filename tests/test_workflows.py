@@ -72,7 +72,7 @@ class WorkflowDependencyTests(unittest.TestCase):
                 events,
                 [
                     'stage', 'space', ('restic', 'backup'),
-                    'remove-stage', 'success-actions', ('restic', 'forget'),
+                    'remove-stage', 'success-actions',
                 ],
             )
             self.assertEqual(saved[0]['last_result'], 'running')
@@ -149,7 +149,6 @@ class WorkflowDependencyTests(unittest.TestCase):
                     ('restic', 'backup'),
                     ('failure-actions', 'cleanup', cleanup_failure),
                     ('failure-actions', 'on_success', action_failure),
-                    ('restic', 'forget'),
                     ('failure-actions', 'state', state_failure),
                 ],
             )
@@ -214,7 +213,7 @@ class WorkflowDependencyTests(unittest.TestCase):
                 command[:2] == ['restic', 'backup']
                 for command in commands
             ))
-            self.assertTrue(any(
+            self.assertFalse(any(
                 command[:2] == ['restic', 'forget']
                 for command in commands
             ))

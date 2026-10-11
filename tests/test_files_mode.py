@@ -102,7 +102,7 @@ class FilesBackupTests(unittest.TestCase):
                     staging, 'validate_docker_environment',
                     side_effect=AssertionError('Docker validation called'),
             ) as docker_environment, mock.patch.object(
-                    staging, 'validate_docker_bind_probe',
+                    staging, 'ensure_volume_helper_image',
                     side_effect=AssertionError('Docker probe called'),
             ) as docker_probe, mock.patch.object(
                     staging, 'compose_model',
@@ -151,7 +151,7 @@ class FilesBackupTests(unittest.TestCase):
                     side_effect=AssertionError('Docker validation called'),
                 ))
                 docker_probe = stack.enter_context(mock.patch.object(
-                    backup, 'validate_docker_bind_probe',
+                    backup, 'volume_helper_image_present',
                     side_effect=AssertionError('Docker probe called'),
                 ))
                 compose_model = stack.enter_context(mock.patch.object(
@@ -201,7 +201,7 @@ class FilesBackupTests(unittest.TestCase):
                     backup, 'validate_docker_environment',
                 ))
                 docker_probe = stack.enter_context(mock.patch.object(
-                    backup, 'validate_docker_bind_probe',
+                    backup, 'volume_helper_image_present',
                 ))
                 compose_model = stack.enter_context(mock.patch.object(
                     backup, 'compose_model', return_value={},
@@ -261,7 +261,7 @@ class FilesBackupTests(unittest.TestCase):
                     staging, 'validate_docker_environment',
                 ))
                 docker_probe = stack.enter_context(mock.patch.object(
-                    staging, 'validate_docker_bind_probe',
+                    staging, 'ensure_volume_helper_image',
                 ))
                 compose_model = stack.enter_context(mock.patch.object(
                     staging, 'compose_model',
@@ -495,7 +495,7 @@ class FilesRestoreTests(unittest.TestCase):
                 side_effect=AssertionError('Docker validation called'),
             ))
             docker_probe = stack.enter_context(mock.patch.object(
-                restore, 'validate_docker_bind_probe',
+                restore, 'ensure_volume_helper_image',
                 side_effect=AssertionError('Docker probe called'),
             ))
             apply_one = stack.enter_context(mock.patch.object(
@@ -546,7 +546,7 @@ class FilesRestoreTests(unittest.TestCase):
                 side_effect=AssertionError('Docker validation called'),
             ))
             docker_probe = stack.enter_context(mock.patch.object(
-                restore, 'validate_docker_bind_probe',
+                restore, 'ensure_volume_helper_image',
                 side_effect=AssertionError('Docker probe called'),
             ))
             apply_one = stack.enter_context(mock.patch.object(

@@ -24,6 +24,7 @@ class GlobalConfig(TypedDict, total=False):
     lock_file: str
     rclone: RcloneConfig
     check: CheckConfig
+    alert: dict
 
 
 class ScheduleConfig(TypedDict, total=False):

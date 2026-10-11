@@ -1,7 +1,12 @@
 FROM alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce
+# Packages are pinned to major.minor (~): Alpine drops superseded package
+# revisions from its repositories, so exact =version pins break rebuilds.
+# The versions actually installed are recorded in the image.
 RUN apk add --no-cache \
-    acl=2.3.2-r1 \
-    attr=2.5.2-r2 \
-    coreutils=9.7-r1 \
-    rsync=3.4.3-r0
+    acl~2.3 \
+    attr~2.5 \
+    coreutils~9.7 \
+    rsync~3.4 \
+    && apk info -v | sort > /usr/share/volume-rsync-apk-versions.txt \
+    && cat /usr/share/volume-rsync-apk-versions.txt
 ENTRYPOINT []

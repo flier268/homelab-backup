@@ -104,10 +104,12 @@ sudo backupctl cleanup-restores --all --yes</code></pre>
     <p>先確認 validate、每個服務首次備份、實際還原測試與主機外的加密設定備援均已完成。</p>
     <pre v-pre><code>sudo systemctl enable --now homelab-backup.timer
 sudo systemctl enable --now homelab-backup-maintenance.timer
+sudo systemctl enable --now homelab-backup-check.timer
+sudo systemctl enable --now homelab-backup-status.timer
 
 systemctl list-timers 'homelab-backup*'
 systemctl status homelab-backup.timer</code></pre>
-    <p>每 5 分鐘 timer 執行 <code>backupctl run-due</code>，只備份當下到期的服務。</p>
+    <p>每 5 分鐘 timer 執行 <code>backupctl run-due</code>，只備份當下到期的服務。每週 maintenance 執行 retention 與 prune，check timer 另外執行 <code>restic check</code>；status timer 每 6 小時執行 <code>backupctl status --notify</code>（不等全域鎖），服務太久沒有成功備份、或全域鎖被持有超過 <code>alert.max_lock_age</code>（預設 13h）時回傳 2；同一問題只在變化或超過 <code>alert.renotify_after</code>（預設 24h）後才再推送，healthchecks 另會收到成功 ping。任一 service 失敗都會觸發 <code>homelab-backup-notify@</code>，在 journal 記錄 ALERT，並在設定 <code>alert.notify_url_file</code>（root 擁有、0600、https）時推送含錯誤第一行與該 unit 最後 30 行 journal 的通知；run-due 的失敗依服務分別節流，只推送剛失敗或超過 <code>alert.renotify_after</code> 的服務，run-due 本身 crash／逾時則依結果類型另外推送；這些內容會離開主機，請使用私人 topic 或信任的服務。</p>
   </section>
 
   <section id="monitor">
@@ -179,6 +181,8 @@ docker compose ps
 docker compose logs --tail=200
 
 sudo systemctl enable --now homelab-backup.timer
-sudo systemctl enable --now homelab-backup-maintenance.timer</code></pre>
+sudo systemctl enable --now homelab-backup-maintenance.timer
+sudo systemctl enable --now homelab-backup-check.timer
+sudo systemctl enable --now homelab-backup-status.timer</code></pre>
   </section>
 </template>
