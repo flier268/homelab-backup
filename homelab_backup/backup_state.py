@@ -174,3 +174,63 @@ def due_status(
     return False, (
         f'next at {next_time.isoformat(timespec="minutes") if next_time else "unknown"}'
     ), next_time
+
+
+DEFAULT_SUCCESS_GRACE_SECONDS = 3600
+
+
+def success_age_threshold(c: GlobalConfig, m: ServiceManifest, now=None):
+    """Seconds after which a missing successful backup must alert.
+
+    ``alert.max_success_age`` in the global config wins. Otherwise two full
+    schedule periods plus one hour of grace are allowed, so one failed or
+    missed run is tolerated but a second one is not (daily -> 49h).
+    """
+    alert = c.get('alert') or {}
+    if alert.get('max_success_age'):
+        return parse_duration(alert['max_success_age'], 'alert.max_success_age')
+    now = now or local_now()
+    cron = (m.get('schedule') or {}).get('cron')
+    if cron is None:
+        return None
+    spec = parse_cron(cron, 'schedule.cron')
+    previous = cron_previous(spec, now)
+    following = cron_next(spec, previous) if previous is not None else None
+    if previous is None or following is None:
+        return None
+    period = (following - previous).total_seconds()
+    return int(2 * period + DEFAULT_SUCCESS_GRACE_SECONDS)
+
+
+def success_staleness(
+        c: GlobalConfig, m: ServiceManifest, state: BackupState, now=None,
+        *, max_age_seconds=None,
+):
+    """Report whether a service has gone too long without a success."""
+    now = now or local_now()
+    result = {
+        'stale': False,
+        'last_success_age_seconds': None,
+        'max_success_age_seconds': None,
+    }
+    if (m.get('schedule') or {}).get('enabled', True) is False:
+        return result
+    threshold = max_age_seconds or success_age_threshold(c, m, now)
+    result['max_success_age_seconds'] = threshold
+    if threshold is None:
+        return result
+    now_utc = now.astimezone(dt.timezone.utc)
+    reference = parse_iso(state.get('last_success_at'))
+    if reference is None:
+        # Never succeeded: measure from when the service was first seen so a
+        # brand-new service is not reported before it had a chance to run.
+        first_seen = parse_iso(state.get('first_seen_at'))
+        if first_seen is None:
+            return result
+        age = (now_utc - first_seen).total_seconds()
+        result['stale'] = age > threshold
+        return result
+    age = (now_utc - reference).total_seconds()
+    result['last_success_age_seconds'] = round(age)
+    result['stale'] = age > threshold
+    return result

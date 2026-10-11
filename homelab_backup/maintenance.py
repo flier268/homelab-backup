@@ -3,7 +3,10 @@ import os
 import sys
 
 from .backup import backup_one, retention_cmd
-from .backup_state import due_status, load_state, save_state
+from .alerting import notify
+from .backup_state import (
+    due_status, load_state, save_state, success_staleness,
+)
 from .btrfs_snapshot import cleanup_snapshot_state, snapshot_state_services
 from .common import (
     CommandError, FailureSummary, GlobalLock, _print_command_failure,
@@ -12,7 +15,7 @@ from .common import (
 from .manifest import (
     manifest, manifests, service_label, valid_service_name, validate_manifest,
 )
-from .schedule import local_now
+from .schedule import local_now, parse_duration
 
 
 def _manifest_error_recorder(failures):
@@ -55,9 +58,17 @@ def cmd_list(c, args):
     failures.raise_if_any('LIST FAILURES')
 
 
+STALE_EXIT_CODE = 2
+
+
 def cmd_status(c, args):
     now = local_now()
     failures = FailureSummary()
+    max_age = getattr(args, 'max_age', None)
+    max_age_seconds = (
+        parse_duration(max_age, '--max-age') if isinstance(max_age, str) else None
+    )
+    stale = []
     for m in manifests(c, on_error=_manifest_error_recorder(failures)):
         service = m.get('service', '<unnamed>')
         try:
@@ -74,6 +85,9 @@ def cmd_status(c, args):
             continue
         try:
             state = load_state(c, service)
+            staleness = success_staleness(
+                c, m, state, now, max_age_seconds=max_age_seconds,
+            )
         except Exception as err:
             failures.record_exception(
                 service, err,
@@ -90,8 +104,64 @@ def cmd_status(c, args):
             'last_duration_seconds': state.get('last_duration_seconds'),
             'last_error': state.get('last_error'),
             'last_retention_error': state.get('last_retention_error'),
+            **staleness,
         }, ensure_ascii=False))
+        if staleness['stale']:
+            stale.append((service, state, staleness))
+    for service, state, staleness in stale:
+        print(
+            f"ALERT: {service}: no successful backup within "
+            f"{staleness['max_success_age_seconds']}s "
+            f"(last success: {state.get('last_success_at') or 'never'}; "
+            f"last error: {state.get('last_error') or '-'})",
+            file=sys.stderr,
+        )
+    notify_requested = getattr(args, 'notify', False) is True
+    if notify_requested and (stale or failures.has_failures()):
+        lines = [
+            f"{service}: last success {state.get('last_success_at') or 'never'}"
+            f"; last error {state.get('last_error') or '-'}"
+            for service, state, _ in stale
+        ]
+        if failures.has_failures():
+            lines.append('status itself reported errors; see journal')
+        notify(
+            c, f"homelab-backup on {c.get('host_id', '?')}: backups are stale",
+            '\n'.join(lines),
+        )
+    elif notify_requested:
+        notify(
+            c, f"homelab-backup on {c.get('host_id', '?')}: OK",
+            'all scheduled backups are fresh', ok=True,
+        )
     failures.raise_if_any('STATUS FAILURES')
+    if stale:
+        raise SystemExit(STALE_EXIT_CODE)
+
+
+def cmd_notify_failure(c, args):
+    """Entry point for systemd OnFailure= (homelab-backup-notify@.service)."""
+    unit = args.unit
+    detail = ''
+    try:
+        detail = run(
+            ['journalctl', '--unit', unit, '--lines', '30', '--no-pager',
+             '--output', 'cat'],
+            capture=True, check=False,
+        ).stdout or ''
+    except Exception as err:  # noqa: BLE001 - journal is optional context
+        detail = f'(journal unavailable: {err})'
+    print(f'ALERT: systemd unit failed: {unit}', file=sys.stderr)
+    delivered = notify(
+        c, f"homelab-backup on {c.get('host_id', '?')}: {unit} failed",
+        detail[-3500:] or 'see journalctl for details',
+    )
+    if not delivered:
+        print(
+            'WARNING: failure notification was not delivered '
+            '(alert.notify_url_file not configured or unreachable)',
+            file=sys.stderr,
+        )
 
 
 def cmd_run_due(c, args):

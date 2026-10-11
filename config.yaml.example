@@ -14,3 +14,10 @@ rclone:
   bwlimit: ""
 check:
   read_data_subset: 5%
+# Optional alerting (stop-the-bleeding). `backupctl status` exits 2 when a
+# scheduled service has no successful backup within max_success_age (default:
+# two schedule periods + 1h). notify_url_file holds a single ntfy topic URL or
+# healthchecks.io ping URL; keep it root-owned 0600 and out of git.
+#alert:
+#  max_success_age: 36h
+#  notify_url_file: /etc/homelab-backup/notify-url

@@ -83,6 +83,9 @@ class FailureSummary:
             print(message.format(error=error), file=sys.stderr)
         self.append(operation, summary_error or str(error))
 
+    def has_failures(self):
+        return bool(self.items)
+
     def raise_if_any(self, title):
         if not self.items:
             return

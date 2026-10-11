@@ -5,6 +5,7 @@ from pathlib import Path
 import yaml
 
 from .common import die, format_remediable_error, load_yaml
+from .schedule import parse_duration
 from .security import paths_overlap
 from .types import GlobalConfig
 
@@ -28,7 +29,7 @@ def _validate_config_header(c):
         'version', 'host_id', 'services_root', 'repository', 'password_file',
         'rclone_config', 'staging_root', 'restore_root', 'cache_root',
         'volume_helper_image', 'state_root', 'lock_file', 'trusted_data_roots',
-        'rclone', 'check',
+        'rclone', 'check', 'alert',
     }
     unknown = sorted(set(c) - allowed)
     if unknown:
@@ -63,6 +64,7 @@ def _validate_optional_sections(c):
     optional_sections = {
         'rclone': {'bwlimit'},
         'check': {'read_data_subset'},
+        'alert': {'max_success_age', 'notify_url_file'},
     }
     for section_name, section_fields in optional_sections.items():
         if section_name not in c:
@@ -80,6 +82,16 @@ def _validate_optional_sections(c):
         subset = c['check']['read_data_subset']
         if not isinstance(subset, str) or not subset:
             die(f'{CFG}: check.read_data_subset must be a non-empty string')
+    alert = c.get('alert', {})
+    if 'max_success_age' in alert:
+        try:
+            parse_duration(alert['max_success_age'], 'alert.max_success_age')
+        except ValueError as err:
+            die(f'{CFG}: {err}')
+    if 'notify_url_file' in alert:
+        value = alert['notify_url_file']
+        if not isinstance(value, str) or not value.startswith('/'):
+            die(f'{CFG}: alert.notify_url_file must be an absolute path')
 
 
 def _validate_root_separation(c):
