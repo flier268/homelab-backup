@@ -104,10 +104,12 @@ sudo backupctl cleanup-restores --all --yes</code></pre>
     <p>先確認 validate、每個服務首次備份、實際還原測試與主機外的加密設定備援均已完成。</p>
     <pre v-pre><code>sudo systemctl enable --now homelab-backup.timer
 sudo systemctl enable --now homelab-backup-maintenance.timer
+sudo systemctl enable --now homelab-backup-check.timer
+sudo systemctl enable --now homelab-backup-status.timer
 
 systemctl list-timers 'homelab-backup*'
 systemctl status homelab-backup.timer</code></pre>
-    <p>每 5 分鐘 timer 執行 <code>backupctl run-due</code>，只備份當下到期的服務。</p>
+    <p>每 5 分鐘 timer 執行 <code>backupctl run-due</code>，只備份當下到期的服務。每週 maintenance 執行 retention 與 prune，check timer 另外執行 <code>restic check</code>；status timer 每 6 小時檢查是否太久沒有成功備份。任一 service 失敗都會觸發 <code>homelab-backup-notify@</code>，在 journal 記錄 ALERT，並在設定 <code>alert.notify_url_file</code> 時推送通知。</p>
   </section>
 
   <section id="monitor">
@@ -179,6 +181,8 @@ docker compose ps
 docker compose logs --tail=200
 
 sudo systemctl enable --now homelab-backup.timer
-sudo systemctl enable --now homelab-backup-maintenance.timer</code></pre>
+sudo systemctl enable --now homelab-backup-maintenance.timer
+sudo systemctl enable --now homelab-backup-check.timer
+sudo systemctl enable --now homelab-backup-status.timer</code></pre>
   </section>
 </template>

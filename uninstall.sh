@@ -47,14 +47,23 @@ UNIT_NAMES=(
   homelab-backup.timer
   homelab-backup-maintenance.service
   homelab-backup-maintenance.timer
+  homelab-backup-check.service
+  homelab-backup-check.timer
+  homelab-backup-status.service
+  homelab-backup-status.timer
+  homelab-backup-notify@.service
 )
 TIMER_NAMES=(
   homelab-backup.timer
   homelab-backup-maintenance.timer
+  homelab-backup-check.timer
+  homelab-backup-status.timer
 )
 SERVICE_NAMES=(
   homelab-backup.service
   homelab-backup-maintenance.service
+  homelab-backup-check.service
+  homelab-backup-status.service
 )
 
 # Serialize with install.sh whenever an installation root exists.

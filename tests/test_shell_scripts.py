@@ -1076,14 +1076,15 @@ class DeploymentScriptTests(unittest.TestCase):
         ).read_text(encoding='utf-8')
         self.assertNotIn('--no-wait', unit)
 
-    def test_repository_check_runs_as_maintenance_cleanup(self):
+    def test_repository_check_is_not_maintenance_cleanup(self):
+        # Stop-the-bleeding change 4: restic check has its own service so a
+        # failing check is visible and alerting instead of hidden in
+        # ExecStopPost of maintenance.
         unit = (
             ROOT / 'systemd' / 'homelab-backup-maintenance.service'
         ).read_text(encoding='utf-8')
-        self.assertIn(
-            'ExecStopPost=/usr/local/sbin/backupctl check',
-            unit,
-        )
+        self.assertNotIn('ExecStopPost', unit)
+        self.assertNotIn('backupctl check', unit)
         self.assertEqual(unit.count('ExecStart='), 1)
 
 

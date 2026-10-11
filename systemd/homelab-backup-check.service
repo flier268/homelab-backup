@@ -1,0 +1,12 @@
+[Unit]
+Description=Homelab backup repository check (restic check)
+After=network-online.target
+Wants=network-online.target
+OnFailure=homelab-backup-notify@%n.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/backupctl check
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

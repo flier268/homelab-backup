@@ -2,6 +2,7 @@
 Description=Evaluate and run due homelab backups
 After=docker.service network-online.target
 Wants=network-online.target
+OnFailure=homelab-backup-notify@%n.service
 
 [Service]
 Type=oneshot
