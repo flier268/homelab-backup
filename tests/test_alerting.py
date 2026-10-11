@@ -177,6 +177,19 @@ class NotifyTests(unittest.TestCase):
         self.assertEqual(headers['Title'], 'Title')
         self.assertIn(b'body', body)
 
+    def test_body_cap_does_not_split_a_character(self):
+        sent = []
+        with mock.patch.object(
+            alerting, 'notification_url', return_value='https://ntfy.sh/t',
+        ):
+            alerting.notify(
+                {}, 'T', '備' * 5000,
+                opener=lambda target, body, headers: sent.append(body),
+            )
+        body = sent[0]
+        self.assertLessEqual(len(body), 10000)
+        self.assertTrue(body.decode('utf-8').endswith('備'))
+
     def test_ntfy_skips_ok_messages(self):
         delivered, sent = self._notify('https://ntfy.sh/t', ok=True)
         self.assertFalse(delivered)
@@ -359,6 +372,52 @@ class NotifyFailureCommandTests(unittest.TestCase):
         self.assertIn('homelab-backup.service', run.call_args.args[0])
         self.assertIn('homelab-backup.service failed', notify.call_args.args[1])
         self.assertIn('line2', notify.call_args.args[2])
+
+    def push(self, summary, journal):
+        """Title and body that _push_unit_failure hands to notify()."""
+        with mock.patch.object(
+            maintenance, 'run', return_value=mock.Mock(stdout=journal),
+        ), mock.patch.object(maintenance, 'notify', return_value=True) as notify:
+            maintenance._push_unit_failure(
+                {'host_id': 'h'}, maintenance.CHECK_UNIT, 'check failed', summary,
+            )
+        title, body = notify.call_args.args[1:3]
+        size = len(f'{title}\n\n{body}'.encode('utf-8'))
+        self.assertLessEqual(size, maintenance.NOTIFY_BODY_LIMIT)
+        self.assertNotIn('�', body)
+        return body, size
+
+    def test_long_multibyte_journal_keeps_summary_and_journal_end(self):
+        journal = ''.join(f'第{i}行：備份失敗，無法連線到儲存庫\n' for i in range(400))
+        body, size = self.push('- svc-a: 錯誤', journal)
+        # Cut on a character boundary, so at most 3 bytes short of the limit.
+        self.assertGreater(size, maintenance.NOTIFY_BODY_LIMIT - 4)
+        summary, tail = body.split('\n\n', 1)
+        self.assertEqual(summary, '- svc-a: 錯誤')
+        self.assertTrue(tail.startswith('…'))
+        self.assertTrue(journal.endswith(tail[1:]))
+        self.assertIn('第399行', tail)
+
+    def test_oversized_summary_is_cut_and_journal_dropped(self):
+        summary = '服務失敗' * 2000
+        body, _ = self.push(summary, 'journal line\n')
+        self.assertTrue(body.endswith('…'))
+        self.assertTrue(summary.startswith(body[:-1]))
+        self.assertNotIn('journal line', body)
+
+    def test_short_body_is_unchanged(self):
+        body, _ = self.push('- svc-a: x', 'line1\nline2\n')
+        self.assertEqual(body, '- svc-a: x\n\nline1\nline2\n')
+
+    def test_utf8_cuts_never_split_a_character(self):
+        text = 'a備份é😀' * 50
+        for limit in range(0, 40):
+            for cut in (maintenance._utf8_head, maintenance._utf8_tail):
+                result = cut(text, limit)
+                self.assertLessEqual(len(result.encode('utf-8')), limit)
+                self.assertTrue(
+                    result.strip('…') in text, (cut.__name__, limit, result),
+                )
 
     def test_alert_is_logged_before_config_loading_fails(self):
         def broken_cfg():

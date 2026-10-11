@@ -229,19 +229,50 @@ class RunDueAlertResetTests(AlertFixture):
         notify = self.notify_failure(maintenance.BACKUP_UNIT, monitor_id='run-1')
         self.assertIn('failed (unknown)', notify.call_args.args[1])
 
-    def test_completed_round_clears_crash_entries(self):
+    def test_completed_round_clears_quiet_crash_entries(self):
         self.notify_failure(maintenance.BACKUP_UNIT, monitor_id='run-x')
         self.assertIn('crashes', self.unit_record(maintenance.BACKUP_UNIT))
-        self.run_due({'a': None}, due=set(), at=NOW + dt.timedelta(minutes=5))
-        self.assertIn('crashes', self.unit_record(maintenance.BACKUP_UNIT))
         # Too soon after the crash: an intermittent crash stays throttled.
+        self.run_due({'a': None}, due=set(), at=NOW + dt.timedelta(minutes=5))
         self.run_due({'a': None}, at=NOW + dt.timedelta(minutes=10))
+        self.run_due({'a': RuntimeError('x')}, at=NOW + dt.timedelta(minutes=59))
         self.assertIn('crashes', self.unit_record(maintenance.BACKUP_UNIT))
-        # A round with a service failure never clears it.
+        # A round with a service failure clears it once it has been quiet.
         self.run_due({'a': RuntimeError('x')}, at=NOW + dt.timedelta(minutes=60))
-        self.assertIn('crashes', self.unit_record(maintenance.BACKUP_UNIT))
-        self.run_due({'a': None}, at=NOW + dt.timedelta(minutes=65))
-        self.assertEqual(self.unit_record(maintenance.BACKUP_UNIT), {})
+        self.assertNotIn('crashes', self.unit_record(maintenance.BACKUP_UNIT))
+
+    def test_nothing_due_clears_quiet_crash_only(self):
+        self.round({'a': RuntimeError('x')}, 0)
+        self.notify_failure(maintenance.BACKUP_UNIT, monitor_id='run-x')
+        before = self.unit_record(maintenance.BACKUP_UNIT)
+        self.assertIn('crashes', before)
+        # 'b' was removed, but a round that attempted nothing keeps its entry.
+        self.run_due(
+            {'b': None}, due=set(), at=NOW + dt.timedelta(minutes=60),
+        )
+        after = self.unit_record(maintenance.BACKUP_UNIT)
+        self.assertNotIn('crashes', after)
+        before.pop('crashes')
+        self.assertEqual(after, before)
+
+    def test_nothing_due_without_anything_to_clear_does_not_write(self):
+        self.run_due({'a': None}, due=set())
+        self.assertFalse(alerting.alert_state_path(self.c).exists())
+        self.round({'a': RuntimeError('x')}, 0)
+        self.notify_failure(maintenance.BACKUP_UNIT, monitor_id='run-x')
+        with mock.patch.object(alerting, 'save_alert_state') as save:
+            self.run_due(
+                {'a': None}, due=set(), at=NOW + dt.timedelta(minutes=59),
+            )
+        save.assert_not_called()
+
+    def test_changed_error_of_still_failing_service_is_not_stored(self):
+        self.round({'a': RuntimeError('x')}, 0)
+        self.assertEqual(
+            self.unit_record(maintenance.BACKUP_UNIT)['services'],
+            {'a': {'notified_at': NOW.isoformat()}},
+        )
+        self.round({'a': RuntimeError('y')}, 5).assert_not_called()
 
     def test_undelivered_crash_is_recorded_as_seen_and_pushed_again(self):
         self.notify_failure(

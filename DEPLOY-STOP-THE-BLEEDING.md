@@ -82,7 +82,10 @@ alert:
 > **注意：通知內容會離開主機。** 通知內文會列出每個失敗服務（run-due）或每個
 > status 錯誤／過期服務的 `last error` 的**第一行**（截斷為 200 字元）；
 > `homelab-backup-notify@` 推送時另外附上失敗 unit 最後 30 行 journal
-> （`journalctl --unit <unit> --lines 30 --output cat`，最多約 3000 字元）。
+> （`journalctl --unit <unit> --lines 30 --output cat`）。標題加內文以 UTF-8 計
+> 最多 3900 bytes（ntfy 單則上限 4096 bytes）：摘要放最前面，放不下時從 journal
+> 開頭裁掉、只保留結尾（摘要本身過長時截斷摘要、不附 journal），一律在字元邊界
+> 切開，不會產生不合法的 UTF-8；被裁掉處以 `…` 標示。
 > 這些內容可能包含服務名稱、路徑、容器名稱與錯誤訊息。ntfy 請用私人或自架
 > server、夠長的隨機 topic（公開 ntfy.sh 上知道 topic 的人都能讀），或改用你信任的
 > healthchecks 服務。
@@ -220,17 +223,23 @@ systemctl status 'homelab-backup-notify@homelab-backup-status.service.service' -
   可列出多個服務，其他仍在失敗但已通知過的服務只附註名稱。某服務備份**成功**只清掉
   該服務的紀錄；這一輪沒排到的服務保留紀錄；「No backups are due」或其他服務成功
   都不會清掉別人的紀錄。所以一個服務持續失敗、其他服務照常成功時，24h 內只推送
-  一次；修好後再壞會立即推送。
+  一次；修好後再壞會立即推送。節流只看服務名稱（每個服務只記 `notified_at`）：
+  仍在失敗的服務即使錯誤訊息變了，在 `renotify_after` 內也不會再推送，新的錯誤
+  只出現在 journal 與 `status` 的 `last_error`。
 - **run-due 沒做完紀錄就結束**（crash、逾時、OOM、被 kill、設定錯誤）時，
   `notify-failure` 不採用舊的失敗紀錄：只有紀錄裡的 invocation id 等於 systemd
   傳來的 `MONITOR_INVOCATION_ID` 才採用。否則以獨立問題推送，標題如
   `homelab-backup.service failed (timeout)`，內文附 `MONITOR_SERVICE_RESULT`／
   `MONITOR_EXIT_CODE`／`MONITOR_EXIT_STATUS`。這類推送依結果類型（`crash:<result>`）
   分別節流：第一次或換成新的結果類型時立即推送，持續發生時每 `renotify_after`
-  最多一次（沒推送成功的那次不算）。每次 crash 都會更新該類型的 `last_seen_at`；
-  只有某一輪 run-due 有實際嘗試備份、沒有任何服務失敗，且距上次看到該 crash 已滿
-  1 小時，才清掉該筆紀錄，所以「每小時被 OOM kill 一次、中間各輪正常」24h 內只推送
-  一次；安靜超過 1 小時後再 crash 會立即推送。systemd 低於 251（沒有 `MONITOR_INVOCATION_ID`）時，
+  最多一次（沒推送成功的那次不算）。每次 crash（不論有沒有推送）都會更新該類型的
+  `last_seen_at`。任何一輪做完紀錄的 run-due——包括「No backups are due」的一輪
+  與有服務失敗的一輪——都會清掉 `last_seen_at` 已滿 1 小時的 `crash:<result>`
+  紀錄（「No backups are due」的一輪不動各服務的紀錄，沒有可清的 crash 時也不會
+  建立或改寫 `_alerts.json`）。crash 的那一輪本身沒做完紀錄，不會清任何東西。
+  所以「每小時（或每 30 分鐘）被 OOM kill 一次、中間各輪正常」24h 內只推送一次；
+  同一種 crash 停了至少 1 小時（期間至少有一輪正常結束）後再發生會立即推送，
+  即使只有每日排程的服務、或有服務一直在失敗也一樣。systemd 低於 251（沒有 `MONITOR_INVOCATION_ID`）時，
   改採 20 分鐘內、尚未被前一次 notify-failure 用過的紀錄。
 - maintenance／check 依 unit 節流；成功跑完一次會清掉該 unit 的紀錄，下次再失敗
   立即推送。`status` 跑完且一切正常（沒有過期、沒有鎖卡住、沒有 status 錯誤）時
@@ -241,7 +250,9 @@ systemctl status 'homelab-backup-notify@homelab-backup-status.service.service' -
   看到。判斷依據是 status 記下的 `INVOCATION_ID` 必須等於 `MONITOR_INVOCATION_ID`；
   有 `MONITOR_INVOCATION_ID` 但紀錄沒有 id 時一律推送，只有 systemd 沒提供
   `MONITOR_INVOCATION_ID` 時才退回 20 分鐘時間窗。`status` 本身出錯（exit 1）則一律
-  由 `notify-failure` 推送。
+  由 `notify-failure` 推送，所以這時會收到**兩則**通知：`status --notify` 自己的
+  推送（`status error: ...`，依問題內容節流）與 `OnFailure=` 觸發的
+  `homelab-backup-status.service failed`（依 unit 與 `renotify_after` 節流）。
 - `run-due` 拿不到全域鎖時，會先以 100 ms 間隔重試 3 次，仍拿不到
   才印 `SKIP:` 跳過這一輪（避免剛好撞上前一輪收尾而白白錯過 5 分鐘）。
 - `status --notify` 在一切正常時：healthchecks 每次都送成功 ping（dead-man's switch）；

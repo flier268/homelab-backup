@@ -292,7 +292,8 @@ STATUS_HANDLED_WINDOW = dt.timedelta(minutes=20)
 RUN_DUE_HANDOFF_WINDOW = dt.timedelta(minutes=20)
 CRASH_QUIET_PERIOD = dt.timedelta(hours=1)
 ERROR_LINE_LIMIT = 200
-JOURNAL_TAIL_LIMIT = 3000
+# Bytes of title + body per push; ntfy's message limit is 4096 bytes.
+NOTIFY_BODY_LIMIT = 3900
 
 
 def _first_line(error, limit=ERROR_LINE_LIMIT):
@@ -343,11 +344,12 @@ def _record_run_due(c, now, attempted, failures, known_services):
     not attempted this round keep theirs. ``known_services`` (None when some
     manifest failed to load) lets entries of removed services be dropped.
     The failed set is stored with this run's INVOCATION_ID so notify-failure
-    can tell it apart from a stale record of an older run. A crash entry is
-    cleared only by a round that attempted a backup with no failures, once
-    the crash has not been seen for CRASH_QUIET_PERIOD, so an intermittent
-    crash between good rounds stays throttled; "No backups are due" proves
-    nothing.
+    can tell it apart from a stale record of an older run. Every completed
+    round, including "No backups are due" and rounds with failed services,
+    clears the crash entries not seen for CRASH_QUIET_PERIOD; a crashing
+    round never gets here, so a crash recurring within that period stays
+    throttled. A round that attempted nothing and failed nothing changes
+    nothing else (and does not rewrite the state when nothing is cleared).
     """
     failed = {}
     for operation, error in failures.items:
@@ -355,8 +357,18 @@ def _record_run_due(c, now, attempted, failures, known_services):
     succeeded = set(attempted) - set(failed)
     if not failed and not _unit_record(load_alert_state(c), BACKUP_UNIT):
         return
+    idle = not attempted and not failed
 
     def update(record):
+        crashes = _record_dict(record, 'crashes')
+        for key in [k for k, v in crashes.items() if _crash_quiet(v, now)]:
+            crashes.pop(key)
+        if crashes:
+            record['crashes'] = crashes
+        else:
+            record.pop('crashes', None)
+        if idle:
+            return
         # Whole-unit throttle fields from older releases.
         for legacy in ('failure_signature', 'notified_signature', 'notified_at'):
             record.pop(legacy, None)
@@ -371,14 +383,6 @@ def _record_run_due(c, now, attempted, failures, known_services):
             record['services'] = services
         else:
             record.pop('services', None)
-        crashes = _record_dict(record, 'crashes')
-        if attempted and not failed:
-            for key in [k for k, v in crashes.items() if _crash_quiet(v, now)]:
-                crashes.pop(key)
-        if crashes:
-            record['crashes'] = crashes
-        else:
-            record.pop('crashes', None)
         if failed:
             record['run'] = {
                 'invocation_id': os.environ.get('INVOCATION_ID'),
@@ -517,6 +521,8 @@ def _notify_run_due_failure(c, now):
 
     A failed service is pushed when it newly enters failure or its last push
     is older than alert.renotify_after; one push lists every such service.
+    Throttling is by service name only: a still-failing service whose error
+    text changes is not pushed again before alert.renotify_after.
     When run-due did not finish its bookkeeping (crash, timeout, OOM, kill,
     config error) the failure is pushed as ``crash:<result>``, throttled per
     result type by its last push. Every crash, pushed or not, refreshes the
@@ -557,9 +563,7 @@ def _notify_run_due_failure(c, now):
             if delivered:
                 stored = _record_dict(current, 'services')
                 for name in pending:
-                    stored[name] = {
-                        'notified_at': now.isoformat(), 'error': failed[name],
-                    }
+                    stored[name] = {'notified_at': now.isoformat()}
                 current['services'] = stored
 
         _update_unit_record(c, BACKUP_UNIT, update)
@@ -610,11 +614,10 @@ def _push_unit_failure(c, unit, title, summary):
         title += f' ({result})'
     if not summary and os.environ.get('MONITOR_SERVICE_RESULT'):
         summary = details
-    journal = journal[-JOURNAL_TAIL_LIMIT:]
-    detail = '\n\n'.join(part for part in (summary, journal) if part)
+    title = f"homelab-backup on {c.get('host_id', '?')}: {title}"
     delivered = notify(
-        c, f"homelab-backup on {c.get('host_id', '?')}: {title}",
-        detail or 'see journalctl for details',
+        c, title, _notification_body(title, summary, journal)
+        or 'see journalctl for details',
     )
     if not delivered:
         print(
@@ -623,6 +626,49 @@ def _push_unit_failure(c, unit, title, summary):
             file=sys.stderr,
         )
     return delivered
+
+
+def _utf8(text):
+    return str(text).encode('utf-8', 'replace')
+
+
+def _utf8_head(text, limit):
+    """``text`` cut to at most ``limit`` UTF-8 bytes, keeping its start."""
+    data = _utf8(text)
+    if len(data) <= limit:
+        return data.decode('utf-8')
+    marker = _utf8('…')
+    if limit < len(marker):
+        return ''
+    # Dropping the bytes of a split character keeps the result valid UTF-8.
+    return (data[:limit - len(marker)] + marker).decode('utf-8', 'ignore')
+
+
+def _utf8_tail(text, limit):
+    """``text`` cut to at most ``limit`` UTF-8 bytes, keeping its end."""
+    data = _utf8(text)
+    if len(data) <= limit:
+        return data.decode('utf-8')
+    marker = _utf8('…')
+    if limit < len(marker):
+        return ''
+    return (marker + data[len(data) - limit + len(marker):]).decode(
+        'utf-8', 'ignore',
+    )
+
+
+def _notification_body(title, summary, journal):
+    """Summary first, then as much of the journal's end as fits.
+
+    notify() sends ``title``, a blank line and the body; together they stay
+    within NOTIFY_BODY_LIMIT bytes so ntfy does not turn the message into an
+    attachment.
+    """
+    budget = max(0, NOTIFY_BODY_LIMIT - len(_utf8(title)) - len(b'\n\n'))
+    summary = _utf8_head(summary, budget) if summary else ''
+    budget -= len(_utf8(summary)) + (len(b'\n\n') if summary else 0)
+    journal = _utf8_tail(journal, budget) if journal and budget > 0 else ''
+    return '\n\n'.join(part for part in (summary, journal) if part)
 
 
 def cmd_run_due(c, args):

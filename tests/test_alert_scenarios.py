@@ -251,13 +251,11 @@ class CrashScenarios(unittest.TestCase):
         report('M2 ... then timeout for 1h', sim)
         self.assertEqual(sim.crash_pushes(), [(1, 'exit-code'), (241, 'timeout')])
 
-        # A completed run right after a crash does not clear it: neither a
-        # round with a failed service nor a successful one. The exit-code
-        # entry, quiet since round 240, is cleared by the successful round.
+        # A completed run right after a crash does not clear it, whether a
+        # service failed or not. The exit-code entry, quiet since round 240,
+        # is cleared by the first completed round, even one where svc-a fails.
         sim.run(1, failing={'svc-a'})
-        self.assertEqual(
-            set(sim.backup_record()['crashes']), {'crash:exit-code', 'crash:timeout'},
-        )
+        self.assertEqual(set(sim.backup_record()['crashes']), {'crash:timeout'})
         sim.run(1)
         self.assertEqual(set(sim.backup_record()['crashes']), {'crash:timeout'})
         self.assertEqual(len(sim.pushes), 3)  # svc-a is still within 24h
@@ -329,12 +327,65 @@ class CrashScenarios(unittest.TestCase):
         sim.run(DAY - 206, failing={'svc-a'})
         report('interleaved crashes and A failures, 24h', sim)
         self.assertEqual(sim.pushed_services(), {'svc-a': [6]})
-        # Rounds where svc-a fails complete but never clear a crash entry,
-        # so the second exit-code episode stays within renotify_after.
+        # Rounds where svc-a fails still complete, so 1h after round 111 they
+        # clear the exit-code entry and the second episode is pushed.
         self.assertEqual(
-            sim.crash_pushes(), [(0, 'timeout'), (100, 'exit-code')],
+            sim.crash_pushes(),
+            [(0, 'timeout'), (100, 'exit-code'), (200, 'exit-code')],
+        )
+        self.assertEqual(len(sim.pushes), 4)
+
+    def test_e2_same_crash_after_an_hour_of_normal_rounds(self):
+        sim = Simulation(self, {'svc-a': (5, 0), 'svc-b': (60, 0)})
+        sim.run(1, crash='oom-kill')
+        sim.run(HOUR - 1)
+        self.assertIn('crashes', sim.backup_record())
+        sim.run(1)
+        self.assertNotIn('crashes', sim.backup_record())
+        sim.run(1, crash='oom-kill')
+        report('E2 crash, 1h of normal rounds, same crash', sim)
+        self.assertEqual(
+            sim.crash_pushes(), [(0, 'oom-kill'), (HOUR + 1, 'oom-kill')],
+        )
+        self.assertEqual(len(sim.pushes), 2)
+
+    def test_e3_same_crash_while_a_service_keeps_failing(self):
+        sim = Simulation(self, {'svc-a': (5, 0), 'svc-b': (60, 0)})
+        sim.run(6, failing={'svc-a'})
+        sim.run(1, crash='timeout')
+        sim.run(HOUR, failing={'svc-a'})
+        self.assertNotIn('crashes', sim.backup_record())
+        sim.run(1, crash='timeout')
+        sim.run(DAY - HOUR - 8, failing={'svc-a'})
+        report('E3 A keeps failing, crash, 1h, same crash, 24h', sim)
+        self.assertEqual(sim.pushed_services(), {'svc-a': [0]})
+        self.assertEqual(
+            sim.crash_pushes(), [(6, 'timeout'), (HOUR + 7, 'timeout')],
         )
         self.assertEqual(len(sim.pushes), 3)
+
+    def test_e2_daily_service_same_crash_after_an_hour_of_nothing_due(self):
+        sim = Simulation(self, {'svc-d': (24 * 60, 0)})
+        sim.run(1)                       # the only due round today succeeds
+        sim.run(1, crash='exit-code')
+        sim.run(HOUR - 1)                # "No backups are due"
+        self.assertIn('crashes', sim.backup_record())
+        sim.run(1)
+        self.assertNotIn('crashes', sim.backup_record())
+        sim.run(1, crash='exit-code')
+        report('E2 daily service, crash, 1h of nothing due, same crash', sim)
+        self.assertEqual(
+            sim.crash_pushes(), [(1, 'exit-code'), (HOUR + 2, 'exit-code')],
+        )
+        self.assertEqual(len(sim.pushes), 2)
+
+    def test_daily_service_hourly_crash_between_nothing_due_rounds(self):
+        sim = Simulation(self, {'svc-d': (24 * 60, 0)})
+        sim.run(1)
+        sim.run_intermittent(DAY - 1, HOUR, 'exit-code')
+        report('daily service, exit-code crash hourly, nothing due, 24h', sim)
+        self.assertEqual(sim.crash_pushes(), [(1, 'exit-code')])
+        self.assertEqual(len(sim.pushes), 1)
 
 
 class StatusScenarios(unittest.TestCase):

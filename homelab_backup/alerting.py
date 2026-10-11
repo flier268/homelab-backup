@@ -234,7 +234,9 @@ def notify(c, title, message, *, ok=False, recovered=False, opener=None):
         return False
     opener = opener or _request
     kind = notification_kind(url)
-    body = f'{title}\n\n{message}'.encode('utf-8')[:10000]
+    # Dropping the bytes of a character split by the cap keeps valid UTF-8.
+    body = f'{title}\n\n{message}'.encode('utf-8', 'replace')[:10000] \
+        .decode('utf-8', 'ignore').encode('utf-8')
     if kind == 'healthchecks':
         target = url.rstrip('/') + ('' if ok else '/fail')
         headers = {'Content-Type': 'text/plain; charset=utf-8'}
