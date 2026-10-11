@@ -149,6 +149,12 @@ systemctl list-timers --all 'homelab-backup*'                              # 都
 | `homelab-backup-status.service` | `backupctl status --notify` | 15min | 每 6 小時（xx:15） |
 | `homelab-backup-notify@.service` | `backupctl notify-failure %i` | 5min | 由 `OnFailure=` 觸發 |
 
+check 逾時的評估：`homelab-backup-check.service` 維持 `TimeoutStartSec=12h`。restic
+check 只透過 rclone 讀取 `check.read_data_subset`（預設 5%）的資料，12h 相當充裕。
+因為 check 執行期間持有全域鎖，這個值必須**小於** `alert.max_lock_age`（預設 13h），
+否則正常的 check 也會被 `status` 當成鎖卡住而告警。若 check 確實需要更久，請同時
+調高 `TimeoutStartSec` 與 `alert.max_lock_age`，或調低 `read_data_subset`。
+
 ## 6. 手動驗證（依序，timer 仍停用）
 
 ```bash
@@ -204,8 +210,16 @@ systemctl status 'homelab-backup-notify@homelab-backup-status.service.service' -
   `status` 問題（相同的過期服務集合／鎖卡住／status 本身出錯），在
   `alert.renotify_after`（預設 24h）內不會再推送，只在 journal 記錄；問題內容改變時
   立即推送。測試想重複觸發時可刪掉這個檔案。
-- `homelab-backup-status.service` 失敗時，若 `status --notify` 剛推送過同一個問題，
-  `notify@` 只記 `ALERT:` 行而不再重複推送；所以 c) 可能只在 journal 看到。
+- 讀寫 `_alerts.json` 時都會持有 `<state_root>/_alerts.lock`（不是全域鎖，所以
+  backup 卡住時告警照常運作），多個 notify／status 同時執行也不會互相覆蓋狀態。
+- 某個 unit 成功跑完一次，就會清掉該 unit 的節流紀錄；下次再失敗會立即推送。
+- `homelab-backup.service`（run-due）失敗時，若失敗的服務集合和上次推送的不同，
+  即使還在 `renotify_after` 內也會立即再推送。
+- `homelab-backup-status.service` 失敗時，若 `status --notify` 剛推送過同一個問題
+  （exit 2），`notify@` 只記 `ALERT:` 行而不再重複推送；所以 c) 可能只在 journal
+  看到。`status` 本身出錯（exit 1）則一律由 `notify-failure` 推送。
+- `run-due` 拿不到全域鎖時，會先以 100 ms 間隔重試 3 次，仍拿不到
+  才印 `SKIP:` 跳過這一輪（避免剛好撞上前一輪收尾而白白錯過 5 分鐘）。
 - `status --notify` 在一切正常時：healthchecks 每次都送成功 ping（dead-man's switch）；
   ntfy 不送平常的 OK，只在先前推送過的問題解除時送一則 `recovered`。
 - healthchecks 的失敗一律送到 `<url>/fail`；backup／maintenance／check 失敗後，
@@ -224,7 +238,32 @@ systemctl list-timers 'homelab-backup*'
 
 ## 8. 回滾
 
-**第一步：移除舊版不認得的新設定欄位。** 舊版會對未知欄位報
+順序很重要：**先停排程、等執行中的工作結束，再改設定**。否則每 5 分鐘的 timer 可能
+在設定改到一半時觸發，或讓新版程式讀到已經改成舊格式的設定。
+
+**第一步：停用全部四個 timer。**
+
+```bash
+sudo systemctl disable --now homelab-backup.timer homelab-backup-maintenance.timer \
+  homelab-backup-check.timer homelab-backup-status.timer
+```
+
+**第二步：等執行中的 unit 結束。** `disable --now` 只停 timer，不會中斷已經在跑的
+service；**不要**強制停止執行中的備份，等它自己跑完。這些都是 `Type=oneshot`，
+執行中顯示為 `activating`（不是 `active`），所以不能只看 `is-active --quiet` 的
+exit code：
+
+```bash
+systemctl list-jobs 'homelab-backup*'              # 執行中的 oneshot 會列出 start job
+while systemctl is-active homelab-backup.service homelab-backup-maintenance.service \
+    homelab-backup-check.service | grep -qvE '^(inactive|failed)$'; do
+  sleep 30
+done
+systemctl is-active homelab-backup.service homelab-backup-maintenance.service \
+  homelab-backup-check.service                     # 三個都應為 inactive（或 failed）
+```
+
+**第三步：移除舊版不認得的新設定欄位。** 舊版會對未知欄位報
 `unsupported fields` 而整個失敗，所以要先：
 
 ```bash
@@ -234,12 +273,7 @@ sudo grep -rln 'skip_if_not_running' /srv/stacks   # 依 services_root 調整路
 #   逐一從列出的 backup.yaml 刪掉每個 skip_if_not_running 鍵
 ```
 
-接著停用新的 timer：
-
-```bash
-sudo systemctl disable --now homelab-backup-check.timer homelab-backup-status.timer
-sudo systemctl disable --now homelab-backup.timer homelab-backup-maintenance.timer
-```
+**第四步：選擇方案 A 或方案 B。** 兩者最後都只重新啟用舊版原有的兩個 timer。
 
 方案 A（建議）：從這個分支之前的最後一個 commit `c66cb2e` 重新安裝舊版。舊 release
 的 helper image 可能已經被清掉，單純切回 symlink 一樣會失敗，重新安裝才會重建 helper：
@@ -268,6 +302,7 @@ sudo systemctl daemon-reload
 # 舊 release 的 helper image 若已不存在，需手動重建（<helper-tag> 見
 # /usr/local/lib/homelab-backup/current/volume-helper-image 的 "tag"）：
 sudo docker build -t <helper-tag> -f <repo-dir>/Dockerfile.volume-rsync <repo-dir>
+sudo systemctl enable --now homelab-backup.timer homelab-backup-maintenance.timer
 ```
 
 注意：舊 launcher 用 image ID 釘死 helper，重建出來的 image ID 不同，所以方案 B
