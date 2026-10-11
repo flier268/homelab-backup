@@ -128,26 +128,67 @@ pub enum CliError {
     Failed(String),
     #[error("")]
     Reported,
+    /// Stale or stalled status. The alert lines are already printed.
+    #[error("")]
+    Stale,
+}
+
+impl CliError {
+    pub fn code(&self) -> u8 {
+        match self {
+            Self::Stale => 2,
+            _ => 1,
+        }
+    }
 }
 
 pub fn run(cli: Cli) -> Result<(), CliError> {
     if let Command::Backup {
         services,
         allow_low_space,
-    } = cli.command
+    } = &cli.command
     {
         return crate::files::run_backup(
             crate::documents::CONFIG_PATH,
-            &services,
-            allow_low_space,
+            services,
+            *allow_low_space,
             "restic",
         )
-        .map_err(|error| match error {
-            crate::files::CommandError::Text(message) => CliError::Failed(message),
-            crate::files::CommandError::Reported => CliError::Reported,
-        });
+        .map_err(map_command);
     }
-    let name = match cli.command {
+    let result = match &cli.command {
+        Command::List => crate::ops::run_list(crate::documents::CONFIG_PATH),
+        Command::Init => crate::ops::run_init(crate::documents::CONFIG_PATH),
+        Command::Snapshots { service } => {
+            crate::ops::run_snapshots(crate::documents::CONFIG_PATH, service.as_deref())
+        }
+        Command::Check { no_wait } => {
+            crate::ops::run_check(crate::documents::CONFIG_PATH, *no_wait)
+        }
+        Command::Unlock => crate::ops::run_unlock(crate::documents::CONFIG_PATH),
+        Command::Maintenance { dry_run, no_wait } => {
+            crate::ops::run_maintenance(crate::documents::CONFIG_PATH, *dry_run, *no_wait)
+        }
+        Command::RunDue => crate::ops::run_due(crate::documents::CONFIG_PATH),
+        Command::Status { max_age, notify } => {
+            crate::ops::run_status(crate::documents::CONFIG_PATH, max_age.as_deref(), *notify)
+        }
+        _ => return not_ported(&cli.command),
+    };
+    result.map_err(map_command)
+}
+
+fn map_command(error: crate::files::CommandError) -> CliError {
+    match error {
+        crate::files::CommandError::Text(message) => CliError::Failed(message),
+        crate::files::CommandError::Reported => CliError::Reported,
+        crate::files::CommandError::Exit(2) => CliError::Stale,
+        crate::files::CommandError::Exit(_) => CliError::Reported,
+    }
+}
+
+fn not_ported(command: &Command) -> Result<(), CliError> {
+    let name = match command {
         Command::List => "list",
         Command::Status { .. } => "status",
         Command::Validate => "validate",

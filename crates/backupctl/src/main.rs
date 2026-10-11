@@ -11,8 +11,10 @@ mod capture;
 mod catalog;
 mod cli;
 mod documents;
+mod due;
 mod files;
 mod fingerprint;
+mod ops;
 mod state;
 mod storage;
 #[allow(dead_code)]
@@ -27,7 +29,7 @@ fn main() -> ExitCode {
             if !text.is_empty() {
                 let _ = writeln!(io::stderr(), "ERROR: {text}");
             }
-            ExitCode::from(1)
+            ExitCode::from(error.code())
         }
     }
 }

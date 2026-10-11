@@ -28,13 +28,15 @@ use crate::unix::restic::restic_env;
 pub enum CommandError {
     Text(String),
     Reported,
+    /// Process exit without an extra `ERROR:` line. Status uses 2.
+    Exit(u8),
 }
 
 impl std::fmt::Display for CommandError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Text(message) => formatter.write_str(message),
-            Self::Reported => Ok(()),
+            Self::Reported | Self::Exit(_) => Ok(()),
         }
     }
 }
@@ -105,7 +107,7 @@ pub fn run_backup(
     Err(CommandError::Reported)
 }
 
-fn backup_loaded(
+pub(crate) fn backup_loaded(
     config: &BTreeMap<String, String>,
     manifest: &BTreeMap<String, Yaml>,
     allow_low_space: bool,
@@ -402,7 +404,7 @@ fn repository_id(
     crate::storage::parse_repository_id(&output)
 }
 
-fn run_restic(
+pub(crate) fn run_restic(
     program: &str,
     args: &[String],
     cwd: Option<&Path>,
@@ -443,7 +445,7 @@ fn run_restic(
     }
 }
 
-fn flat_strings(config: &BTreeMap<String, Yaml>) -> BTreeMap<String, String> {
+pub(crate) fn flat_strings(config: &BTreeMap<String, Yaml>) -> BTreeMap<String, String> {
     let mut flat = BTreeMap::new();
     for key in [
         "host_id",

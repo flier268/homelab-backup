@@ -16,6 +16,7 @@ croner = { version = "4", features = ["chrono"] }
 humantime = "2"
 rustix = { version = "1", features = ["fs", "process"] }
 noyalib = "0.0.5"
+ureq = "2"
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"
 thiserror = "2"
