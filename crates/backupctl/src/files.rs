@@ -14,7 +14,10 @@ use crate::catalog::{SelectionFailure, select_services};
 use crate::documents::load_global_config;
 use crate::fingerprint::stage_fingerprint;
 use crate::state::{load_backup_state, save_backup_state};
-use crate::storage::{PathInventory, SyncOptions, check_backup_space, prepare_stage, sync_paths};
+use crate::storage::{
+    PathInventory, SyncOptions, check_backup_space, estimate_path_sources, prepare_stage,
+    sync_paths,
+};
 use crate::unix::atomic::{atomic_copy_file, atomic_write_json};
 use crate::unix::control::{clear_control_leaf, ensure_private_directory};
 use crate::unix::error::SecurityError;
@@ -240,7 +243,8 @@ fn stage_files(
         }
     }
     let stage = prepare_stage(staging_root, service, &protected)?;
-    ensure_space(&label, &stage, 0, allow_low_space)?;
+    let estimated = estimate_path_sources(config, manifest, &stage)?;
+    ensure_space(&label, &stage, estimated, allow_low_space)?;
     let captured = (|| {
         let mut before = run_phase(manifest, "backup", "before", &[], &mut |_| None)?;
         let mut check = || ensure_space(&label, &stage, 0, allow_low_space);

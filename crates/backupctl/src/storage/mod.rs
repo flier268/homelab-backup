@@ -1,11 +1,14 @@
 //! Staging copies, space checks, and the Restic command adapter.
 
+mod estimate;
 mod policy;
 mod restic;
 mod space;
 mod stage;
 mod sync;
 
+#[allow(unused_imports)]
+pub use estimate::estimate_path_sources;
 #[allow(unused_imports)]
 pub use policy::{build_path_filter_args, validate_path_source_policy};
 #[allow(unused_imports)]
