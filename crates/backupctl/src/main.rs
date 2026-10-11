@@ -3,7 +3,11 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
+#[allow(dead_code)]
+mod backup;
 mod cli;
+#[allow(dead_code)]
+mod fingerprint;
 #[allow(dead_code)]
 mod storage;
 #[allow(dead_code)]
