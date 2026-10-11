@@ -16,8 +16,8 @@ from .actions import (
 from .backup_state import load_state, save_state
 from .common import (
     CommandError, FailureSummary, GlobalLock, _print_command_failure,
-    add_exception_note, die, format_remediable_error, restic_env, run,
-    run_cleanup,
+    add_exception_note, clear_stale_restic_locks, die, format_remediable_error,
+    restic_env, run, run_cleanup,
 )
 from .fingerprint import snapshot_context_fingerprint, stage_fingerprint
 from .manifest import (
@@ -529,6 +529,8 @@ def cmd_backup(c, args):
     with GlobalLock(c['lock_file']) as acquired:
         if not acquired:
             die('another backupctl process is running')
+        if ms:
+            clear_stale_restic_locks(c)
         for m in ms:
             service = m.get('service', '<unnamed>')
             label = service_label(m)

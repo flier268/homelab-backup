@@ -6,8 +6,8 @@ from .backup import backup_one, retention_cmd
 from .backup_state import due_status, load_state, save_state
 from .btrfs_snapshot import cleanup_snapshot_state, snapshot_state_services
 from .common import (
-    CommandError, FailureSummary, GlobalLock, _print_command_failure, die,
-    restic_env, run,
+    CommandError, FailureSummary, GlobalLock, _print_command_failure,
+    clear_stale_restic_locks, die, restic_env, run,
 )
 from .manifest import (
     manifest, manifests, service_label, valid_service_name, validate_manifest,
@@ -124,6 +124,8 @@ def cmd_run_due(c, args):
                 due.append(m)
         if not due:
             print('No backups are due.')
+        else:
+            clear_stale_restic_locks(c)
         for m in due:
             print(f"\n== Scheduled backup: {service_label(m)} ==")
             try:
@@ -171,6 +173,7 @@ def cmd_maintenance(c, args):
         if not acquired:
             print('SKIP: backup or maintenance is still running')
             return
+        clear_stale_restic_locks(c)
         failures = FailureSummary()
         if not args.dry_run:
             try:
@@ -256,6 +259,7 @@ def cmd_check(c, args):
         if not acquired:
             print('SKIP: backup or maintenance is still running')
             return
+        clear_stale_restic_locks(c)
         cmd = ['restic', 'check']
         subset = (c.get('check') or {}).get('read_data_subset')
         if subset:

@@ -172,6 +172,27 @@ def restic_env(c):
     return env
 
 
+def clear_stale_restic_locks(c):
+    """Remove stale restic locks once our own flock is held.
+
+    Deliberately runs plain ``restic unlock`` (never ``--remove-all``): restic
+    only deletes locks whose owner is gone or that are older than its stale
+    threshold, so a live backup from another host is never broken. A failure
+    is reported but does not abort the caller; the real restic command will
+    surface any lasting repository problem.
+    """
+    try:
+        run(['restic', 'unlock'], env=restic_env(c))
+        return True
+    except Exception as err:  # noqa: BLE001 - best effort by design
+        print(
+            f'WARNING: could not clear stale restic locks: '
+            f'{type(err).__name__}: {err}',
+            file=sys.stderr,
+        )
+        return False
+
+
 class GlobalLock:
     _held = {}
 
