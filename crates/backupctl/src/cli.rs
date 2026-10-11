@@ -183,6 +183,12 @@ pub fn run(cli: Cli) -> Result<(), CliError> {
             *yes,
             *prune,
         ),
+        Command::CleanupRestores { targets, all, yes } => crate::commands::run_cleanup_restores(
+            crate::documents::CONFIG_PATH,
+            targets,
+            *all,
+            *yes,
+        ),
         Command::RunDue => crate::ops::run_due(crate::documents::CONFIG_PATH),
         Command::Status { max_age, notify } => {
             crate::ops::run_status(crate::documents::CONFIG_PATH, max_age.as_deref(), *notify)

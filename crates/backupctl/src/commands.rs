@@ -18,9 +18,11 @@ use crate::files::{CommandError, flat_strings, run_restic};
 use crate::state::invalidate_snapshot_fingerprint;
 use crate::storage::{parse_snapshots, validate_path_source_policy};
 use crate::unix::account::account;
+use crate::unix::control::clear_control_leaf;
 use crate::unix::control::validate_control_file;
 use crate::unix::data::open_data_path;
 use crate::unix::error::SecurityError;
+use crate::unix::lock::GlobalLock;
 use crate::unix::mount::validate_control_root;
 use crate::unix::restic::restic_env;
 
@@ -119,6 +121,177 @@ pub fn run_validate(config_path: &str) -> Result<(), CommandError> {
         eprintln!("  - {error}");
     }
     Err(CommandError::Reported)
+}
+
+pub fn run_cleanup_restores(
+    config_path: &str,
+    targets: &[String],
+    all: bool,
+    yes: bool,
+) -> Result<(), CommandError> {
+    if !yes {
+        return Err(CommandError::Text(
+            "cleanup-restores requires --yes".to_owned(),
+        ));
+    }
+    if all != targets.is_empty() {
+        return Err(CommandError::Text(
+            "specify restore targets or --all, but not both".to_owned(),
+        ));
+    }
+    let mut requested = Vec::new();
+    if !all {
+        for target in targets {
+            let parsed = parse_restore_target(target)?;
+            if !requested.contains(&parsed) {
+                requested.push(parsed);
+            }
+        }
+    }
+    let config = load_global_config(config_path).map_err(text)?;
+    let flat = flat_strings(&config);
+    let restore_root = flat
+        .get("restore_root")
+        .cloned()
+        .ok_or_else(|| CommandError::Text("missing restore_root".to_owned()))?;
+    let records = crate::unix::mount::current_mount_records().map_err(text)?;
+    let selected = if all {
+        all_restore_targets(&restore_root, &records)?
+    } else {
+        requested
+    };
+    let Some(_guard) = acquire(flat.get("lock_file").map(String::as_str).unwrap_or(""))? else {
+        return Err(CommandError::Text(
+            "another backupctl process is running".to_owned(),
+        ));
+    };
+    let mut failures = Vec::new();
+    let mut removed = 0usize;
+    for (service, restore_id) in selected {
+        let label = format!("{service}/{restore_id}");
+        let target = format!("{restore_root}/{service}/{restore_id}");
+        match validate_control_root(&target, false, &records)
+            .and_then(|_| clear_control_leaf(&target))
+        {
+            Ok(()) => {
+                removed += 1;
+                println!("Removed restore: {label}");
+            }
+            Err(error) => {
+                eprintln!("ERROR: cannot remove restore {label}: {error}");
+                failures.push((label, error.message));
+            }
+        }
+    }
+    println!("Removed {removed} restore artifact(s).");
+    if failures.is_empty() {
+        return Ok(());
+    }
+    eprintln!("\nRESTORE CLEANUP FAILURES");
+    for (label, error) in failures {
+        eprintln!("  - {label}: {error}");
+    }
+    Err(CommandError::Reported)
+}
+
+fn parse_restore_target(value: &str) -> Result<(String, String), CommandError> {
+    let path = Path::new(value);
+    let parts: Vec<_> = path.components().collect();
+    let invalid = || {
+        CommandError::Text(format!(
+            "invalid restore target '{value}'; expected SERVICE/RESTORE_ID"
+        ))
+    };
+    if path.is_absolute() || parts.len() != 2 {
+        return Err(invalid());
+    }
+    let (
+        Some(std::path::Component::Normal(service)),
+        Some(std::path::Component::Normal(restore_id)),
+    ) = (parts.first(), parts.get(1))
+    else {
+        return Err(invalid());
+    };
+    let Some(service) = service.to_str() else {
+        return Err(invalid());
+    };
+    let Some(restore_id) = restore_id.to_str() else {
+        return Err(invalid());
+    };
+    if !valid_service_name(service) || !is_restore_id(restore_id) {
+        return Err(invalid());
+    }
+    Ok((service.to_owned(), restore_id.to_owned()))
+}
+
+fn is_restore_id(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 8 + 1 + 6 + 1 + 9
+        && bytes[8] == b'-'
+        && bytes[15] == b'-'
+        && bytes[..8].iter().all(u8::is_ascii_digit)
+        && bytes[9..15].iter().all(u8::is_ascii_digit)
+        && bytes[16..].iter().all(u8::is_ascii_digit)
+}
+
+fn all_restore_targets(
+    restore_root: &str,
+    records: &[crate::unix::mount::MountRecord],
+) -> Result<Vec<(String, String)>, CommandError> {
+    let root = Path::new(restore_root);
+    if !root.exists() && std::fs::symlink_metadata(root).is_err() {
+        return Ok(Vec::new());
+    }
+    validate_control_root(restore_root, false, records).map_err(text)?;
+    let mut services = std::fs::read_dir(root)
+        .map_err(|error| CommandError::Text(error.to_string()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| CommandError::Text(error.to_string()))?;
+    services.sort_by_key(|entry| entry.file_name());
+    let mut targets = Vec::new();
+    for service in services {
+        let name = service.file_name();
+        let Some(service_name) = name.to_str() else {
+            return Err(CommandError::Text(format!(
+                "invalid service directory in restore root: {}",
+                service.path().display()
+            )));
+        };
+        if !valid_service_name(service_name) {
+            return Err(CommandError::Text(format!(
+                "invalid service directory in restore root: {}",
+                service.path().display()
+            )));
+        }
+        validate_control_root(&service.path().to_string_lossy(), false, records).map_err(text)?;
+        let mut restores = std::fs::read_dir(service.path())
+            .map_err(|error| CommandError::Text(error.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| CommandError::Text(error.to_string()))?;
+        restores.sort_by_key(|entry| entry.file_name());
+        for restore in restores {
+            let restore_name = restore.file_name();
+            let Some(restore_id) = restore_name.to_str().filter(|name| is_restore_id(name)) else {
+                return Err(CommandError::Text(format!(
+                    "invalid restore directory: {}",
+                    restore.path().display()
+                )));
+            };
+            validate_control_root(&restore.path().to_string_lossy(), false, records)
+                .map_err(text)?;
+            targets.push((service_name.to_owned(), restore_id.to_owned()));
+        }
+    }
+    Ok(targets)
+}
+
+fn acquire(path: &str) -> Result<Option<GlobalLock>, CommandError> {
+    let mut lock = GlobalLock::new(path, false, 0);
+    if lock.enter(&mut || {}).map_err(text)? {
+        Ok(Some(lock))
+    } else {
+        Ok(None)
+    }
 }
 
 pub fn run_docs() -> Result<(), CommandError> {
@@ -425,6 +598,8 @@ fn text(error: SecurityError) -> CommandError {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
     use super::*;
 
     #[test]
@@ -450,6 +625,91 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn cleanup_requires_confirmation_and_one_selector() {
+        let missing = run_cleanup_restores("/unused", &[], false, false).unwrap_err();
+        assert!(matches!(missing, CommandError::Text(message) if message.contains("--yes")));
+        let both = run_cleanup_restores(
+            "/unused",
+            &["demo/20261012-120000-000000001".to_owned()],
+            true,
+            true,
+        )
+        .unwrap_err();
+        assert!(matches!(both, CommandError::Text(message) if message.contains("not both")));
+        let invalid = run_cleanup_restores("/unused", &["demo/not-an-id".to_owned()], false, true)
+            .unwrap_err();
+        match invalid {
+            CommandError::Text(message) => {
+                assert!(message.contains("SERVICE/RESTORE_ID"), "{message}")
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cleanup_removes_a_downloaded_restore_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "homelab-cleanup-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for name in ["staging", "restore", "cache", "state", "services"] {
+            let path = root.join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        for name in ["password", "rclone.conf"] {
+            let path = root.join(name);
+            std::fs::write(&path, "secret").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let config = root.join("config.yaml");
+        std::fs::write(
+            &config,
+            format!(
+                "version: 1\nhost_id: host\nservices_root: {}\nrepository: rclone:demo:repo\npassword_file: {}\nrclone_config: {}\nstaging_root: {}\nrestore_root: {}\ncache_root: {}\nvolume_helper_image: helper:latest\nstate_root: {}\nlock_file: {}\n",
+                root.join("services").display(),
+                root.join("password").display(),
+                root.join("rclone.conf").display(),
+                root.join("staging").display(),
+                root.join("restore").display(),
+                root.join("cache").display(),
+                root.join("state").display(),
+                root.join("lock").display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let target = root
+            .join("restore")
+            .join("demo")
+            .join("20261012-120000-000000001");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("payload.txt"), "keep").unwrap();
+        let result = run_cleanup_restores(
+            &config.to_string_lossy(),
+            &["demo/20261012-120000-000000001".to_owned()],
+            false,
+            true,
+        );
+        match result {
+            Ok(()) => assert!(!target.exists()),
+            Err(CommandError::Reported) => assert!(
+                target.exists(),
+                "a refused restore directory must stay in place"
+            ),
+            Err(error) => panic!("unexpected {error:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
