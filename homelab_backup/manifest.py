@@ -30,6 +30,9 @@ DISPLAY_NAME_RE = re.compile(
 DOCKER_VOLUME_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]*')
 
 
+# Docker container names: [a-zA-Z0-9][a-zA-Z0-9_.-]*
+CONTAINER_NAME_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,254}')
+
 def _load_manifest_yaml(path):
     try:
         return yaml.safe_load(read_control_text(path)) or {}
@@ -359,6 +362,7 @@ def _validate_action_definition(action, field, seen):
     unknown_action = sorted(
         set(action) - {
             'name', 'command', 'script', 'timeout', 'required', 'run_as',
+            'skip_if_not_running',
         }
     )
     if unknown_action:
@@ -393,6 +397,18 @@ def _validate_action_definition(action, field, seen):
         )
     if not isinstance(action.get('required', True), bool):
         raise ValueError(f'{field}.required must be boolean')
+    if 'skip_if_not_running' in action:
+        containers = action['skip_if_not_running']
+        if isinstance(containers, str):
+            containers = [containers]
+        if not isinstance(containers, list) or not containers or not all(
+                isinstance(item, str) and CONTAINER_NAME_RE.fullmatch(item)
+                for item in containers
+        ):
+            raise ValueError(
+                f'{field}.skip_if_not_running must be a container name or a '
+                'non-empty list of container names'
+            )
 
 
 def _validate_actions(m, path):

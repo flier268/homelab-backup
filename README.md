@@ -216,6 +216,9 @@ timestamped 密文。
 - Actions 依 `actions.backup`／`actions.restore` 分組；每項必須擇一使用不經
   shell 的 `command` argv，或由 `/bin/bash -euo pipefail -c` 執行的 inline
   `script`，並指定 `run_as`。密碼或 token 不可放入 argv。
+  可選的 `skip_if_not_running: <容器名稱>`（或名稱清單）會在執行前檢查容器；
+  容器不存在或未執行時略過該 action 並記錄警告，備份照常進行但標記為 best-effort，
+  例如服務已停用時的 `docker exec ... pg_dump`。
   完整欄位、writer 判定與 Btrfs 限制請見 `GUIDE.html`。
 
 從預設加密檔放回系統，依提示貼入 SSH 私鑰並解密：
