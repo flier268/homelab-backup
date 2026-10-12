@@ -196,6 +196,10 @@ pub fn run(cli: Cli) -> Result<(), CliError> {
         Command::NotifyFailure { unit } => {
             crate::alerts::run_notify_failure(crate::documents::CONFIG_PATH, unit)
         }
+        Command::Upgrade => {
+            return crate::upgrade::run_upgrade()
+                .map_err(|error| CliError::Failed(error.to_string()));
+        }
         _ => return not_ported(&cli.command),
     };
     result.map_err(map_command)

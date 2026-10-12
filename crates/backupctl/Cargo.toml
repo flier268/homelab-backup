@@ -16,6 +16,7 @@ homelab-backup-domain = { path = "../domain" }
 rustix.workspace = true
 noyalib.workspace = true
 ureq.workspace = true
+flate2.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true

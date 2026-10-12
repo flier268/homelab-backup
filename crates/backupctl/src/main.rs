@@ -23,6 +23,7 @@ mod state;
 mod storage;
 #[allow(dead_code)]
 mod unix;
+mod upgrade;
 mod volumes;
 
 fn main() -> ExitCode {
