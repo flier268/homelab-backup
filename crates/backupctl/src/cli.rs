@@ -1,5 +1,4 @@
 //! Command line matching the existing `backupctl` subcommands.
-//! Handlers land with the modules they belong to. Until then they fail closed.
 
 use clap::{Parser, Subcommand};
 
@@ -122,8 +121,6 @@ pub enum Command {
 
 #[derive(Debug, thiserror::Error)]
 pub enum CliError {
-    #[error("{command} is not ported yet")]
-    NotPorted { command: &'static str },
     #[error("{0}")]
     Failed(String),
     #[error("")]
@@ -196,11 +193,45 @@ pub fn run(cli: Cli) -> Result<(), CliError> {
         Command::NotifyFailure { unit } => {
             crate::alerts::run_notify_failure(crate::documents::CONFIG_PATH, unit)
         }
+        Command::Restore {
+            services,
+            all,
+            snapshot,
+            apply,
+            start,
+            yes,
+            allow_low_space,
+            restore_manifest,
+            keep_manifest,
+        } => crate::restore_cmd::run_restore(
+            crate::documents::CONFIG_PATH,
+            services,
+            *all,
+            snapshot,
+            *apply,
+            *start,
+            *yes,
+            *allow_low_space,
+            *restore_manifest,
+            *keep_manifest,
+        ),
+        Command::Apply {
+            service,
+            restore_dir,
+            start,
+            yes,
+        } => crate::restore_cmd::run_apply(
+            crate::documents::CONFIG_PATH,
+            service,
+            restore_dir,
+            *start,
+            *yes,
+        ),
         Command::Upgrade => {
             return crate::upgrade::run_upgrade()
                 .map_err(|error| CliError::Failed(error.to_string()));
         }
-        _ => return not_ported(&cli.command),
+        Command::Backup { .. } => unreachable!("backup returns before the match"),
     };
     result.map_err(map_command)
 }
@@ -212,27 +243,4 @@ fn map_command(error: crate::files::CommandError) -> CliError {
         crate::files::CommandError::Exit(2) => CliError::Stale,
         crate::files::CommandError::Exit(_) => CliError::Reported,
     }
-}
-
-fn not_ported(command: &Command) -> Result<(), CliError> {
-    let name = match command {
-        Command::List => "list",
-        Command::Status { .. } => "status",
-        Command::Validate => "validate",
-        Command::Init => "init",
-        Command::Backup { .. } => "backup",
-        Command::RunDue => "run-due",
-        Command::Snapshots { .. } => "snapshots",
-        Command::DeleteSnapshot { .. } => "delete-snapshot",
-        Command::Restore { .. } => "restore",
-        Command::CleanupRestores { .. } => "cleanup-restores",
-        Command::Apply { .. } => "apply",
-        Command::Maintenance { .. } => "maintenance",
-        Command::Check { .. } => "check",
-        Command::Unlock => "unlock",
-        Command::NotifyFailure { .. } => "notify-failure",
-        Command::Docs => "docs",
-        Command::Upgrade => "upgrade",
-    };
-    Err(CliError::NotPorted { command: name })
 }

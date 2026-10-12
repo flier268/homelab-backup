@@ -905,7 +905,7 @@ pub(crate) fn snapshot_manifest(
     Ok(snapshot)
 }
 
-fn parse_yaml_mapping(path: &str, text: &str) -> Result<Yaml, SecurityError> {
+pub(crate) fn parse_yaml_mapping(path: &str, text: &str) -> Result<Yaml, SecurityError> {
     if text.trim().is_empty() {
         return Ok(Yaml::Map(BTreeMap::new()));
     }
