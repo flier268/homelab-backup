@@ -1,6 +1,6 @@
 # Encrypted disaster recovery configuration
 
-`sudo ../backup-configs.sh` 的 Git 模式只會在此建立：
+`sudo backupctl backup-configs` 的 Git 模式只會在此建立：
 
 - `homelab-backup-configs.zip.age`
 

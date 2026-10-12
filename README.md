@@ -28,7 +28,7 @@ Docker Compose 服務的 Restic + OneDrive 備份工具。
 一致性模式、path／volume sources，以及統一的 backup／restore 五階段
 actions、inline Bash 與安全說明。
 
-編輯器會產生一段可在服務根目錄執行的 `python3` 清單命令。命令輸出版本化
+編輯器會產生一段可在服務根目錄執行的 `backupctl inventory` 命令。命令輸出版本化
 JSON Lines，不依賴 `ls` 的語系格式，並可安全表示空白、Unicode、tab 與換行；
 將結果貼入或匯入編輯器後，即可把檔案標成備份、排除或不納入，再整理成多個
 source 群組。清單不含檔案內容，也不會由瀏覽器上傳。
@@ -59,7 +59,8 @@ sudo backupctl validate
 cd ~/Apps
 git clone https://github.com/flier268/homelab-backup.git
 cd homelab-backup
-sudo ./install.sh
+cargo build --release -p backupctl
+sudo ./target/release/backupctl install
 ```
 
 也可從 GitHub Releases 下載版本化的 `homelab-backup-X.Y.Z.tar.gz`，先用同一個
@@ -69,18 +70,17 @@ Release 內的 `SHA256SUMS` 驗證，再解壓並執行安裝：
 sha256sum --check SHA256SUMS
 tar -xzf homelab-backup-X.Y.Z.tar.gz
 cd homelab-backup-X.Y.Z
-sudo ./install.sh
+sudo ./bin/backupctl install
 ```
 
-維護者推送與 `homelab_backup.VERSION` 相同的 `vX.Y.Z` 標籤後，GitHub Actions
-會在 CI 全數通過時自動建立 Release、產生 release notes，並附上 archive 與
-checksum。一般 push 與 pull request 只執行 CI，不會發布。
+維護者推送與 workspace `Cargo.toml` 的 `version` 相同的 `vX.Y.Z` 標籤後，GitHub Actions
+會在 CI 全數通過時自動建立 Release、產生 release notes，並附上 archive、
+`backupctl` 二進位與 checksum。一般 push 與 pull request 只執行 CI，不會發布。
 
-升版時只需修改 `homelab_backup/__init__.py` 的 `VERSION`，不必全域取代測試
-內容。提交並確認 CI 通過後，建立完全相同版本的 `vX.Y.Z` tag 並推送；
-Release workflow 會拒絕 tag 與 `VERSION` 不一致的發布。
+升版時修改 workspace `Cargo.toml` 的 `version`。提交並確認 CI 通過後，建立完全相同版本的 `vX.Y.Z` tag 並推送；
+Release workflow 會拒絕 tag 與 crate 版本不一致的發布。
 
-安裝期間不要關機；若因斷電中止，重新執行同一個 `install.sh` 讓完整 release
+安裝期間不要關機；若因斷電中止，重新執行同一個 `backupctl install` 讓完整 release
 重新發布。安裝器不維護跨斷電 transaction journal。
 
 ## 升級
@@ -103,12 +103,12 @@ backupctl docs
 不下載 archive，也不允許降版或安裝 prerelease。
 
 archive 必須完整符合 Release 內的 SHA-256，且封裝只能包含預期的單一版本目錄、
-一般檔案與目錄，通過路徑及 `install.sh` 驗證後才會交給既有安裝器。checksum
+一般檔案與目錄，通過路徑及 `bin/backupctl` 驗證後才會交給既有安裝器。checksum
 與 archive 都透過 GitHub HTTPS 下載；此校驗沿用 Release 的 `SHA256SUMS`，
 不另外提供獨立簽章信任根。
 
-下載、校驗、解壓或安裝任一步驟失敗時，暫存內容都會清除。既有安裝器只有在
-Python runtime、鎖定依賴、Docker helper、launcher 與 systemd units 全部準備
+下載、校驗、解壓或安裝任一步驟失敗時，暫存內容都會清除。安裝器只有在
+`backupctl` 二進位、Docker helper、launcher 與 systemd units 全部準備
 完成後才原子切換 `current`；失敗時目前版本仍維持啟用。
 
 接著：
@@ -119,7 +119,7 @@ Python runtime、鎖定依賴、Docker helper、launcher 與 systemd units 全�
 4. 執行 `sudo backupctl validate`。
 5. 執行 `sudo backupctl init` 建立全新 repository。
 6. 手動備份並完成還原測試。
-7. 執行 `sudo ./backup-configs.sh`，貼入 SSH 公鑰並加密災難復原必要設定。
+7. 在來源目錄執行 `sudo ./target/release/backupctl backup-configs`，貼入 SSH 公鑰並加密災難復原必要設定。
 8. 最後才啟用 systemd timers。
 
 服務 ID、顯示名稱與部署目錄彼此獨立。例如：
@@ -152,7 +152,7 @@ Restic snapshot。若某個服務需要每次排程都留下時間點版本，�
 Docker helper images：
 
 ```bash
-sudo ./uninstall.sh
+sudo backupctl uninstall
 ```
 
 預設保留 `/etc/homelab-backup`、`/var/lib/homelab-backup` 與
@@ -160,7 +160,7 @@ sudo ./uninstall.sh
 staging、restore workspace 與 cache 都不再需要，可明確要求清除：
 
 ```bash
-sudo ./uninstall.sh --purge
+sudo backupctl uninstall --purge
 ```
 
 兩種模式都不會移除安裝器透過 APT 安裝的共用系統套件、遠端 Restic repository，
@@ -176,7 +176,7 @@ configs/homelab-backup-configs.zip.age
 ```
 
 ```bash
-sudo ./backup-configs.sh
+sudo backupctl backup-configs
 ```
 
 此腳本只允許 root 執行。明文只會在 `/run` 的 root 專用暫存目錄中封裝，
@@ -227,20 +227,20 @@ timestamped 密文。
 從預設加密檔放回系統，依提示貼入 SSH 私鑰並解密：
 
 ```bash
-sudo ./restore-configs.sh
+sudo backupctl restore-configs
 ```
 
 非互動執行時需明確加上 `--yes`：
 
 ```bash
-sudo ./restore-configs.sh --yes \
+sudo backupctl restore-configs --yes \
   /safe/path/configs.zip.age
 ```
 
 換 KEY 不必重新讀取目前系統設定。輸入舊私鑰解密，接著貼入新公鑰：
 
 ```bash
-sudo ./backup-configs.sh --rotate configs/homelab-backup-configs.zip.age
+sudo backupctl backup-configs --rotate configs/homelab-backup-configs.zip.age
 ```
 
 腳本會先以舊私鑰解密並驗證 archive 內容，再以新 age KEY 加密並原子替換。

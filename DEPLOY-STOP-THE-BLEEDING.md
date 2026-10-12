@@ -129,10 +129,10 @@ actions:
 cd <repo-dir>
 git status --short          # 應該是乾淨的
 git log --oneline -8        # 確認在 fix/stop-the-bleeding
-sudo ./install.sh
+sudo ./target/release/backupctl install
 ```
 
-`install.sh` 會跑 `apt-get update/install`、建新的 venv 與 helper image、把
+`backupctl install` 會跑 `apt-get update/install`、安裝 `backupctl` 二進位與 helper image、把
 `Dockerfile.volume-rsync` 一起放進 release（之後 helper 被清掉時可自動重建）、
 發布新的 launcher 和 systemd unit（含 `daemon-reload`），並把舊 release 保留成
 `previous`。失敗時會自動回復。
@@ -336,7 +336,7 @@ sudo grep -rln 'skip_if_not_running' /srv/stacks   # 依 services_root 調整路
 
 ```bash
 git -C <repo-dir> switch --detach c66cb2e
-sudo <repo-dir>/install.sh
+sudo <repo-dir>/target/release/backupctl install
 sudo rm -f /etc/systemd/system/homelab-backup-check.* \
   /etc/systemd/system/homelab-backup-status.* \
   '/etc/systemd/system/homelab-backup-notify@.service'

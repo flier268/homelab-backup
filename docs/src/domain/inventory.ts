@@ -6,63 +6,7 @@ import type {
   SourceGroup,
 } from './types'
 
-export const INVENTORY_COMMAND = `python3 - <<'PY'
-import json
-import os
-import stat
-import tempfile
-
-OUTPUT = "homelab-backup-inventory.jsonl"
-descriptor, temporary_path = tempfile.mkstemp(
-    prefix=".homelab-backup-inventory.", suffix=".tmp", dir="."
-)
-temporary_name = os.path.relpath(temporary_path, ".")
-try:
-    with os.fdopen(descriptor, "w", encoding="utf-8") as output:
-        print(
-            json.dumps(
-                {"format": "homelab-backup-inventory", "version": 1, "root": "."}
-            ),
-            file=output,
-        )
-        for current, directories, files in os.walk(
-            ".", topdown=True, followlinks=False
-        ):
-            names = sorted(directories + files)
-            for name in names:
-                path = os.path.join(current, name)
-                relative = os.path.relpath(path, ".")
-                if relative in {OUTPUT, temporary_name}:
-                    continue
-                mode = os.lstat(path).st_mode
-                if stat.S_ISLNK(mode):
-                    kind = "symlink"
-                elif stat.S_ISDIR(mode):
-                    kind = "directory"
-                elif stat.S_ISREG(mode):
-                    kind = "file"
-                else:
-                    continue
-                print(
-                    json.dumps(
-                        {"path": relative, "type": kind}, ensure_ascii=False
-                    ),
-                    file=output,
-                )
-            directories[:] = [
-                name for name in sorted(directories)
-                if not os.path.islink(os.path.join(current, name))
-            ]
-        output.flush()
-        os.fsync(output.fileno())
-    os.replace(temporary_path, OUTPUT)
-except BaseException:
-    try:
-        os.unlink(temporary_path)
-    except FileNotFoundError:
-        pass
-    raise
-PY`
+export const INVENTORY_COMMAND = `backupctl inventory`
 
 const ENTRY_TYPES = new Set<InventoryEntryType>(['file', 'directory', 'symlink'])
 

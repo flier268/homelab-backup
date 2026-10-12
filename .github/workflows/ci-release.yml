@@ -16,59 +16,32 @@ concurrency:
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
-  static-checks:
-    name: Static checks
+  rust:
+    name: Rust
     runs-on: ubuntu-24.04
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
 
-      - name: Install ShellCheck
-        run: sudo apt-get update && sudo apt-get install --yes shellcheck
-
-      - name: Check Python syntax
-        run: python3 -m py_compile backupctl homelab_backup/*.py
-
-      - name: Check shell syntax
-        run: |
-          bash -n install.sh
-          bash -n backup-configs.sh
-          bash -n restore-configs.sh
-          bash -n config-ops-runtime.sh
-
-      - name: Run ShellCheck
-        run: shellcheck install.sh backup-configs.sh restore-configs.sh config-ops-runtime.sh
-
-  tests:
-    name: Tests (Python ${{ matrix.python-version }})
-    runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version:
-          - "3.10"
-          - "3.12"
-          - "3.13"
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
-
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+      - name: Install Rust 1.96.0
+        uses: dtolnay/rust-toolchain@1.96.0
         with:
-          python-version: ${{ matrix.python-version }}
-          cache: pip
+          components: rustfmt, clippy
 
-      - name: Install locked dependencies
-        run: python -m pip install --require-hashes -r requirements.txt
+      - name: Check formatting
+        run: cargo fmt --all --check
 
-      - name: Run unit tests
-        run: python -m unittest discover -s tests -v
+      - name: Lint
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
 
       - name: Smoke-test repository launcher
         run: |
-          ./backupctl --help >/dev/null
-          ./backupctl --version
+          cargo build -p backupctl
+          ./target/debug/backupctl --help >/dev/null
+          ./target/debug/backupctl --version
 
   frontend:
     name: Documentation app
@@ -108,8 +81,7 @@ jobs:
     name: Publish GitHub Release
     if: startsWith(github.ref, 'refs/tags/v')
     needs:
-      - static-checks
-      - tests
+      - rust
       - frontend
     runs-on: ubuntu-24.04
     permissions:
@@ -131,15 +103,17 @@ jobs:
             exit 1
           fi
 
-          declared_version="$(python3 - <<'PY'
-          from homelab_backup import VERSION
-          print(VERSION)
-          PY
-          )"
+          declared_version="$(awk -F '\"' '/^version = / { print $2; exit }' Cargo.toml)"
           if [[ "v$declared_version" != "$RELEASE_TAG" ]]; then
-            echo "Tag $RELEASE_TAG does not match homelab_backup.VERSION ($declared_version)." >&2
+            echo "Tag $RELEASE_TAG does not match Cargo.toml version ($declared_version)." >&2
             exit 1
           fi
+
+      - name: Install Rust 1.96.0
+        uses: dtolnay/rust-toolchain@1.96.0
+
+      - name: Build release binary
+        run: cargo build --locked --release -p backupctl
 
       - name: Download tested documentation app
         uses: actions/download-artifact@v5
@@ -166,6 +140,13 @@ jobs:
             --transform="s|^|homelab-backup-${version}/|" \
             -C guide-artifact \
             GUIDE.html
+          install -d -m 0755 dist/payload/bin
+          install -m 0755 target/release/backupctl dist/payload/bin/backupctl
+          tar --append \
+            --file="dist/$archive" \
+            --transform="s|^|homelab-backup-${version}/|" \
+            -C dist/payload \
+            bin/backupctl
           gzip --no-name "dist/$archive"
           cd dist
           sha256sum "${archive}.gz" > SHA256SUMS

@@ -17,16 +17,13 @@ const header = JSON.stringify({
 })
 
 describe('parseInventory', () => {
-  it('generator excludes its own output and unsupported special files', () => {
-    expect(INVENTORY_COMMAND).toContain('if relative in {OUTPUT, temporary_name}:')
-    expect(INVENTORY_COMMAND).toContain('elif stat.S_ISREG(mode):')
-    expect(INVENTORY_COMMAND).toMatch(/else:\n\s+continue/)
+  it('generator is the installed inventory command', () => {
+    expect(INVENTORY_COMMAND).toBe('backupctl inventory')
+    expect(INVENTORY_COMMAND).not.toContain('python3')
   })
 
   it('publishes output without following an existing destination symlink', () => {
     expect(INVENTORY_COMMAND).not.toContain('> homelab-backup-inventory.jsonl')
-    expect(INVENTORY_COMMAND).toContain('tempfile.mkstemp(')
-    expect(INVENTORY_COMMAND).toContain('os.replace(temporary_path, OUTPUT)')
   })
 
   it('parses versioned JSON Lines and preserves escaped special names', () => {

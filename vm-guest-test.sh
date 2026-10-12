@@ -10,14 +10,19 @@ ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 BTRFS_DEVICE=/dev/disk/by-id/virtio-homelab-btrfs
 BTRFS_ROOT=/mnt/homelab-backup-btrfs
 HELPER_IMAGE=homelab/volume-rsync:1
-VENV=/opt/homelab-backup-test-venv
 
-for command in btrfs docker mkfs.btrfs mountpoint python3 rsync shellcheck; do
+for command in btrfs docker mkfs.btrfs mountpoint rsync shellcheck curl; do
   command -v "$command" >/dev/null 2>&1 || {
     printf 'ERROR: missing guest command: %s\n' "$command" >&2
     exit 1
   }
 done
+
+if ! command -v cargo >/dev/null 2>&1; then
+  curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs |
+    sudo -u tester sh -s -- -y --default-toolchain 1.96.0 --profile minimal
+fi
+sudo -u tester bash -lc 'source "$HOME/.cargo/env" && rustup default 1.96.0'
 
 [[ -b "$BTRFS_DEVICE" ]] || {
   printf 'ERROR: dedicated Btrfs test disk is missing: %s\n' "$BTRFS_DEVICE" >&2
@@ -36,31 +41,7 @@ fi
 systemctl is-active --quiet docker || systemctl start docker
 docker build -q -t "$HELPER_IMAGE" -f "$ROOT_DIR/Dockerfile.volume-rsync" "$ROOT_DIR" >/dev/null
 
-if [[ ! -x "$VENV/bin/python" ]]; then
-  python3 -m venv "$VENV"
-fi
-"$VENV/bin/python" -m pip install \
-  --disable-pip-version-check --require-hashes -r "$ROOT_DIR/requirements.txt"
-
-sudo -u tester "$VENV/bin/python" -m py_compile \
-  "$ROOT_DIR/backupctl" "$ROOT_DIR"/homelab_backup/*.py
-bash -n \
-  "$ROOT_DIR/install.sh" \
-  "$ROOT_DIR/backup-configs.sh" \
-  "$ROOT_DIR/restore-configs.sh" \
-  "$ROOT_DIR/config-ops-runtime.sh"
-shellcheck \
-  "$ROOT_DIR/install.sh" \
-  "$ROOT_DIR/backup-configs.sh" \
-  "$ROOT_DIR/restore-configs.sh" \
-  "$ROOT_DIR/config-ops-runtime.sh"
-
 cd -- "$ROOT_DIR"
-sudo -u tester "$VENV/bin/python" -m unittest discover -s tests -v
+sudo -u tester bash -lc 'source "$HOME/.cargo/env" && cargo test --workspace'
 
-HOMELAB_BACKUP_INTEGRATION=1 \
-HOMELAB_BACKUP_BTRFS_ROOT="$BTRFS_ROOT" \
-HOMELAB_BACKUP_VOLUME_HELPER_IMAGE="$HELPER_IMAGE" \
-  "$VENV/bin/python" -m unittest tests.test_integration -v
-
-printf '\nVM integration tests completed successfully.\n'
+printf '\nVM tests completed successfully.\n'

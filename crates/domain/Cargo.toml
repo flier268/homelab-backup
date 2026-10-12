@@ -1,0 +1,15 @@
+[package]
+name = "homelab-backup-domain"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+chrono.workspace = true
+croner.workspace = true
+humantime.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+chrono-tz.workspace = true
