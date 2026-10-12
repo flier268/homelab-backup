@@ -81,14 +81,11 @@ pub fn prepare_docker(
     validate_docker_environment()?;
     let model = compose_model(manifest)?;
     let resolved = resolved_volumes(manifest, &model)?;
-    for (_, _, name) in &resolved {
-        if !docker_volume_exists(name)? {
-            let required = volume_required(manifest, name);
-            if required {
-                return Err(SecurityError::runtime(format!(
-                    "Docker volume does not exist or is inaccessible: {name}"
-                )));
-            }
+    for (id, _, name) in &resolved {
+        if !docker_volume_exists(name)? && source_required(manifest, id) {
+            return Err(SecurityError::runtime(format!(
+                "Docker volume does not exist or is inaccessible: {name}"
+            )));
         }
     }
     if !resolved.is_empty() {
@@ -99,24 +96,6 @@ pub fn prepare_docker(
         ensure_volume_helper_image(image)?;
     }
     Ok(context_from(manifest, &model, &resolved))
-}
-
-fn volume_required(manifest: &BTreeMap<String, Yaml>, actual: &str) -> bool {
-    let Some(sources) = manifest.get("sources").and_then(Yaml::as_map) else {
-        return true;
-    };
-    let Some(Yaml::Seq(volumes)) = sources.get("volumes") else {
-        return true;
-    };
-    for source in volumes.iter().filter_map(Yaml::as_map) {
-        if source.get("name").and_then(Yaml::as_str) == Some(actual) {
-            return source
-                .get("required")
-                .and_then(Yaml::as_bool)
-                .unwrap_or(true);
-        }
-    }
-    true
 }
 
 pub fn validate_docker_environment() -> Result<String, SecurityError> {
@@ -1006,5 +985,22 @@ mod tests {
             stderr: "Error: no such volume".to_owned(),
         }]);
         assert!(!docker_volume_exists("missing_data").unwrap());
+    }
+
+    #[test]
+    fn optional_compose_volume_is_identified_by_source_id() {
+        let manifest = BTreeMap::from([(
+            "sources".to_owned(),
+            Yaml::map([(
+                "volumes",
+                Yaml::seq([Yaml::map([
+                    ("id", Yaml::string("data")),
+                    ("compose_volume", Yaml::string("data")),
+                    ("required", Yaml::Bool(false)),
+                ])]),
+            )]),
+        )]);
+        assert!(!source_required(&manifest, "data"));
+        assert!(source_required(&manifest, "other"));
     }
 }

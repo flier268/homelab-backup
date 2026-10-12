@@ -291,8 +291,8 @@ fn apply_stopped(
     })() {
         primary = Some((error, active.to_owned()));
     }
-    if let Err(error) = run_restore_actions(plan, root, "finally", None, None) {
-        match &mut primary {
+    match run_restore_actions(plan, root, "finally", None, None) {
+        Err(error) => match &mut primary {
             None => primary = Some((error, "finally".to_owned())),
             Some((existing, _)) => {
                 existing.message = format!(
@@ -300,9 +300,8 @@ fn apply_stopped(
                     existing.message
                 );
             }
-        }
-    } else if let Ok(failures) = run_restore_actions(plan, root, "finally", None, None) {
-        optional.extend(failures);
+        },
+        Ok(failures) => optional.extend(failures),
     }
     if let Some((error, phase)) = primary {
         cleanup(
@@ -1493,11 +1492,7 @@ fn restore_non_directory(
         let payload = format!("{}/payload", temporary.1);
         let metadata = std::fs::symlink_metadata(&payload)
             .map_err(|error| SecurityError::runtime(error.to_string()))?;
-        renameat(parent, file_name(&payload).as_str(), parent, name)
-            .or_else(|_| {
-                // The payload lives inside the temporary directory, not the parent.
-                renameat(&temporary.0, "payload", parent, name)
-            })
+        renameat(&temporary.0, "payload", parent, name)
             .map_err(|error| SecurityError::runtime(error.to_string()))?;
         let identity = (metadata.dev(), metadata.ino());
         if let Some(callback) = on_publish.as_mut() {
@@ -2003,5 +1998,39 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn file_restore_leaves_a_sibling_named_payload_in_place() {
+        let root = temp_base("payload-sibling");
+        let parent = root.join("live");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::write(parent.join("payload"), "sibling").unwrap();
+        let source = root.join("restored");
+        std::fs::write(&source, "new-bytes").unwrap();
+        let fd = rustix::fs::openat(
+            rustix::fs::CWD,
+            &parent,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap();
+        restore_non_directory(&source, &fd, "data", &mut None).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(parent.join("payload")).unwrap(),
+            "sibling"
+        );
+        assert_eq!(
+            std::fs::read_to_string(parent.join("data")).unwrap(),
+            "new-bytes"
+        );
+        std::fs::write(parent.join("payload"), "old").unwrap();
+        std::fs::write(&source, "replaced").unwrap();
+        restore_non_directory(&source, &fd, "payload", &mut None).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(parent.join("payload")).unwrap(),
+            "replaced"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

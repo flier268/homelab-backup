@@ -14,7 +14,7 @@ chrono-tz = "0.10"
 clap = { version = "4", features = ["derive"] }
 croner = { version = "4", features = ["chrono"] }
 humantime = "2"
-rustix = { version = "1", features = ["fs", "process"] }
+rustix = { version = "1", features = ["fs", "process", "thread"] }
 noyalib = "0.0.5"
 ureq = "2"
 flate2 = "1"

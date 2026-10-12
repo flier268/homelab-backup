@@ -11,6 +11,9 @@ if [[ -f "$HERE/Cargo.toml" ]]; then
   if [[ -x "$HERE/target/debug/backupctl" && ! -L "$HERE/target/debug/backupctl" ]]; then
     exec "$HERE/target/debug/backupctl" "$@"
   fi
+  if [[ -x "$HERE/bin/backupctl" && ! -L "$HERE/bin/backupctl" ]]; then
+    exec "$HERE/bin/backupctl" "$@"
+  fi
   printf 'ERROR: build backupctl first: cargo build --release -p backupctl\n' >&2
   exit 1
 fi

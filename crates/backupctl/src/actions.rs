@@ -262,6 +262,15 @@ fn run_action(
     }
     if let Some((uid, gid)) = drop_privileges(run_as)? {
         process.uid(uid).gid(gid);
+        // std sets uid/gid after pre_exec and does not clear supplementary groups.
+        // Drop them here, while the child can still call setgroups.
+        unsafe {
+            process.pre_exec(|| {
+                rustix::thread::set_thread_groups(&[]).map_err(|error| {
+                    std::io::Error::from_raw_os_error(error.raw_os_error())
+                })
+            });
+        }
     }
     let child = process
         .spawn()
