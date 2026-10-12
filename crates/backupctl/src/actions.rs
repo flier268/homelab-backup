@@ -266,9 +266,8 @@ fn run_action(
         // Drop them here, while the child can still call setgroups.
         unsafe {
             process.pre_exec(|| {
-                rustix::thread::set_thread_groups(&[]).map_err(|error| {
-                    std::io::Error::from_raw_os_error(error.raw_os_error())
-                })
+                rustix::thread::set_thread_groups(&[])
+                    .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))
             });
         }
     }

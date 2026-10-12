@@ -117,6 +117,28 @@ pub enum Command {
     Docs,
     /// Upgrade an installed release from GitHub.
     Upgrade,
+    /// Install packages, the release tree, the helper image, and systemd units.
+    Install,
+    /// Remove the launcher, releases, units, and helper images.
+    Uninstall {
+        /// Also remove /etc, /var/lib, and /var/cache homelab-backup data.
+        #[arg(long)]
+        purge: bool,
+    },
+    /// Encrypt /etc/homelab-backup into a recovery archive.
+    BackupConfigs {
+        /// Re-encrypt an existing archive with a new SSH public key.
+        #[arg(long, value_name = "ARCHIVE")]
+        rotate: Option<std::path::PathBuf>,
+    },
+    /// Decrypt a recovery archive into /etc/homelab-backup.
+    RestoreConfigs {
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+        /// Encrypted archive. Defaults to configs/homelab-backup-configs.zip.age.
+        archive: Option<std::path::PathBuf>,
+    },
     /// Write a versioned file inventory for the offline service editor.
     Inventory,
     /// Publish and inspect recovery config bundles. Used by the config scripts.
@@ -244,6 +266,23 @@ pub fn run(cli: Cli) -> Result<(), CliError> {
         Command::Upgrade => {
             return crate::upgrade::run_upgrade()
                 .map_err(|error| CliError::Failed(error.to_string()));
+        }
+        Command::Install => {
+            let root = crate::launcher::source_root().map_err(CliError::Failed)?;
+            return crate::host_install::run_install(&root).map_err(CliError::Failed);
+        }
+        Command::Uninstall { purge } => {
+            return crate::host_install::run_uninstall(*purge).map_err(CliError::Failed);
+        }
+        Command::BackupConfigs { rotate } => {
+            let root = crate::launcher::source_root().map_err(CliError::Failed)?;
+            return crate::config_archive::run_backup(&root, rotate.clone())
+                .map_err(CliError::Failed);
+        }
+        Command::RestoreConfigs { yes, archive } => {
+            let root = crate::launcher::source_root().map_err(CliError::Failed)?;
+            return crate::config_archive::run_restore(&root, *yes, archive.clone())
+                .map_err(CliError::Failed);
         }
         Command::Backup { .. } => unreachable!("backup returns before the match"),
     };

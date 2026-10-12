@@ -356,7 +356,7 @@ pub fn ensure_volume_helper_image(image: &str) -> Result<(), SecurityError> {
         dockerfile.filter(|path| Path::new(path).is_absolute() && Path::new(path).is_file());
     let Some(dockerfile) = dockerfile else {
         return Err(SecurityError::runtime(format!(
-            "Docker helper image is missing: {image}; rebuild it with `docker build -t {image} -f Dockerfile.volume-rsync .` from the homelab-backup source or rerun install.sh"
+            "Docker helper image is missing: {image}; rebuild it with `docker build -t {image} -f Dockerfile.volume-rsync .` from the homelab-backup source or rerun backupctl install"
         )));
     };
     eprintln!("WARNING: Docker helper image {image} is missing; rebuilding it from {dockerfile}");

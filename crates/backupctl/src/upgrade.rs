@@ -78,9 +78,9 @@ impl HttpClient for UreqClient {
     }
 }
 
-fn bash_install(source_root: &Path) -> Result<i32, String> {
-    let status = Command::new("/bin/bash")
-        .arg("install.sh")
+fn release_install(source_root: &Path) -> Result<i32, String> {
+    let status = Command::new(source_root.join("bin/backupctl"))
+        .arg("install")
         .current_dir(source_root)
         .status()
         .map_err(|error| error.to_string())?;
@@ -105,7 +105,7 @@ pub fn run_upgrade() -> Result<(), UpgradeError> {
         Path::new(INSTALL_ROOT),
         env!("CARGO_PKG_VERSION"),
         &UreqClient,
-        &bash_install,
+        &release_install,
     )
 }
 
@@ -687,10 +687,10 @@ fn validate_members(members: &[Member], version: &str) -> Result<(), UpgradeErro
                 ));
             }
         }
-        if relative == format!("{expected_root}/install.sh") {
+        if relative == format!("{expected_root}/bin/backupctl") {
             if !is_reg || member.size == 0 || member.mode & 0o111 == 0 || member.mode & 0o022 != 0 {
                 return Err(UpgradeError::new(
-                    "release archive contains an invalid install.sh",
+                    "release archive contains an invalid bin/backupctl",
                 ));
             }
             saw_install = true;
@@ -705,7 +705,9 @@ fn validate_members(members: &[Member], version: &str) -> Result<(), UpgradeErro
         }
     }
     if !saw_install {
-        return Err(UpgradeError::new("release archive is missing install.sh"));
+        return Err(UpgradeError::new(
+            "release archive is missing bin/backupctl",
+        ));
     }
     if !saw_guide {
         return Err(UpgradeError::new("release archive is missing GUIDE.html"));
@@ -1026,7 +1028,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::fs::File;
     use std::io::Cursor;
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{PermissionsExt, symlink};
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, MutexGuard};
 
@@ -1208,7 +1210,7 @@ mod tests {
         if include_installer {
             push_entry(
                 &mut tar,
-                &format!("{root}/install.sh"),
+                &format!("{root}/bin/backupctl"),
                 b'0',
                 installer_mode,
                 "",
@@ -1354,7 +1356,7 @@ mod tests {
             CURRENT,
             &http,
             &|source_root: &Path| {
-                assert!(source_root.join("install.sh").is_file());
+                assert!(source_root.join("bin/backupctl").is_file());
                 assert_eq!(
                     fs::read(source_root.join("GUIDE.html")).unwrap(),
                     b"<!doctype html><title>Guide</title>\n"
@@ -1532,7 +1534,7 @@ mod tests {
                     &format!("{root}/hardlink"),
                     b'1',
                     0o644,
-                    &format!("{root}/install.sh"),
+                    &format!("{root}/bin/backupctl"),
                     b"",
                 )],
                 true,
@@ -1565,7 +1567,7 @@ mod tests {
                 Vec::new(),
                 false,
                 true,
-                "missing install.sh",
+                "missing bin/backupctl",
             ),
             (
                 "missing-guide",
@@ -1612,7 +1614,7 @@ mod tests {
             fs::create_dir(&destination).unwrap();
             let error = extract_archive(&archive_path, &destination, &version).unwrap_err();
             assert!(
-                error.to_string().contains("invalid install.sh"),
+                error.to_string().contains("invalid bin/backupctl"),
                 "{mode:o}: {error}"
             );
         }
@@ -1637,8 +1639,18 @@ mod tests {
     #[test]
     fn upgrade_installer_runs_bash_in_release_root_and_propagates_failure() {
         let temp = TempPath::new();
-        fs::write(temp.0.join("install.sh"), "pwd > marker\nexit 3\n").unwrap();
-        let error = run_installer(&temp.0, &bash_install).unwrap_err();
+        fs::create_dir(temp.0.join("bin")).unwrap();
+        fs::write(
+            temp.0.join("bin/backupctl"),
+            "#!/bin/sh\npwd > marker\nexit 3\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            temp.0.join("bin/backupctl"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let error = run_installer(&temp.0, &release_install).unwrap_err();
         assert!(error.to_string().contains("exit status 3"), "{error}");
         let marker = fs::read_to_string(temp.0.join("marker")).unwrap();
         assert_eq!(
@@ -1664,7 +1676,7 @@ mod tests {
                 "--prefix=homelab-backup-1.0.12/",
                 "HEAD",
                 "--",
-                "install.sh",
+                "Dockerfile.volume-rsync",
             ])
             .stdout(output)
             .status()
@@ -1675,8 +1687,11 @@ mod tests {
         let names: Vec<_> = members.iter().map(|member| member.name.as_str()).collect();
         assert_eq!(
             names,
-            ["homelab-backup-1.0.12", "homelab-backup-1.0.12/install.sh"]
+            [
+                "homelab-backup-1.0.12",
+                "homelab-backup-1.0.12/Dockerfile.volume-rsync"
+            ]
         );
-        assert_eq!(members[1].mode & 0o777, 0o755);
+        assert_eq!(members[1].mode & 0o777, 0o644);
     }
 }

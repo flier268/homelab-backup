@@ -16,28 +16,6 @@ concurrency:
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
-  static-checks:
-    name: Static checks
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
-
-      - name: Install ShellCheck
-        run: sudo apt-get update && sudo apt-get install --yes shellcheck
-
-      - name: Check shell syntax
-        run: |
-          bash -n install.sh
-          bash -n uninstall.sh
-          bash -n backup-configs.sh
-          bash -n restore-configs.sh
-          bash -n config-ops-runtime.sh
-          bash -n backupctl
-
-      - name: Run ShellCheck
-        run: shellcheck install.sh uninstall.sh backup-configs.sh restore-configs.sh config-ops-runtime.sh backupctl
-
   rust:
     name: Rust
     runs-on: ubuntu-24.04
@@ -62,8 +40,8 @@ jobs:
       - name: Smoke-test repository launcher
         run: |
           cargo build -p backupctl
-          ./backupctl --help >/dev/null
-          ./backupctl --version
+          ./target/debug/backupctl --help >/dev/null
+          ./target/debug/backupctl --version
 
   frontend:
     name: Documentation app
@@ -103,7 +81,6 @@ jobs:
     name: Publish GitHub Release
     if: startsWith(github.ref, 'refs/tags/v')
     needs:
-      - static-checks
       - rust
       - frontend
     runs-on: ubuntu-24.04

@@ -14,11 +14,14 @@ mod capture;
 mod catalog;
 mod cli;
 mod commands;
+mod config_archive;
 mod config_ops;
 mod documents;
 mod due;
 mod files;
 mod fingerprint;
+mod host_install;
+mod launcher;
 mod ops;
 mod restore_apply;
 mod restore_cmd;
@@ -32,6 +35,10 @@ mod upgrade;
 mod volumes;
 
 fn main() -> ExitCode {
+    if let Err(error) = launcher::enter_if_installed_launcher() {
+        let _ = writeln!(io::stderr(), "ERROR: {error}");
+        return ExitCode::from(1);
+    }
     let command = cli::Cli::parse();
     match cli::run(command) {
         Ok(()) => ExitCode::SUCCESS,

@@ -5,9 +5,7 @@
 - `cargo fmt --all --check`
 - `cargo clippy --offline --all-targets --tests -- -D warnings`
 - `cargo test --workspace --offline`
-- `bash -n install.sh uninstall.sh backup-configs.sh restore-configs.sh config-ops-runtime.sh backupctl`
-- `shellcheck install.sh uninstall.sh backup-configs.sh restore-configs.sh config-ops-runtime.sh backupctl`
-- `cargo build -p backupctl`，然後 `./backupctl --help` 與 `./backupctl --version`。`cargo test` 只產生測試執行檔，launcher 不會用它。
+- `cargo build -p backupctl`，然後 `./target/debug/backupctl --help` 與 `./target/debug/backupctl --version`。
 
 行為測試在 `crates/domain` 與 `crates/backupctl` 的 Rust 單元測試。
 
@@ -39,7 +37,7 @@ maintenance、finally 清理與 capture inventory 驗證。
    完成後才發布 Compose files 與 manifest
 5. 執行互動式 `sudo backupctl restore`，確認預設全選與鍵盤操作
 6. 在隔離環境測試 `--apply --start`
-7. 以測試 SSH key 執行 `backup-configs.sh`、`restore-configs.sh` 與 `--rotate`
+7. 以測試 SSH key 執行 `backupctl backup-configs`、`backupctl restore-configs` 與 `--rotate`
 
 Rust 單元測試涵蓋已移植的 Docker volume、Btrfs snapshot 與 restore 行為，不需要
 常駐的 Docker daemon 或 Btrfs 檔案系統。需要真實 daemon 的舊 Python integration

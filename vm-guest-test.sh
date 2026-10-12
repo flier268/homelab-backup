@@ -41,19 +41,6 @@ fi
 systemctl is-active --quiet docker || systemctl start docker
 docker build -q -t "$HELPER_IMAGE" -f "$ROOT_DIR/Dockerfile.volume-rsync" "$ROOT_DIR" >/dev/null
 
-bash -n \
-  "$ROOT_DIR/install.sh" \
-  "$ROOT_DIR/backup-configs.sh" \
-  "$ROOT_DIR/restore-configs.sh" \
-  "$ROOT_DIR/config-ops-runtime.sh" \
-  "$ROOT_DIR/backupctl"
-shellcheck \
-  "$ROOT_DIR/install.sh" \
-  "$ROOT_DIR/backup-configs.sh" \
-  "$ROOT_DIR/restore-configs.sh" \
-  "$ROOT_DIR/config-ops-runtime.sh" \
-  "$ROOT_DIR/backupctl"
-
 cd -- "$ROOT_DIR"
 sudo -u tester bash -lc 'source "$HOME/.cargo/env" && cargo test --workspace'
 
