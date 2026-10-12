@@ -294,6 +294,76 @@ fn acquire(path: &str) -> Result<Option<GlobalLock>, CommandError> {
     }
 }
 
+pub fn run_inventory() -> Result<(), CommandError> {
+    let output_name = "homelab-backup-inventory.jsonl";
+    let temporary_name = format!(".homelab-backup-inventory.{}.tmp", std::process::id());
+    let mut lines = vec![
+        serde_json::json!({
+            "format": "homelab-backup-inventory",
+            "version": 1,
+            "root": "."
+        })
+        .to_string(),
+    ];
+    walk_inventory(
+        std::path::Path::new("."),
+        output_name,
+        &temporary_name,
+        &mut lines,
+    )
+    .map_err(CommandError::Text)?;
+    let body = lines.join("\n") + "\n";
+    let temporary = std::path::Path::new(&temporary_name);
+    std::fs::write(temporary, body).map_err(|error| CommandError::Text(error.to_string()))?;
+    std::fs::rename(temporary, output_name).map_err(|error| {
+        let _ = std::fs::remove_file(temporary);
+        CommandError::Text(error.to_string())
+    })
+}
+
+fn walk_inventory(
+    directory: &std::path::Path,
+    output_name: &str,
+    temporary_name: &str,
+    lines: &mut Vec<String>,
+) -> Result<(), String> {
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(directory).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        names.push(entry.file_name());
+    }
+    names.sort();
+    for name in names {
+        let path = directory.join(&name);
+        let relative = path.strip_prefix(".").unwrap_or(&path);
+        let relative = relative.to_string_lossy().replace('\\', "/");
+        if relative == output_name || relative == temporary_name {
+            continue;
+        }
+        let metadata = std::fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+        let kind = if metadata.file_type().is_symlink() {
+            "symlink"
+        } else if metadata.file_type().is_dir() {
+            "directory"
+        } else if metadata.file_type().is_file() {
+            "file"
+        } else {
+            continue;
+        };
+        lines.push(
+            serde_json::json!({
+                "path": relative,
+                "type": kind,
+            })
+            .to_string(),
+        );
+        if kind == "directory" {
+            walk_inventory(&path, output_name, temporary_name, lines)?;
+        }
+    }
+    Ok(())
+}
+
 pub fn run_docs() -> Result<(), CommandError> {
     let guide = installed_guide()?;
     let uri = format!("file://{}", guide.display());

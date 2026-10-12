@@ -1,17 +1,16 @@
 #!/usr/bin/env bash
 
-CONFIG_OPS_PYTHON=""
-CONFIG_OPS_MODULE=""
+CONFIG_OPS_BIN=""
 CONFIG_OPS_RELEASE_FDS=()
 
 resolve_config_ops_runtime() {
-  local release lease_fd
-  [[ -z "$CONFIG_OPS_PYTHON" ]] || return 0
-  if [[ -x /usr/local/lib/homelab-backup/current/venv/bin/python &&
-        -d /usr/local/lib/homelab-backup/current/app ]]; then
+  local release lease_fd candidate
+  [[ -z "$CONFIG_OPS_BIN" ]] || return 0
+  candidate=/usr/local/lib/homelab-backup/current/bin/backupctl
+  if [[ -x "$candidate" && ! -L "$candidate" ]]; then
     release="$(readlink -f -- /usr/local/lib/homelab-backup/current)"
     [[ "$release" == /usr/local/lib/homelab-backup/releases/release.* &&
-       -x "$release/venv/bin/python" && -d "$release/app" ]] || {
+       -x "$release/bin/backupctl" && ! -L "$release/bin/backupctl" ]] || {
       printf 'ERROR: installed config helper release is invalid: %s\n' "$release" >&2
       return 1
     }
@@ -22,21 +21,24 @@ resolve_config_ops_runtime() {
     exec {lease_fd}<"$release/.lease"
     flock -s "$lease_fd"
     CONFIG_OPS_RELEASE_FDS+=("$lease_fd")
-    CONFIG_OPS_PYTHON="$release/venv/bin/python"
-    CONFIG_OPS_MODULE="$release/app"
-  elif [[ -x "$ROOT_DIR/.venv/bin/python" ]]; then
-    CONFIG_OPS_PYTHON="$ROOT_DIR/.venv/bin/python"
-    CONFIG_OPS_MODULE="$ROOT_DIR"
-  else
-    CONFIG_OPS_PYTHON=python3
-    CONFIG_OPS_MODULE="$ROOT_DIR"
+    CONFIG_OPS_BIN="$release/bin/backupctl"
+    return 0
   fi
+  if [[ -x "$ROOT_DIR/target/release/backupctl" && ! -L "$ROOT_DIR/target/release/backupctl" ]]; then
+    CONFIG_OPS_BIN="$ROOT_DIR/target/release/backupctl"
+    return 0
+  fi
+  if [[ -x "$ROOT_DIR/target/debug/backupctl" && ! -L "$ROOT_DIR/target/debug/backupctl" ]]; then
+    CONFIG_OPS_BIN="$ROOT_DIR/target/debug/backupctl"
+    return 0
+  fi
+  printf 'ERROR: backupctl is not built; run cargo build --release -p backupctl or install.sh\n' >&2
+  return 1
 }
 
 run_config_ops() {
   resolve_config_ops_runtime
-  PYTHONPATH="$CONFIG_OPS_MODULE" \
-    "$CONFIG_OPS_PYTHON" -m homelab_backup.config_ops "$@"
+  "$CONFIG_OPS_BIN" config-ops "$@"
 }
 
 run_config_ops_as_user() {
@@ -44,10 +46,8 @@ run_config_ops_as_user() {
   shift 2
   resolve_config_ops_runtime
   if ((EUID == uid)); then
-    PYTHONPATH="$CONFIG_OPS_MODULE" \
-      "$CONFIG_OPS_PYTHON" -m homelab_backup.config_ops "$@"
+    "$CONFIG_OPS_BIN" config-ops "$@"
   else
-    runuser --user "$user" -- env PYTHONPATH="$CONFIG_OPS_MODULE" \
-      "$CONFIG_OPS_PYTHON" -m homelab_backup.config_ops "$@"
+    runuser --user "$user" -- "$CONFIG_OPS_BIN" config-ops "$@"
   fi
 }

@@ -28,7 +28,7 @@ Docker Compose 服務的 Restic + OneDrive 備份工具。
 一致性模式、path／volume sources，以及統一的 backup／restore 五階段
 actions、inline Bash 與安全說明。
 
-編輯器會產生一段可在服務根目錄執行的 `python3` 清單命令。命令輸出版本化
+編輯器會產生一段可在服務根目錄執行的 `backupctl inventory` 命令。命令輸出版本化
 JSON Lines，不依賴 `ls` 的語系格式，並可安全表示空白、Unicode、tab 與換行；
 將結果貼入或匯入編輯器後，即可把檔案標成備份、排除或不納入，再整理成多個
 source 群組。清單不含檔案內容，也不會由瀏覽器上傳。
@@ -72,13 +72,12 @@ cd homelab-backup-X.Y.Z
 sudo ./install.sh
 ```
 
-維護者推送與 `homelab_backup.VERSION` 相同的 `vX.Y.Z` 標籤後，GitHub Actions
-會在 CI 全數通過時自動建立 Release、產生 release notes，並附上 archive 與
-checksum。一般 push 與 pull request 只執行 CI，不會發布。
+維護者推送與 workspace `Cargo.toml` 的 `version` 相同的 `vX.Y.Z` 標籤後，GitHub Actions
+會在 CI 全數通過時自動建立 Release、產生 release notes，並附上 archive、
+`backupctl` 二進位與 checksum。一般 push 與 pull request 只執行 CI，不會發布。
 
-升版時只需修改 `homelab_backup/__init__.py` 的 `VERSION`，不必全域取代測試
-內容。提交並確認 CI 通過後，建立完全相同版本的 `vX.Y.Z` tag 並推送；
-Release workflow 會拒絕 tag 與 `VERSION` 不一致的發布。
+升版時修改 workspace `Cargo.toml` 的 `version`。提交並確認 CI 通過後，建立完全相同版本的 `vX.Y.Z` tag 並推送；
+Release workflow 會拒絕 tag 與 crate 版本不一致的發布。
 
 安裝期間不要關機；若因斷電中止，重新執行同一個 `install.sh` 讓完整 release
 重新發布。安裝器不維護跨斷電 transaction journal。
@@ -107,8 +106,8 @@ archive 必須完整符合 Release 內的 SHA-256，且封裝只能包含預期�
 與 archive 都透過 GitHub HTTPS 下載；此校驗沿用 Release 的 `SHA256SUMS`，
 不另外提供獨立簽章信任根。
 
-下載、校驗、解壓或安裝任一步驟失敗時，暫存內容都會清除。既有安裝器只有在
-Python runtime、鎖定依賴、Docker helper、launcher 與 systemd units 全部準備
+下載、校驗、解壓或安裝任一步驟失敗時，暫存內容都會清除。安裝器只有在
+`backupctl` 二進位、Docker helper、launcher 與 systemd units 全部準備
 完成後才原子切換 `current`；失敗時目前版本仍維持啟用。
 
 接著：

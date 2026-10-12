@@ -117,6 +117,14 @@ pub enum Command {
     Docs,
     /// Upgrade an installed release from GitHub.
     Upgrade,
+    /// Write a versioned file inventory for the offline service editor.
+    Inventory,
+    /// Publish and inspect recovery config bundles. Used by the config scripts.
+    #[command(hide = true)]
+    ConfigOps {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -125,6 +133,9 @@ pub enum CliError {
     Failed(String),
     #[error("")]
     Reported,
+    /// Exit with this status. The message is already printed.
+    #[error("")]
+    Code(u8),
     /// Stale or stalled status. The alert lines are already printed.
     #[error("")]
     Stale,
@@ -134,6 +145,7 @@ impl CliError {
     pub fn code(&self) -> u8 {
         match self {
             Self::Stale => 2,
+            Self::Code(code) => *code,
             _ => 1,
         }
     }
@@ -227,6 +239,8 @@ pub fn run(cli: Cli) -> Result<(), CliError> {
             *start,
             *yes,
         ),
+        Command::Inventory => crate::commands::run_inventory(),
+        Command::ConfigOps { args } => crate::config_ops::run(args),
         Command::Upgrade => {
             return crate::upgrade::run_upgrade()
                 .map_err(|error| CliError::Failed(error.to_string()));
@@ -241,6 +255,6 @@ fn map_command(error: crate::files::CommandError) -> CliError {
         crate::files::CommandError::Text(message) => CliError::Failed(message),
         crate::files::CommandError::Reported => CliError::Reported,
         crate::files::CommandError::Exit(2) => CliError::Stale,
-        crate::files::CommandError::Exit(_) => CliError::Reported,
+        crate::files::CommandError::Exit(code) => CliError::Code(code),
     }
 }

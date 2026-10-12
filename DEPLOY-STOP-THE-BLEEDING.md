@@ -132,7 +132,7 @@ git log --oneline -8        # 確認在 fix/stop-the-bleeding
 sudo ./install.sh
 ```
 
-`install.sh` 會跑 `apt-get update/install`、建新的 venv 與 helper image、把
+`install.sh` 會跑 `apt-get update/install`、安裝 `backupctl` 二進位與 helper image、把
 `Dockerfile.volume-rsync` 一起放進 release（之後 helper 被清掉時可自動重建）、
 發布新的 launcher 和 systemd unit（含 `daemon-reload`），並把舊 release 保留成
 `previous`。失敗時會自動回復。

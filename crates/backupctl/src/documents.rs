@@ -75,15 +75,19 @@ fn read_yaml_document(path: &str) -> Result<Yaml, ReadError> {
     validate_control_file(&absolute).map_err(|error| ReadError::Other(error.message))?;
     let text =
         std::fs::read_to_string(&absolute).map_err(|error| ReadError::Other(error.to_string()))?;
+    parse_yaml_text(&text).map_err(ReadError::Other)
+}
+
+pub(crate) fn parse_yaml_text(text: &str) -> Result<Yaml, String> {
     if text.trim().is_empty() {
         return Ok(Yaml::Map(BTreeMap::new()));
     }
-    let value = noyalib::from_str::<noyalib::Value>(&text)
-        .map_err(|error| ReadError::Other(format!("YAML: {error}")))?;
+    let value =
+        noyalib::from_str::<noyalib::Value>(text).map_err(|error| format!("YAML: {error}"))?;
     match convert(value) {
         Ok(Yaml::Null) => Ok(Yaml::Map(BTreeMap::new())),
         Ok(value) => Ok(value),
-        Err(message) => Err(ReadError::Other(format!("YAML: {message}"))),
+        Err(message) => Err(format!("YAML: {message}")),
     }
 }
 

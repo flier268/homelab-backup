@@ -41,7 +41,7 @@ die() {
 
 require_tools() {
   local tool
-  for tool in age flock python3; do
+  for tool in age flock zip unzip; do
     command -v "$tool" >/dev/null 2>&1 || die "$tool is required; run install.sh first."
   done
 }
@@ -82,38 +82,7 @@ cleanup_publish_dir() {
 copy_file_as_user() {
   local input=$1 user=$2 uid=$3 output=$4 maximum_size=$5
   local status=0
-  local runner=()
-  if ((EUID != uid)); then
-    runner=(runuser --user "$user" --)
-  fi
-  "${runner[@]}" python3 - "$input" "$maximum_size" > "$output" <<'PY' || status=$?
-import os
-import stat
-import sys
-
-path = sys.argv[1]
-maximum_size = int(sys.argv[2])
-fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-try:
-    metadata = os.fstat(fd)
-    if not stat.S_ISREG(metadata.st_mode):
-        raise SystemExit(f'ERROR: encrypted archive is not a regular file: {path}')
-    if metadata.st_size > maximum_size:
-        raise SystemExit(
-            f'ERROR: input file exceeds the {maximum_size // (1024 * 1024)} MiB limit'
-        )
-    with os.fdopen(fd, 'rb', closefd=False) as source:
-        copied = 0
-        while chunk := source.read(1024 * 1024):
-            copied += len(chunk)
-            if copied > maximum_size:
-                raise SystemExit(
-                    f'ERROR: input file exceeds the {maximum_size // (1024 * 1024)} MiB limit'
-                )
-            sys.stdout.buffer.write(chunk)
-finally:
-    os.close(fd)
-PY
+  run_config_ops_as_user "$user" "$uid" copy-stdout "$input" "$maximum_size" > "$output" || status=$?
   if ((status != 0)); then
     rm -f -- "$output"
     return "$status"
@@ -139,35 +108,7 @@ publish_ciphertext_for_user() {
 
 remove_archive_as_user() {
   local archive=$1 user=$2 uid=$3 status=0
-  local runner=()
-  if ((EUID != uid)); then
-    runner=(runuser --user "$user" --)
-  fi
-  "${runner[@]}" python3 - "$archive" <<'PY' || status=$?
-import os
-from pathlib import Path
-import stat
-import sys
-
-archive = Path(sys.argv[1])
-directory_fd = os.open(archive.parent, os.O_RDONLY | os.O_DIRECTORY)
-try:
-    try:
-        metadata = os.stat(
-            archive.name, dir_fd=directory_fd, follow_symlinks=False,
-        )
-    except FileNotFoundError:
-        pass
-    else:
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid():
-            raise SystemExit(
-                f'ERROR: encrypted archive is not an owned regular file: {archive}'
-            )
-        os.unlink(archive.name, dir_fd=directory_fd)
-        os.fsync(directory_fd)
-finally:
-    os.close(directory_fd)
-PY
+  run_config_ops_as_user "$user" "$uid" remove-owned "$archive" || status=$?
   return "$status"
 }
 
@@ -347,25 +288,21 @@ encrypt_archive() {
 }
 
 validate_archive() {
-  python3 - "$1" <<'PY'
-import sys
-import zipfile
-
-expected = {
-    'configs/restic-password',
-    'configs/rclone.conf',
-    'configs/config.yaml',
-}
-with zipfile.ZipFile(sys.argv[1]) as archive:
-    names = archive.namelist()
-    if len(names) != len(expected) or set(names) != expected:
-        raise SystemExit('ERROR: archive contains unexpected or missing files')
-    if any(info.file_size > 16 * 1024 * 1024 for info in archive.infolist()):
-        raise SystemExit('ERROR: archive member exceeds the 16 MiB config limit')
-    damaged = archive.testzip()
-    if damaged is not None:
-        raise SystemExit(f'ERROR: archive member is damaged: {damaged}')
-PY
+  local archive=$1 listing sorted expected line size name
+  listing="$(unzip -Z1 -- "$archive")" || die 'ERROR: archive member is damaged'
+  sorted="$(printf '%s\n' "$listing" | LC_ALL=C sort)"
+  expected="$(printf '%s\n' configs/config.yaml configs/rclone.conf configs/restic-password | LC_ALL=C sort)"
+  [[ "$sorted" == "$expected" ]] || die 'ERROR: archive contains unexpected or missing files'
+  while IFS= read -r line; do
+    [[ "$line" =~ ^[[:space:]]*([0-9]+).*$ ]] || continue
+    size="${BASH_REMATCH[1]}"
+    name="${line##* }"
+    [[ "$name" == configs/* ]] || continue
+    if (( size > 16 * 1024 * 1024 )); then
+      die 'ERROR: archive member exceeds the 16 MiB config limit'
+    fi
+  done < <(unzip -l -- "$archive")
+  unzip -t -qq -- "$archive" >/dev/null || die 'ERROR: archive member is damaged'
 }
 
 create_plain_archive() {
@@ -377,16 +314,11 @@ create_plain_archive() {
     /etc/homelab-backup/rclone/rclone.conf "$source_dir/configs/rclone.conf"
   install -o root -g root -m 0600 \
     /etc/homelab-backup/config.yaml "$source_dir/configs/config.yaml"
-  python3 - "$source_dir" "$archive" <<'PY'
-from pathlib import Path
-import sys
-import zipfile
-
-root = Path(sys.argv[1])
-with zipfile.ZipFile(sys.argv[2], 'w', zipfile.ZIP_DEFLATED) as archive:
-    for name in ('restic-password', 'rclone.conf', 'config.yaml'):
-        archive.write(root / 'configs' / name, f'configs/{name}')
-PY
+  (
+    cd -- "$source_dir"
+    zip -X -q -- "$archive" \
+      configs/restic-password configs/rclone.conf configs/config.yaml
+  )
   validate_archive "$archive"
 }
 

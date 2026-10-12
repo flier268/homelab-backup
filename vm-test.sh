@@ -120,7 +120,8 @@ packages:
   - ca-certificates
   - curl
   - docker.io
-  - python3-venv
+  - unzip
+  - zip
   - rclone
   - restic
   - rsync

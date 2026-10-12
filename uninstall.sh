@@ -78,6 +78,19 @@ elif [[ -e "$LIB_ROOT" || -L "$LIB_ROOT" ]]; then
   exit 1
 fi
 
+helper_image_tag() {
+  local metadata=$1 line
+  [[ -f "$metadata" && ! -L "$metadata" ]] || return 1
+  line="$(sed -n '1p' -- "$metadata")" || return 1
+  if [[ "$line" == \{* ]]; then
+    if [[ "$line" =~ \"tag\":\"([^\"]+)\" ]]; then
+      printf '%s\n' "${BASH_REMATCH[1]}"
+      return 0
+    fi
+    return 1
+  fi
+  printf '%s\n' "$line"
+}
 unit_is_installed() {
   [[ -e "$UNIT_ROOT/$1" || -L "$UNIT_ROOT/$1" ]]
 }
@@ -133,14 +146,7 @@ HELPER_IMAGES=()
 if [[ -d "$RELEASES_ROOT" ]]; then
   for metadata in "$RELEASES_ROOT"/release.*/volume-helper-image; do
     [[ -f "$metadata" && ! -L "$metadata" ]] || continue
-    if ! helper_image="$(python3 -c '
-import json, sys
-raw = open(sys.argv[1], encoding="utf-8").read().strip()
-if raw.startswith("{"):
-    print(json.loads(raw)["tag"])
-else:
-    print(raw)
-' "$metadata")"; then
+    if ! helper_image="$(helper_image_tag "$metadata")"; then
       echo "WARNING: invalid helper image metadata; image was not removed: $metadata" >&2
       continue
     fi

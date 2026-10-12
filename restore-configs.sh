@@ -40,76 +40,24 @@ require_runtime_tmpfs() {
 }
 
 validate_and_extract_archive() {
-  local archive=$1 destination=$2
-  python3 - "$archive" "$destination" <<'PY'
-from pathlib import Path
-import shutil
-import sys
-import zipfile
-
-expected = {
-    'configs/restic-password',
-    'configs/rclone.conf',
-    'configs/config.yaml',
-}
-destination = Path(sys.argv[2])
-with zipfile.ZipFile(sys.argv[1]) as archive:
-    names = archive.namelist()
-    if len(names) != len(expected) or set(names) != expected:
-        raise SystemExit('ERROR: archive contains unexpected or missing files')
-    if any(info.file_size > 16 * 1024 * 1024 for info in archive.infolist()):
-        raise SystemExit('ERROR: archive member exceeds the 16 MiB config limit')
-    damaged = archive.testzip()
-    if damaged is not None:
-        raise SystemExit(f'ERROR: archive member is damaged: {damaged}')
-    for name in expected:
-        target = destination / name
-        target.parent.mkdir(parents=True, exist_ok=True)
-        with archive.open(name) as source, target.open('xb') as output:
-            shutil.copyfileobj(source, output)
-PY
+  local archive=$1 destination=$2 listing sorted member target
+  listing="$(unzip -Z1 -- "$archive")" || die 'ERROR: archive member is damaged'
+  sorted="$(printf '%s\n' "$listing" | LC_ALL=C sort)"
+  local expected
+  expected="$(printf '%s\n' configs/config.yaml configs/rclone.conf configs/restic-password | LC_ALL=C sort)"
+  [[ "$sorted" == "$expected" ]] || die 'ERROR: archive contains unexpected or missing files'
+  unzip -t -qq -- "$archive" >/dev/null || die 'ERROR: archive member is damaged'
+  install -d -m 0700 "$destination/configs"
+  for member in configs/restic-password configs/rclone.conf configs/config.yaml; do
+    target="$destination/$member"
+    unzip -p -- "$archive" "$member" > "$target" || die "ERROR: archive member is damaged: $member"
+    chmod 0600 -- "$target"
+  done
 }
 
 copy_untrusted_regular_file() {
   local input=$1 output=$2 maximum_size=$3
-  python3 - "$input" "$output" "$maximum_size" <<'PY'
-import os
-import stat
-import sys
-
-source = sys.argv[1]
-destination = sys.argv[2]
-maximum_size = int(sys.argv[3])
-source_fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-try:
-    metadata = os.fstat(source_fd)
-    if not stat.S_ISREG(metadata.st_mode):
-        raise SystemExit(f'ERROR: input is not a regular file: {source}')
-    if metadata.st_size > maximum_size:
-        raise SystemExit('ERROR: input exceeds its size limit')
-    destination_fd = os.open(
-        destination,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-        0o600,
-    )
-    try:
-        copied = 0
-        while chunk := os.read(source_fd, 1024 * 1024):
-            copied += len(chunk)
-            if copied > maximum_size:
-                raise SystemExit('ERROR: input exceeds its size limit')
-            remaining = memoryview(chunk)
-            while remaining:
-                written = os.write(destination_fd, remaining)
-                if written == 0:
-                    raise OSError('short write while copying untrusted input')
-                remaining = remaining[written:]
-        os.fsync(destination_fd)
-    finally:
-        os.close(destination_fd)
-finally:
-    os.close(source_fd)
-PY
+  run_config_ops copy-regular "$input" "$output" "$maximum_size"
 }
 
 preflight_config_bundle() {
@@ -175,7 +123,7 @@ done
 archive="${1:-$DEFAULT_ARCHIVE}"
 
 command -v age >/dev/null 2>&1 || { printf 'ERROR: age is required; run install.sh first.\n' >&2; exit 1; }
-command -v python3 >/dev/null 2>&1 || { printf 'ERROR: python3 is required.\n' >&2; exit 1; }
+command -v unzip >/dev/null 2>&1 || { printf 'ERROR: unzip is required; run install.sh first.\n' >&2; exit 1; }
 command -v flock >/dev/null 2>&1 || { printf 'ERROR: flock is required.\n' >&2; exit 1; }
 [[ -f "$archive" && ! -L "$archive" ]] || {
   printf 'ERROR: encrypted archive is not a regular non-symlink file: %s\n' "$archive" >&2

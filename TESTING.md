@@ -2,25 +2,14 @@
 
 已執行下列靜態與 smoke tests：
 
-- 先建立測試用虛擬環境：`python3 -m venv .venv`
-- 安裝鎖定依賴：`.venv/bin/python -m pip install --require-hashes -r requirements.txt`
-- 更新依賴時先在虛擬環境安裝 `pip-tools`，再執行
-  `pip-compile --upgrade --generate-hashes --strip-extras --output-file=requirements.txt requirements.in`。
-  `requirements.in` 只記錄直接依賴意圖；`requirements.txt` 是指令產生、包含各發布架構 wheel hash 的鎖檔，不手動增刪 hash。
-- 以下 Python 指令請以 `.venv/bin/python` 執行。
-- `python3 -m py_compile backupctl homelab_backup/*.py`
-- `bash -n install.sh`
-- `bash -n uninstall.sh`
-- `bash -n backup-configs.sh`
-- `bash -n restore-configs.sh`
-- `bash -n config-ops-runtime.sh`
-- `shellcheck install.sh uninstall.sh backup-configs.sh restore-configs.sh config-ops-runtime.sh`
-- `python3 -m unittest discover -s tests -v`
-- repository 與模擬安裝後的 `backupctl --help`、`backupctl --version`
+- `cargo fmt --all --check`
+- `cargo clippy --offline --all-targets --tests -- -D warnings`
+- `cargo test --workspace --offline`
+- `bash -n install.sh uninstall.sh backup-configs.sh restore-configs.sh config-ops-runtime.sh backupctl`
+- `shellcheck install.sh uninstall.sh backup-configs.sh restore-configs.sh config-ops-runtime.sh backupctl`
+- `./backupctl --help` 與 `./backupctl --version`（需要已經建好的 debug 或 release 二進位）
 
-Python 單元測試依 package 元件拆分為 `test_schedule.py`、`test_config.py`、
-`test_storage.py`、`test_backup.py`、`test_restore.py` 與 `test_cli.py`；共用測試
-fixture 集中在 `tests/helpers.py`。
+行為測試在 `crates/domain` 與 `crates/backupctl` 的 Rust 單元測試。
 
 自動化測試涵蓋 manifest schema 與路徑安全、Cron 解析、staging 清理、
 staging symlink 防護、managed-leaf control parent、filesystem allowlist、控制路徑與工作 root 隔離、hook／精確服務重啟、壞
@@ -52,16 +41,9 @@ maintenance、finally 清理與 capture inventory 驗證。
 6. 在隔離環境測試 `--apply --start`
 7. 以測試 SSH key 執行 `backup-configs.sh`、`restore-configs.sh` 與 `--rotate`
 
-Rootful Docker 與 Btrfs 真實整合測試為 opt-in：
-
-```bash
-sudo HOMELAB_BACKUP_INTEGRATION=1 \
-  HOMELAB_BACKUP_BTRFS_ROOT=/path/on/btrfs \
-  python3 -m unittest tests.test_integration -v
-```
-
-未設定時會安全跳過；Docker 測試使用本機 helper image，Btrfs 測試只在明確指定
-的 Btrfs root 下建立並刪除測試 subvolume。
+Rust 單元測試涵蓋已移植的 Docker volume、Btrfs snapshot 與 restore 行為，不需要
+常駐的 Docker daemon 或 Btrfs 檔案系統。需要真實 daemon 的舊 Python integration
+測試已隨 runtime 移除。
 
 ## 一次性 QEMU VM
 

@@ -3,11 +3,7 @@ set -euo pipefail
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd -- "$ROOT_DIR"
 apt-get update
-apt-get install -y python3 python3-venv rsync restic rclone age ca-certificates curl openssl btrfs-progs util-linux
-if ! python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 10))'; then
-  echo 'ERROR: homelab-backup requires Python 3.10 or newer.' >&2
-  exit 1
-fi
+apt-get install -y rsync restic rclone age ca-certificates curl openssl btrfs-progs util-linux zip unzip
 LIB_ROOT=/usr/local/lib/homelab-backup
 RELEASES_ROOT="$LIB_ROOT/releases"
 CURRENT_ROOT="$LIB_ROOT/current"
@@ -64,6 +60,19 @@ LAUNCHER_PUBLISHED=0
 UNITS_PUBLISHED=0
 HAD_PREVIOUS=0
 HAD_LAUNCHER=0
+helper_image_tag() {
+  local metadata=$1 line
+  [[ -f "$metadata" && ! -L "$metadata" ]] || return 1
+  line="$(sed -n '1p' -- "$metadata")" || return 1
+  if [[ "$line" == \{* ]]; then
+    if [[ "$line" =~ \"tag\":\"([^\"]+)\" ]]; then
+      printf '%s\n' "${BASH_REMATCH[1]}"
+      return 0
+    fi
+    return 1
+  fi
+  printf '%s\n' "$line"
+}
 restore_install_path() {
   source_path=$1
   destination_path=$2
@@ -154,24 +163,27 @@ cleanup_release_install() {
 trap cleanup_release_install EXIT
 chmod 0755 "$RELEASE_NEXT"
 install -m 0644 /dev/null "$RELEASE_NEXT/.lease"
-python3 -m venv "$RELEASE_NEXT/venv"
-"$RELEASE_NEXT/venv/bin/python" -m pip install \
-  --require-hashes --no-deps --only-binary=:all: --upgrade \
-  -r requirements.txt
-install -d -m 0755 "$RELEASE_NEXT/app/homelab_backup"
-install -m 0644 homelab_backup/*.py "$RELEASE_NEXT/app/homelab_backup/"
+if [[ -f bin/backupctl && ! -L bin/backupctl ]]; then
+  SOURCE_BIN=bin/backupctl
+elif [[ -x target/release/backupctl && ! -L target/release/backupctl ]]; then
+  SOURCE_BIN=target/release/backupctl
+else
+  command -v cargo >/dev/null 2>&1 || {
+    echo 'ERROR: release binary is missing and cargo is not installed.' >&2
+    exit 1
+  }
+  cargo build --locked --release -p backupctl
+  SOURCE_BIN=target/release/backupctl
+fi
+install -d -m 0755 "$RELEASE_NEXT/bin"
+install -m 0755 "$SOURCE_BIN" "$RELEASE_NEXT/bin/backupctl"
 if [[ -f GUIDE.html ]]; then
   install -m 0644 GUIDE.html "$RELEASE_NEXT/GUIDE.html"
 fi
-(
-  cd -- "$RELEASE_NEXT"
-  PYTHONPATH="$RELEASE_NEXT/app" \
-    "$RELEASE_NEXT/venv/bin/python" -c \
-      'import homelab_backup.cli, homelab_backup.config_ops'
-)
+"$RELEASE_NEXT/bin/backupctl" --version >/dev/null
 
-# Prepare every shared runtime dependency before publishing the new Python
-# release. A failure here leaves the existing current release active.
+# Prepare every shared runtime dependency before publishing the new release.
+# A failure here leaves the existing current release active.
 if [[ -e "$LAUNCHER_NEXT" || -L "$LAUNCHER_NEXT" ]]; then
   echo "ERROR: temporary launcher already exists: $LAUNCHER_NEXT" >&2
   exit 1
@@ -206,9 +218,8 @@ if [[ ! "$HELPER_IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]]; then
 fi
 docker run --rm --network none "$HELPER_IMAGE_ID" rsync --version >/dev/null
 install -m 0644 /dev/null "$RELEASE_NEXT/volume-helper-image"
-python3 -c \
-  'import json,sys; print(json.dumps({"tag": sys.argv[1], "image_id": sys.argv[2]}, separators=(",", ":")))' \
-  "$HELPER_IMAGE" "$HELPER_IMAGE_ID" > "$RELEASE_NEXT/volume-helper-image"
+printf '{"tag":"%s","image_id":"%s"}\n' "$HELPER_IMAGE" "$HELPER_IMAGE_ID" \
+  > "$RELEASE_NEXT/volume-helper-image"
 
 if [[ -e "$CURRENT_NEXT" || -L "$CURRENT_NEXT" ]]; then
   echo "ERROR: temporary release link already exists: $CURRENT_NEXT" >&2
@@ -248,10 +259,6 @@ done
 UNIT_NEXT_PATHS=()
 systemctl daemon-reload
 
-LAUNCHER_PUBLISHED=1
-mv -Tf -- "$LAUNCHER_NEXT" /usr/local/sbin/backupctl
-LAUNCHER_NEXT=
-
 if [[ -n "$OLD_RELEASE" ]]; then
   ln -s -- "releases/$(basename -- "$OLD_RELEASE")" "$PREVIOUS_NEXT"
   PREVIOUS_PUBLISHED=1
@@ -262,6 +269,12 @@ ln -s -- "releases/$(basename -- "$RELEASE_NEXT")" "$CURRENT_NEXT"
 CURRENT_PUBLISHED=1
 mv -Tf -- "$CURRENT_NEXT" "$CURRENT_ROOT"
 CURRENT_NEXT=
+# Publish the launcher after current points at this release. The launcher
+# executes releases/current/bin/backupctl, so a Rust-to-Rust upgrade keeps
+# resolving a complete release.
+LAUNCHER_PUBLISHED=1
+mv -Tf -- "$LAUNCHER_NEXT" /usr/local/sbin/backupctl
+LAUNCHER_NEXT=
 NEW_RELEASE="$RELEASE_NEXT"
 RELEASE_NEXT=
 HELPER_IMAGE=
@@ -288,11 +301,7 @@ for release in "$RELEASES_ROOT"/release.*; do
     if [[ -f "$release/volume-helper-image" ]]; then
       obsolete_metadata="$(sed -n '1p' "$release/volume-helper-image")"
       if [[ "$obsolete_metadata" == \{* ]]; then
-        if ! obsolete_helper="$(
-          python3 -c \
-            'import json,sys; value=json.load(open(sys.argv[1], encoding="utf-8")); print(value["tag"])' \
-            "$release/volume-helper-image"
-        )"; then
+        if ! obsolete_helper="$(helper_image_tag "$release/volume-helper-image")"; then
           echo "WARNING: invalid obsolete helper image metadata; retaining release for inspection: $release" >&2
           exec {release_lease_fd}<&-
           continue

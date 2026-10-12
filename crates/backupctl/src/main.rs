@@ -14,6 +14,7 @@ mod capture;
 mod catalog;
 mod cli;
 mod commands;
+mod config_ops;
 mod documents;
 mod due;
 mod files;
