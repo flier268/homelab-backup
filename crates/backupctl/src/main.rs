@@ -20,6 +20,7 @@ mod state;
 mod storage;
 #[allow(dead_code)]
 mod unix;
+mod volumes;
 
 fn main() -> ExitCode {
     let command = cli::Cli::parse();

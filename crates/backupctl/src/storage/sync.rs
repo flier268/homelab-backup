@@ -26,6 +26,7 @@ pub struct PathInventory {
     pub present: bool,
     pub capture_method: String,
     pub ancestors: Vec<Ancestor>,
+    pub writers: Vec<String>,
 }
 
 type RunHook<'a> = Option<&'a mut dyn FnMut(&[String]) -> Result<(), SecurityError>>;
@@ -37,6 +38,9 @@ pub struct SyncOptions<'a> {
     pub mounts: MountHook<'a>,
     /// Empty means the quiesced-copy method used by stop, hooks, and external.
     pub capture_method: String,
+    /// Per-source methods override `capture_method`. Live and snapshot use this.
+    pub capture_methods: BTreeMap<String, String>,
+    pub writers: BTreeMap<String, Vec<String>>,
     pub before_copy: Option<&'a mut dyn FnMut() -> Result<(), SecurityError>>,
 }
 
@@ -56,7 +60,7 @@ pub fn sync_paths(
             return Err(SecurityError::invalid("sources.paths must be a list"));
         }
     };
-    let capture_method = if options.capture_method.is_empty() {
+    let fallback_method = if options.capture_method.is_empty() {
         "quiesced-copy".to_owned()
     } else {
         options.capture_method.clone()
@@ -70,6 +74,12 @@ pub fn sync_paths(
             return Err(SecurityError::invalid("path source must be a mapping"));
         };
         let id = source.get("id").and_then(Yaml::as_str).unwrap_or("");
+        let capture_method = options
+            .capture_methods
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| fallback_method.clone());
+        let writers = options.writers.get(id).cloned().unwrap_or_default();
         let declared = source.get("path").and_then(Yaml::as_str).unwrap_or("");
         let required = source
             .get("required")
@@ -85,6 +95,7 @@ pub fn sync_paths(
                 present: true,
                 capture_method: capture_method.clone(),
                 ancestors,
+                writers: writers.clone(),
             }),
             Err(error) if error.is_missing_path() && !required => {
                 if let Some(parent) = destination.parent() {
@@ -99,6 +110,7 @@ pub fn sync_paths(
                     present: false,
                     capture_method: capture_method.clone(),
                     ancestors: Vec::new(),
+                    writers,
                 });
             }
             Err(error) if error.is_missing_path() => {

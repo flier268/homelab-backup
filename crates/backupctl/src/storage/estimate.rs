@@ -23,15 +23,6 @@ pub fn estimate_path_sources(
     let Some(sources) = manifest.get("sources").and_then(Yaml::as_map) else {
         return Ok(0);
     };
-    if sources
-        .get("volumes")
-        .and_then(Yaml::as_seq)
-        .is_some_and(|volumes| !volumes.is_empty())
-    {
-        return Err(SecurityError::runtime(
-            "Docker volume copy is not ported yet",
-        ));
-    }
     let paths = match sources.get("paths") {
         None => return Ok(0),
         Some(Yaml::Seq(paths)) => paths,

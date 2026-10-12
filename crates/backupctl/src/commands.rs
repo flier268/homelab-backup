@@ -455,7 +455,7 @@ fn check_runtime_sources(
         .and_then(Yaml::as_seq)
         .is_some_and(|volumes| !volumes.is_empty())
     {
-        return Err("Docker volume validation is not ported yet".to_owned());
+        crate::volumes::prepare_docker(config, manifest).map_err(|error| error.message)?;
     }
     let Some(paths) = sources
         .and_then(|sources| sources.get("paths"))

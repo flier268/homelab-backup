@@ -121,13 +121,7 @@ pub(crate) fn backup_loaded(
         .and_then(|consistency| consistency.get("mode"))
         .and_then(Yaml::as_str)
         .unwrap_or("stop");
-    let has_volumes = manifest
-        .get("sources")
-        .and_then(Yaml::as_map)
-        .and_then(|sources| sources.get("volumes"))
-        .and_then(Yaml::as_seq)
-        .is_some_and(|volumes| !volumes.is_empty());
-    if !matches!(mode, "files" | "external" | "hooks") || has_volumes {
+    if !matches!(mode, "files" | "external" | "hooks" | "stop" | "live") {
         return Err(format!("consistency mode {mode} is not ported yet"));
     }
     for message in legacy_messages(manifest) {
@@ -257,48 +251,29 @@ fn stage_files(
         }
     }
     let stage = prepare_stage(staging_root, service, &protected)?;
+    let docker = if mode == "files" {
+        None
+    } else {
+        Some(crate::volumes::prepare_docker(config, manifest)?)
+    };
     let estimated = estimate_path_sources(config, manifest, &stage)?;
     ensure_space(&label, &stage, estimated, allow_low_space)?;
     let captured = (|| {
         let mut before = run_phase(manifest, "backup", "before", &[], &mut |_| None)?;
-        let mut check = || ensure_space(&label, &stage, 0, allow_low_space);
-        let capture_method = if mode == "files" {
-            "best-effort"
-        } else {
-            "quiesced-copy"
-        };
-        let mut options = SyncOptions {
-            capture_method: capture_method.to_owned(),
-            before_copy: Some(&mut check),
-            ..SyncOptions::default()
-        };
-        let synced = if mode == "hooks" {
-            let captured = (|| {
-                run_consistency_hooks(manifest, "before")?;
-                sync_paths(config, manifest, Path::new(&stage), &mut options)
-            })();
-            let cleanup = run_consistency_hooks(manifest, "after");
-            match (captured, cleanup) {
-                (Err(error), Err(cleanup)) => {
-                    eprintln!("ERROR: after hook cleanup also failed: {cleanup}");
-                    Err(error)?
-                }
-                (Err(error), Ok(())) => Err(error)?,
-                (Ok(paths), cleanup) => {
-                    cleanup?;
-                    paths
-                }
-            }
-        } else {
-            sync_paths(config, manifest, Path::new(&stage), &mut options)?
-        };
-        let paths = synced;
-        ensure_space(&label, &stage, 0, allow_low_space)?;
+        let copied = capture_sources(
+            config,
+            manifest,
+            &stage,
+            mode,
+            docker.as_ref(),
+            &label,
+            allow_low_space,
+        )?;
         before.extend(run_phase(manifest, "backup", "after", &[], &mut |_| None)?);
-        Ok::<_, SecurityError>((paths, before))
+        Ok::<_, SecurityError>((copied, before))
     })();
     let finally = run_phase(manifest, "backup", "finally", &[], &mut |_| None);
-    let (paths, mut failures) = match captured {
+    let ((paths, volumes), mut failures) = match captured {
         Ok(value) => value,
         Err(error) => {
             if let Err(cleanup) = finally {
@@ -308,14 +283,223 @@ fn stage_files(
         }
     };
     failures.extend(finally?);
-    write_inventory(manifest, Path::new(&stage), &paths, &failures)?;
+    write_inventory(
+        manifest,
+        Path::new(&stage),
+        &paths,
+        &volumes,
+        docker.as_ref(),
+        &failures,
+    )?;
     Ok(PathBuf::from(stage))
+}
+
+fn capture_sources(
+    config: &BTreeMap<String, String>,
+    manifest: &BTreeMap<String, Yaml>,
+    stage: &str,
+    mode: &str,
+    docker: Option<&crate::volumes::DockerContext>,
+    label: &str,
+    allow_low_space: bool,
+) -> Result<(Vec<PathInventory>, Vec<crate::volumes::VolumeInventory>), SecurityError> {
+    let timeout = manifest
+        .get("consistency")
+        .and_then(Yaml::as_map)
+        .and_then(|consistency| consistency.get("timeout"))
+        .and_then(Yaml::as_int)
+        .unwrap_or(120);
+    let targets = if mode == "stop" {
+        crate::volumes::running_services(manifest)?
+    } else {
+        Vec::new()
+    };
+    let captured = (|| {
+        if mode == "stop" && !targets.is_empty() {
+            crate::volumes::compose_lifecycle(manifest, "stop", &targets, timeout)?;
+        }
+        if mode == "hooks" {
+            run_consistency_hooks(manifest, "before")?;
+        }
+        if matches!(mode, "external" | "hooks" | "stop")
+            && let Some(docker) = docker
+        {
+            crate::volumes::validate_no_writers(manifest, docker, mode == "stop")?;
+        }
+        let writers = if mode == "live" {
+            let docker =
+                docker.ok_or_else(|| SecurityError::runtime("live mode requires Docker"))?;
+            let maps = crate::volumes::writer_maps(manifest, docker)?;
+            crate::volumes::warn_writers(&maps.paths, &maps.volumes);
+            maps
+        } else {
+            crate::volumes::WriterMaps {
+                paths: BTreeMap::new(),
+                volumes: BTreeMap::new(),
+            }
+        };
+        if let Some(docker) = docker {
+            let image = config
+                .get("volume_helper_image")
+                .map(String::as_str)
+                .unwrap_or("");
+            let mut volume_bytes = 0u64;
+            for (id, _, name) in &docker.volumes {
+                let required = manifest_volume_required(manifest, id);
+                volume_bytes = volume_bytes
+                    .saturating_add(crate::volumes::estimate_volume(image, name, required)?);
+            }
+            ensure_space(label, stage, volume_bytes, allow_low_space)?;
+        }
+        copy_sources(
+            config,
+            manifest,
+            mode,
+            docker,
+            &StageSpace {
+                label,
+                stage,
+                allow_low_space,
+            },
+            &writers,
+        )
+    })();
+    let cleanup = if mode == "hooks" {
+        run_consistency_hooks(manifest, "after")
+    } else if mode == "stop" && !targets.is_empty() {
+        crate::volumes::compose_lifecycle(manifest, "start", &targets, timeout)
+    } else {
+        Ok(())
+    };
+    let label = if mode == "hooks" {
+        "after hook"
+    } else {
+        "service restart"
+    };
+    match (captured, cleanup) {
+        (Err(error), Err(cleanup)) => {
+            eprintln!("ERROR: {label} cleanup also failed: {cleanup}");
+            Err(error)
+        }
+        (Err(error), Ok(())) => Err(error),
+        (Ok(copied), cleanup) => {
+            cleanup?;
+            Ok(copied)
+        }
+    }
+}
+
+struct StageSpace<'a> {
+    label: &'a str,
+    stage: &'a str,
+    allow_low_space: bool,
+}
+
+fn copy_sources(
+    config: &BTreeMap<String, String>,
+    manifest: &BTreeMap<String, Yaml>,
+    mode: &str,
+    docker: Option<&crate::volumes::DockerContext>,
+    space: &StageSpace<'_>,
+    writers: &crate::volumes::WriterMaps,
+) -> Result<(Vec<PathInventory>, Vec<crate::volumes::VolumeInventory>), SecurityError> {
+    let mut check = || ensure_space(space.label, space.stage, 0, space.allow_low_space);
+    let path_ids = source_ids(manifest, "paths");
+    let path_methods = if mode == "files" {
+        path_ids
+            .into_iter()
+            .map(|id| (id, "best-effort".to_owned()))
+            .collect()
+    } else if mode == "live" {
+        crate::volumes::method_map(path_ids, &writers.paths, &BTreeMap::new())
+    } else {
+        path_ids
+            .into_iter()
+            .map(|id| (id, "quiesced-copy".to_owned()))
+            .collect()
+    };
+    let mut options = SyncOptions {
+        capture_method: if mode == "files" {
+            "best-effort".to_owned()
+        } else {
+            "quiesced-copy".to_owned()
+        },
+        capture_methods: path_methods,
+        writers: writers.paths.clone(),
+        before_copy: Some(&mut check),
+        ..SyncOptions::default()
+    };
+    let paths = sync_paths(config, manifest, Path::new(space.stage), &mut options)?;
+    ensure_space(space.label, space.stage, 0, space.allow_low_space)?;
+    let volumes = if let Some(docker) = docker {
+        let volume_ids = docker
+            .volumes
+            .iter()
+            .map(|(id, _, _)| id.clone())
+            .collect::<Vec<_>>();
+        let volume_methods = if mode == "live" {
+            crate::volumes::method_map(volume_ids, &writers.volumes, &BTreeMap::new())
+        } else {
+            volume_ids
+                .into_iter()
+                .map(|id| (id, "quiesced-copy".to_owned()))
+                .collect()
+        };
+        crate::volumes::sync_volumes(
+            config,
+            manifest,
+            Path::new(space.stage),
+            &docker.volumes,
+            &volume_methods,
+            &writers.volumes,
+            &mut || ensure_space(space.label, space.stage, 0, space.allow_low_space),
+        )?
+    } else {
+        Vec::new()
+    };
+    Ok((paths, volumes))
+}
+
+fn source_ids(manifest: &BTreeMap<String, Yaml>, key: &str) -> Vec<String> {
+    manifest
+        .get("sources")
+        .and_then(Yaml::as_map)
+        .and_then(|sources| sources.get(key))
+        .and_then(Yaml::as_seq)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Yaml::as_map)
+                .filter_map(|source| source.get("id").and_then(Yaml::as_str))
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn manifest_volume_required(manifest: &BTreeMap<String, Yaml>, id: &str) -> bool {
+    manifest
+        .get("sources")
+        .and_then(Yaml::as_map)
+        .and_then(|sources| sources.get("volumes"))
+        .and_then(Yaml::as_seq)
+        .and_then(|items| {
+            items
+                .iter()
+                .filter_map(Yaml::as_map)
+                .find(|source| source.get("id").and_then(Yaml::as_str) == Some(id))
+        })
+        .and_then(|source| source.get("required"))
+        .and_then(Yaml::as_bool)
+        .unwrap_or(true)
 }
 
 fn write_inventory(
     manifest: &BTreeMap<String, Yaml>,
     stage: &Path,
     paths: &[PathInventory],
+    volumes: &[crate::volumes::VolumeInventory],
+    docker: Option<&crate::volumes::DockerContext>,
     failures: &[crate::actions::ActionFailure],
 ) -> Result<(), SecurityError> {
     let meta = stage.join("_meta");
@@ -325,13 +509,15 @@ fn write_inventory(
     }
     atomic_write_json(
         &meta.join("inventory.json"),
-        &inventory_value(manifest, paths, failures),
+        &inventory_value(manifest, paths, volumes, docker, failures),
     )
 }
 
 fn inventory_value(
     manifest: &BTreeMap<String, Yaml>,
     paths: &[PathInventory],
+    volumes: &[crate::volumes::VolumeInventory],
+    docker: Option<&crate::volumes::DockerContext>,
     failures: &[crate::actions::ActionFailure],
 ) -> serde_json::Value {
     let path_items = paths
@@ -369,6 +555,56 @@ fn inventory_value(
                 "capture_method".to_owned(),
                 serde_json::Value::String(item.capture_method.clone()),
             );
+            if !item.writers.is_empty() {
+                entry.insert(
+                    "writers".to_owned(),
+                    serde_json::Value::Array(
+                        item.writers
+                            .iter()
+                            .cloned()
+                            .map(serde_json::Value::String)
+                            .collect(),
+                    ),
+                );
+            }
+            serde_json::Value::Object(entry)
+        })
+        .collect::<Vec<_>>();
+    let volume_items = volumes
+        .iter()
+        .map(|item| {
+            let mut entry = serde_json::Map::new();
+            entry.insert("id".to_owned(), serde_json::Value::String(item.id.clone()));
+            if let Some(name) = &item.name {
+                entry.insert("name".to_owned(), serde_json::Value::String(name.clone()));
+            }
+            if let Some(compose_volume) = &item.compose_volume {
+                entry.insert(
+                    "compose_volume".to_owned(),
+                    serde_json::Value::String(compose_volume.clone()),
+                );
+            }
+            entry.insert(
+                "actual_name".to_owned(),
+                serde_json::Value::String(item.actual_name.clone()),
+            );
+            entry.insert("present".to_owned(), serde_json::Value::Bool(item.present));
+            entry.insert(
+                "capture_method".to_owned(),
+                serde_json::Value::String(item.capture_method.clone()),
+            );
+            if !item.writers.is_empty() {
+                entry.insert(
+                    "writers".to_owned(),
+                    serde_json::Value::Array(
+                        item.writers
+                            .iter()
+                            .cloned()
+                            .map(serde_json::Value::String)
+                            .collect(),
+                    ),
+                );
+            }
             serde_json::Value::Object(entry)
         })
         .collect::<Vec<_>>();
@@ -382,20 +618,45 @@ fn inventory_value(
             })
         })
         .collect::<Vec<_>>();
-    serde_json::json!({
+    let mut writers = std::collections::BTreeSet::new();
+    for item in paths.iter().filter(|item| item.present) {
+        writers.extend(item.writers.iter().cloned());
+    }
+    for item in volumes.iter().filter(|item| item.present) {
+        writers.extend(item.writers.iter().cloned());
+    }
+    let mut value = serde_json::json!({
         "version": 1,
         "service": manifest.get("service").and_then(Yaml::as_str).unwrap_or(""),
         "service_directory": manifest.get("_dir").and_then(Yaml::as_str).unwrap_or(""),
         "service_relative_directory": manifest.get("_relative_dir").and_then(Yaml::as_str).unwrap_or(""),
         "paths": path_items,
-        "volumes": [],
-        "consistency": {
-            "mode": manifest.get("consistency").and_then(Yaml::as_map).and_then(|item| item.get("mode")).and_then(Yaml::as_str).unwrap_or("stop"),
-            "guarantee": overall_guarantee(manifest, paths, failures),
-            "optional_action_failures": action_failures,
-            "writers": [],
-        }
-    })
+        "volumes": volume_items,
+    });
+    if let Some(docker) = docker {
+        value["compose"] = serde_json::json!({
+            "project_name": docker.project_name,
+            "compose_files": docker.compose_files,
+            "services": docker.services,
+            "volumes": docker.volumes.iter().map(|(id, logical, actual)| {
+                let mut entry = serde_json::json!({
+                    "id": id,
+                    "actual_name": actual,
+                });
+                if let Some(logical) = logical {
+                    entry["logical_name"] = serde_json::Value::String(logical.clone());
+                }
+                entry
+            }).collect::<Vec<_>>(),
+        });
+    }
+    value["consistency"] = serde_json::json!({
+        "mode": manifest.get("consistency").and_then(Yaml::as_map).and_then(|item| item.get("mode")).and_then(Yaml::as_str).unwrap_or("stop"),
+        "guarantee": overall_guarantee(manifest, paths, volumes, failures),
+        "optional_action_failures": action_failures,
+        "writers": writers.into_iter().collect::<Vec<_>>(),
+    });
+    value
 }
 
 fn ensure_space(
@@ -515,6 +776,7 @@ pub(crate) fn flat_strings(config: &BTreeMap<String, Yaml>) -> BTreeMap<String, 
 fn overall_guarantee(
     manifest: &BTreeMap<String, Yaml>,
     paths: &[PathInventory],
+    volumes: &[crate::volumes::VolumeInventory],
     failures: &[crate::actions::ActionFailure],
 ) -> &'static str {
     let mode = manifest
@@ -523,18 +785,20 @@ fn overall_guarantee(
         .and_then(|consistency| consistency.get("mode"))
         .and_then(Yaml::as_str)
         .unwrap_or("stop");
-    if mode == "files"
-        || !failures.is_empty()
-        || paths
-            .iter()
-            .any(|item| item.capture_method == "best-effort")
-    {
+    let methods = paths
+        .iter()
+        .filter(|item| item.present)
+        .map(|item| item.capture_method.as_str())
+        .chain(
+            volumes
+                .iter()
+                .filter(|item| item.present)
+                .map(|item| item.capture_method.as_str()),
+        )
+        .collect::<Vec<_>>();
+    if mode == "files" || !failures.is_empty() || methods.contains(&"best-effort") {
         "best-effort"
-    } else if !paths.is_empty()
-        && paths
-            .iter()
-            .all(|item| item.capture_method == "btrfs-snapshot")
-    {
+    } else if !methods.is_empty() && methods.iter().all(|item| *item == "btrfs-snapshot") {
         "btrfs-snapshot"
     } else {
         "quiesced-copy"
@@ -675,6 +939,12 @@ mod tests {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         std::fs::write(data.join("payload.txt"), "snapshot").unwrap();
+        std::fs::write(demo.join("compose.yaml"), "services: {}\n").unwrap();
+        std::fs::set_permissions(
+            demo.join("compose.yaml"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
         let manifest = demo.join("backup.yaml");
         std::fs::write(
             &manifest,
@@ -685,6 +955,7 @@ mod tests {
         let config_path = write_config(&root, &services);
         let inventory = root.join("inventory.json");
         let program = fake_restic(&root, &root.join("restic.log"), &inventory);
+        let _docker = quiet_docker();
         run_backup(
             &config_path.to_string_lossy(),
             &[],
@@ -712,7 +983,7 @@ mod tests {
         let manifest = demo.join("backup.yaml");
         std::fs::write(
             &manifest,
-            "version: 1\nservice: demo\nschedule:\n  cron: '0 0 * * *'\nretention:\n  keep_last: 1\nconsistency:\n  mode: stop\nsources:\n  paths: []\n  volumes: []\n",
+            "version: 1\nservice: demo\nschedule:\n  cron: '0 0 * * *'\nretention:\n  keep_last: 1\nconsistency:\n  mode: snapshot\nsources:\n  paths: []\n  volumes: []\n",
         )
         .unwrap();
         std::fs::set_permissions(&manifest, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -736,6 +1007,96 @@ mod tests {
         let calls = std::fs::read_to_string(&log).unwrap_or_default();
         assert!(!calls.contains("backup"), "{calls}");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stop_mode_restarts_the_compose_service_and_backs_up() {
+        let root = temp_root("stop-run");
+        let services = root.join("services");
+        let demo = services.join("demo");
+        let data = demo.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        for path in [&services, &demo, &data] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::write(data.join("payload.txt"), "snapshot").unwrap();
+        std::fs::write(demo.join("compose.yaml"), "services: {}\n").unwrap();
+        std::fs::set_permissions(
+            demo.join("compose.yaml"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let manifest = demo.join("backup.yaml");
+        std::fs::write(
+            &manifest,
+            "version: 1\nservice: demo\nschedule:\n  cron: '0 0 * * *'\nretention:\n  keep_last: 1\nconsistency:\n  mode: stop\nsources:\n  paths:\n    - id: data\n      path: data\n  volumes: []\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&manifest, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let recorded = std::rc::Rc::clone(&calls);
+        let _docker = crate::volumes::install_runner(Box::new(move |exec| {
+            let joined = exec.argv.join(" ");
+            recorded.borrow_mut().push(joined.clone());
+            let stdout = if joined.contains("context") && joined.contains("inspect") {
+                "\"unix:///var/run/docker.sock\"\n".to_owned()
+            } else if joined.contains(" info ") {
+                "[\"name=seccomp\"]\n".to_owned()
+            } else if joined.contains("config") {
+                "{\"name\":\"demo\",\"services\":{\"app\":{}}}\n".to_owned()
+            } else if joined.contains("--services") {
+                "app\n".to_owned()
+            } else {
+                String::new()
+            };
+            Ok(crate::volumes::CapturedText {
+                code: 0,
+                stdout,
+                stderr: String::new(),
+            })
+        }));
+        let config_path = write_config(&root, &services);
+        let log = root.join("restic.log");
+        let program = fake_restic(&root, &log, &root.join("inventory.json"));
+        run_backup(
+            &config_path.to_string_lossy(),
+            &["demo".to_owned()],
+            false,
+            &program.to_string_lossy(),
+        )
+        .unwrap();
+        let calls = calls.borrow();
+        let stop = calls
+            .iter()
+            .position(|call| call.contains(" stop "))
+            .unwrap();
+        let start = calls
+            .iter()
+            .position(|call| call.contains(" start "))
+            .unwrap();
+        assert!(stop < start, "{calls:?}");
+        assert!(std::fs::read_to_string(&log).unwrap().contains("backup"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn quiet_docker() -> crate::volumes::RunnerGuard {
+        crate::volumes::install_runner(Box::new(|exec| {
+            let joined = exec.argv.join(" ");
+            let stdout = if joined.contains("context") && joined.contains("inspect") {
+                "\"unix:///var/run/docker.sock\"\n".to_owned()
+            } else if joined.contains(" info ") {
+                "[\"name=seccomp\"]\n".to_owned()
+            } else if joined.contains("config") {
+                "{\"name\":\"demo\",\"services\":{}}\n".to_owned()
+            } else {
+                String::new()
+            };
+            Ok(crate::volumes::CapturedText {
+                code: 0,
+                stdout,
+                stderr: String::new(),
+            })
+        }))
     }
 
     fn temp_root(label: &str) -> PathBuf {
