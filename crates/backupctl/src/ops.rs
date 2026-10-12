@@ -148,7 +148,7 @@ pub fn run_check(config_path: &str, no_wait: bool) -> Result<(), CommandError> {
         args.push(subset.to_owned());
     }
     run_restic("restic", &args, None, &environment, false).map_err(text)?;
-    crate::alerts::clear_unit_alert(&config, "homelab-backup-check.service");
+    crate::alerts::clear_unit_alert(&config, crate::alerts::CHECK_UNIT);
     Ok(())
 }
 
@@ -297,7 +297,7 @@ pub fn run_maintenance(
         });
     }
     if !dry_run && failures.is_empty() {
-        crate::alerts::clear_unit_alert(&config, "homelab-backup-maintenance.service");
+        crate::alerts::clear_unit_alert(&config, crate::alerts::MAINTENANCE_UNIT);
     }
     finish(failures, "MAINTENANCE FAILURES")
 }
@@ -391,9 +391,13 @@ pub fn run_due(config_path: &str) -> Result<(), CommandError> {
         .iter()
         .map(|failure| (failure.operation.clone(), failure.summary.clone()))
         .collect::<Vec<_>>();
+    let invocation = std::env::var("INVOCATION_ID")
+        .ok()
+        .filter(|value| !value.is_empty());
     crate::alerts::record_run_due(
         &config,
         Local::now().fixed_offset(),
+        invocation.as_deref(),
         &attempted,
         &recorded,
         if manifests_incomplete {

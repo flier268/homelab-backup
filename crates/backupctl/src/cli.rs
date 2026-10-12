@@ -112,7 +112,7 @@ pub enum Command {
     },
     /// Remove a stale restic lock.
     Unlock,
-    /// Send a failure notification for a systemd unit (OnFailure=).
+    /// Send a failure notification for a systemd unit (OnFailure=); the push includes the last 30 journal lines of the unit and is repeated at most once per alert.renotify_after while the failure is unchanged.
     NotifyFailure { unit: String },
     /// Open the offline guide shipped with this release.
     Docs,
