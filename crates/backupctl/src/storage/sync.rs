@@ -41,6 +41,8 @@ pub struct SyncOptions<'a> {
     /// Per-source methods override `capture_method`. Live and snapshot use this.
     pub capture_methods: BTreeMap<String, String>,
     pub writers: BTreeMap<String, Vec<String>>,
+    /// Snapshot directories that replace the live path for the copy.
+    pub source_overrides: BTreeMap<String, String>,
     pub before_copy: Option<&'a mut dyn FnMut() -> Result<(), SecurityError>>,
 }
 
@@ -87,7 +89,14 @@ pub fn sync_paths(
             .unwrap_or(true);
         let resolved = validate_path_source_policy(config, manifest, source)?;
         let destination = stage.join("paths").join(id);
-        match copy_one(&resolved, &destination, source, options) {
+        let physical = options.source_overrides.get(id).cloned();
+        match copy_one(
+            &resolved,
+            physical.as_deref(),
+            &destination,
+            source,
+            options,
+        ) {
             Ok((kind, ancestors)) => inventory.push(PathInventory {
                 id: id.to_owned(),
                 path: declared.to_owned(),
@@ -123,12 +132,21 @@ pub fn sync_paths(
 }
 
 fn copy_one(
-    source_path: &str,
+    logical_path: &str,
+    physical_path: Option<&str>,
     destination: &Path,
     source: &BTreeMap<String, Yaml>,
     options: &mut SyncOptions<'_>,
 ) -> Result<(String, Vec<Ancestor>), SecurityError> {
-    let (fd, metadata, ancestors) = open_data_path(Path::new(source_path))?;
+    let (logical_fd, logical_metadata, ancestors) = open_data_path(Path::new(logical_path))?;
+    let (fd, metadata) = if let Some(physical_path) = physical_path {
+        drop(logical_fd);
+        let (fd, metadata, _) = open_data_path(Path::new(physical_path))?;
+        (fd, metadata)
+    } else {
+        (logical_fd, logical_metadata)
+    };
+    let source_path = physical_path.unwrap_or(logical_path);
     let mode = mode_of(&metadata);
     let include = string_list(source.get("include"));
     if !include.is_empty() && !is_dir(mode) {

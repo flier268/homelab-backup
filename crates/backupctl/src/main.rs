@@ -5,7 +5,10 @@ use clap::Parser;
 
 #[allow(dead_code)]
 mod actions;
+mod alerts;
 mod backup;
+mod btrfs;
+mod btrfs_exec;
 #[allow(dead_code)]
 mod capture;
 mod catalog;

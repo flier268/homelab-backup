@@ -193,6 +193,9 @@ pub fn run(cli: Cli) -> Result<(), CliError> {
         Command::Status { max_age, notify } => {
             crate::ops::run_status(crate::documents::CONFIG_PATH, max_age.as_deref(), *notify)
         }
+        Command::NotifyFailure { unit } => {
+            crate::alerts::run_notify_failure(crate::documents::CONFIG_PATH, unit)
+        }
         _ => return not_ported(&cli.command),
     };
     result.map_err(map_command)

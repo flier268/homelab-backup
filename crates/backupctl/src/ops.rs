@@ -1,7 +1,6 @@
 //! List, status, schedule, retention, and repository commands.
-//! `notify-failure` and the run-due alert ledger are still separate.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::time::Duration;
@@ -149,6 +148,7 @@ pub fn run_check(config_path: &str, no_wait: bool) -> Result<(), CommandError> {
         args.push(subset.to_owned());
     }
     run_restic("restic", &args, None, &environment, false).map_err(text)?;
+    crate::alerts::clear_unit_alert(&config, "homelab-backup-check.service");
     Ok(())
 }
 
@@ -192,16 +192,28 @@ pub fn run_maintenance(
     }
     let mut failures = Vec::new();
     if !dry_run {
-        match snapshot_services(flat.get("state_root").map(String::as_str).unwrap_or("")) {
-            Ok(services) if !services.is_empty() => failures.push(Failure {
-                operation: "Btrfs snapshot recovery".to_owned(),
-                summary: "Btrfs snapshot recovery is not ported yet".to_owned(),
-                line: "ERROR: Btrfs snapshot journal scan failed: Btrfs snapshot recovery is not ported yet".to_owned(),
-            }),
-            Ok(_) => {}
+        let state_root = flat.get("state_root").map(String::as_str).unwrap_or("");
+        match crate::btrfs::snapshot_state_services(state_root) {
+            Ok(services) => {
+                for service in services {
+                    if let Err(error) = crate::btrfs::cleanup_snapshot_state(
+                        state_root,
+                        &service,
+                        &mut crate::btrfs_exec::run_btrfs_command,
+                    ) {
+                        failures.push(Failure {
+                            operation: service.clone(),
+                            summary: format!("Btrfs snapshot recovery failed: {error}"),
+                            line: format!(
+                                "ERROR: Btrfs snapshot recovery failed for {service}: {error}"
+                            ),
+                        });
+                    }
+                }
+            }
             Err(error) => failures.push(Failure {
                 operation: "Btrfs snapshot recovery".to_owned(),
-                summary: format!("Btrfs snapshot recovery failed: {error}"),
+                summary: error.message.clone(),
                 line: format!("ERROR: Btrfs snapshot journal scan failed: {error}"),
             }),
         }
@@ -284,6 +296,9 @@ pub fn run_maintenance(
             line: format!("ERROR: repository prune failed: {error}"),
         });
     }
+    if !dry_run && failures.is_empty() {
+        crate::alerts::clear_unit_alert(&config, "homelab-backup-maintenance.service");
+    }
     finish(failures, "MAINTENANCE FAILURES")
 }
 
@@ -301,6 +316,7 @@ pub fn run_due(config_path: &str) -> Result<(), CommandError> {
     };
     let now = Local::now().fixed_offset();
     let (ready, load_errors) = select_services(&config, &[]).map_err(text)?;
+    let manifests_incomplete = !load_errors.is_empty();
     let mut failures = load_errors
         .into_iter()
         .map(|failure| Failure {
@@ -310,6 +326,7 @@ pub fn run_due(config_path: &str) -> Result<(), CommandError> {
         })
         .collect::<Vec<_>>();
     let mut due = Vec::new();
+    let mut known_services = BTreeSet::new();
     let state_root = flat.get("state_root").cloned().unwrap_or_default();
     for service in ready {
         let manifest = service.manifest;
@@ -318,6 +335,9 @@ pub fn run_due(config_path: &str) -> Result<(), CommandError> {
             .and_then(Yaml::as_str)
             .unwrap_or("<unnamed>")
             .to_owned();
+        if valid_service_name(&name) {
+            known_services.insert(name.clone());
+        }
         let state = load_backup_state(&state_root, &name).unwrap_or_default();
         match due_status(&manifest, &state, now) {
             Ok(status) => {
@@ -338,6 +358,11 @@ pub fn run_due(config_path: &str) -> Result<(), CommandError> {
             }),
         }
     }
+    let attempted = due
+        .iter()
+        .filter_map(|manifest| manifest.get("service").and_then(Yaml::as_str))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
     if due.is_empty() {
         println!("No backups are due.");
     } else {
@@ -362,6 +387,21 @@ pub fn run_due(config_path: &str) -> Result<(), CommandError> {
             }
         }
     }
+    let recorded = failures
+        .iter()
+        .map(|failure| (failure.operation.clone(), failure.summary.clone()))
+        .collect::<Vec<_>>();
+    crate::alerts::record_run_due(
+        &config,
+        Local::now().fixed_offset(),
+        &attempted,
+        &recorded,
+        if manifests_incomplete {
+            None
+        } else {
+            Some(&known_services)
+        },
+    );
     finish(failures, "SCHEDULED BACKUP FAILURES")
 }
 
@@ -467,6 +507,7 @@ pub fn run_status(
     if !stale.is_empty() || lock_alert.is_some() {
         return Err(CommandError::Exit(2));
     }
+    crate::alerts::clear_unit_alert(&config, crate::alerts::STATUS_UNIT);
     Ok(())
 }
 
@@ -755,45 +796,6 @@ fn error_type_name(error: &ureq::Error) -> &'static str {
     match error {
         ureq::Error::Status(_, _) => "HTTPError",
         ureq::Error::Transport(_) => "URLError",
-    }
-}
-
-fn snapshot_services(state_root: &str) -> Result<Vec<String>, SecurityError> {
-    if state_root.is_empty() {
-        return Ok(Vec::new());
-    }
-    let root = homelab_backup_domain::paths::lexical_absolute(state_root)
-        .map_err(|error| SecurityError::invalid(error.message))?;
-    let entries = match std::fs::read_dir(&root) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(SecurityError::runtime(error.to_string())),
-    };
-    crate::unix::control::validate_control_directory(&root, false, None)?;
-    let mut services = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|error| SecurityError::runtime(error.to_string()))?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if let Some(service) = snapshot_service_name(&name) {
-            services.push(service);
-        }
-    }
-    services.sort();
-    Ok(services)
-}
-
-fn snapshot_service_name(file_name: &str) -> Option<String> {
-    let rest = file_name
-        .strip_prefix('.')?
-        .strip_suffix(".btrfs-snapshots.json")?;
-    if rest.chars().next()?.is_ascii_alphanumeric()
-        && rest
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-'))
-    {
-        Some(rest.to_owned())
-    } else {
-        None
     }
 }
 

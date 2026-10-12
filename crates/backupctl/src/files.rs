@@ -121,7 +121,10 @@ pub(crate) fn backup_loaded(
         .and_then(|consistency| consistency.get("mode"))
         .and_then(Yaml::as_str)
         .unwrap_or("stop");
-    if !matches!(mode, "files" | "external" | "hooks" | "stop" | "live") {
+    if !matches!(
+        mode,
+        "files" | "external" | "hooks" | "stop" | "live" | "snapshot"
+    ) {
         return Err(format!("consistency mode {mode} is not ported yet"));
     }
     for message in legacy_messages(manifest) {
@@ -251,6 +254,12 @@ fn stage_files(
         }
     }
     let stage = prepare_stage(staging_root, service, &protected)?;
+    let state_root = config.get("state_root").map(String::as_str).unwrap_or("");
+    crate::btrfs::cleanup_snapshot_state(
+        state_root,
+        service,
+        &mut crate::btrfs_exec::run_btrfs_command,
+    )?;
     let docker = if mode == "files" {
         None
     } else {
@@ -351,6 +360,18 @@ fn capture_sources(
             }
             ensure_space(label, stage, volume_bytes, allow_low_space)?;
         }
+        if mode == "snapshot" {
+            return capture_snapshot(
+                config,
+                manifest,
+                docker,
+                &StageSpace {
+                    label,
+                    stage,
+                    allow_low_space,
+                },
+            );
+        }
         copy_sources(
             config,
             manifest,
@@ -362,6 +383,7 @@ fn capture_sources(
                 allow_low_space,
             },
             &writers,
+            &BTreeMap::new(),
         )
     })();
     let cleanup = if mode == "hooks" {
@@ -395,6 +417,53 @@ struct StageSpace<'a> {
     allow_low_space: bool,
 }
 
+fn capture_snapshot(
+    config: &BTreeMap<String, String>,
+    manifest: &BTreeMap<String, Yaml>,
+    docker: Option<&crate::volumes::DockerContext>,
+    space: &StageSpace<'_>,
+) -> Result<(Vec<PathInventory>, Vec<crate::volumes::VolumeInventory>), SecurityError> {
+    let state_root = config.get("state_root").map(String::as_str).unwrap_or("");
+    let mut run = crate::btrfs_exec::run_btrfs_command;
+    let mut conflicts = |workspace: &str| crate::volumes::docker_users(&[workspace], &[], false);
+    let mut transaction = crate::btrfs::SnapshotTransaction::new(
+        state_root,
+        manifest,
+        &mut conflicts,
+        &mut run,
+        None,
+    );
+    let created = (|| {
+        let overrides = transaction.create()?;
+        let writers = if let Some(docker) = docker {
+            crate::volumes::writer_maps(manifest, docker)?
+        } else {
+            crate::volumes::WriterMaps {
+                paths: BTreeMap::new(),
+                volumes: BTreeMap::new(),
+            }
+        };
+        let mut warned = writers.paths.clone();
+        warned.retain(|id, _| !overrides.contains_key(id));
+        crate::volumes::warn_writers(&warned, &writers.volumes);
+        copy_sources(
+            config, manifest, "snapshot", docker, space, &writers, &overrides,
+        )
+    })();
+    let cleanup = transaction.cleanup();
+    match (created, cleanup) {
+        (Err(error), Err(cleanup)) => {
+            eprintln!("ERROR: Btrfs snapshot cleanup also failed: {cleanup}");
+            Err(error)
+        }
+        (Err(error), Ok(())) => Err(error),
+        (Ok(copied), cleanup) => {
+            cleanup?;
+            Ok(copied)
+        }
+    }
+}
+
 fn copy_sources(
     config: &BTreeMap<String, String>,
     manifest: &BTreeMap<String, Yaml>,
@@ -402,6 +471,7 @@ fn copy_sources(
     docker: Option<&crate::volumes::DockerContext>,
     space: &StageSpace<'_>,
     writers: &crate::volumes::WriterMaps,
+    overrides: &BTreeMap<String, String>,
 ) -> Result<(Vec<PathInventory>, Vec<crate::volumes::VolumeInventory>), SecurityError> {
     let mut check = || ensure_space(space.label, space.stage, 0, space.allow_low_space);
     let path_ids = source_ids(manifest, "paths");
@@ -410,8 +480,8 @@ fn copy_sources(
             .into_iter()
             .map(|id| (id, "best-effort".to_owned()))
             .collect()
-    } else if mode == "live" {
-        crate::volumes::method_map(path_ids, &writers.paths, &BTreeMap::new())
+    } else if mode == "live" || mode == "snapshot" {
+        crate::volumes::method_map(path_ids, &writers.paths, overrides)
     } else {
         path_ids
             .into_iter()
@@ -421,11 +491,14 @@ fn copy_sources(
     let mut options = SyncOptions {
         capture_method: if mode == "files" {
             "best-effort".to_owned()
+        } else if mode == "snapshot" {
+            "btrfs-snapshot".to_owned()
         } else {
             "quiesced-copy".to_owned()
         },
         capture_methods: path_methods,
         writers: writers.paths.clone(),
+        source_overrides: overrides.clone(),
         before_copy: Some(&mut check),
         ..SyncOptions::default()
     };
@@ -437,7 +510,7 @@ fn copy_sources(
             .iter()
             .map(|(id, _, _)| id.clone())
             .collect::<Vec<_>>();
-        let volume_methods = if mode == "live" {
+        let volume_methods = if mode == "live" || mode == "snapshot" {
             crate::volumes::method_map(volume_ids, &writers.volumes, &BTreeMap::new())
         } else {
             volume_ids
@@ -973,8 +1046,8 @@ mod tests {
     }
 
     #[test]
-    fn other_consistency_modes_fail_before_restic_backup() {
-        let root = temp_root("stop");
+    fn snapshot_mode_without_path_sources_reaches_restic() {
+        let root = temp_root("snapshot");
         let services = root.join("services");
         let demo = services.join("demo");
         std::fs::create_dir_all(&demo).unwrap();
@@ -996,16 +1069,21 @@ mod tests {
         let config_path = write_config(&root, &services);
         let log = root.join("restic.log");
         let program = fake_restic(&root, &log, &root.join("inventory.json"));
-        let error = run_backup(
+        let _docker = quiet_docker();
+        let inventory = root.join("inventory.json");
+        run_backup(
             &config_path.to_string_lossy(),
             &["demo".to_owned()],
             false,
             &program.to_string_lossy(),
         )
-        .unwrap_err();
-        assert!(matches!(error, CommandError::Reported));
+        .unwrap();
         let calls = std::fs::read_to_string(&log).unwrap_or_default();
-        assert!(!calls.contains("backup"), "{calls}");
+        assert!(calls.contains("backup"), "{calls}");
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&inventory).unwrap()).unwrap();
+        assert_eq!(saved["consistency"]["mode"], "snapshot");
+        assert_eq!(saved["consistency"]["guarantee"], "quiesced-copy");
         let _ = std::fs::remove_dir_all(&root);
     }
 

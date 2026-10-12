@@ -625,22 +625,36 @@ fn project_containers(project: &str) -> Result<Vec<String>, SecurityError> {
         .collect())
 }
 
+pub fn docker_users(
+    paths: &[&str],
+    volumes: &[&str],
+    writable_only: bool,
+) -> Result<Vec<String>, SecurityError> {
+    docker_mount_users(
+        paths,
+        volumes,
+        false,
+        writable_only,
+        &mut |argv| match run(Exec {
+            argv: argv.to_vec(),
+            cwd: None,
+            clean_env: false,
+            capture: true,
+        }) {
+            Ok(captured) => CapturedCommand {
+                code: captured.code,
+                stdout: captured.stdout,
+            },
+            Err(error) => CapturedCommand {
+                code: 1,
+                stdout: error.message,
+            },
+        },
+    )
+}
+
 fn mount_conflicts(paths: &[&str], volumes: &[&str]) -> Result<Vec<String>, SecurityError> {
-    docker_mount_users(paths, volumes, false, true, &mut |argv| match run(Exec {
-        argv: argv.to_vec(),
-        cwd: None,
-        clean_env: false,
-        capture: true,
-    }) {
-        Ok(captured) => CapturedCommand {
-            code: captured.code,
-            stdout: captured.stdout,
-        },
-        Err(error) => CapturedCommand {
-            code: 1,
-            stdout: error.message,
-        },
-    })
+    docker_users(paths, volumes, true)
 }
 
 pub fn warn_writers(
