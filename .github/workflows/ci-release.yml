@@ -61,6 +61,7 @@ jobs:
 
       - name: Smoke-test repository launcher
         run: |
+          cargo build -p backupctl
           ./backupctl --help >/dev/null
           ./backupctl --version
 

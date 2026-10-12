@@ -7,7 +7,7 @@
 - `cargo test --workspace --offline`
 - `bash -n install.sh uninstall.sh backup-configs.sh restore-configs.sh config-ops-runtime.sh backupctl`
 - `shellcheck install.sh uninstall.sh backup-configs.sh restore-configs.sh config-ops-runtime.sh backupctl`
-- `./backupctl --help` 與 `./backupctl --version`（需要已經建好的 debug 或 release 二進位）
+- `cargo build -p backupctl`，然後 `./backupctl --help` 與 `./backupctl --version`。`cargo test` 只產生測試執行檔，launcher 不會用它。
 
 行為測試在 `crates/domain` 與 `crates/backupctl` 的 Rust 單元測試。
 
