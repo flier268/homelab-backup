@@ -19,6 +19,9 @@ mod due;
 mod files;
 mod fingerprint;
 mod ops;
+mod restore_apply;
+mod restore_inventory;
+mod restore_plan;
 mod state;
 mod storage;
 #[allow(dead_code)]
